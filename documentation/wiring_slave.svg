@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500">
+  <!-- Background -->
+  <rect width="800" height="500" fill="white"/>
+  <text x="400" y="40" font-family="Arial" font-size="24" text-anchor="middle" font-weight="bold">Tally Slave Wiring: ESP32-C3 SuperMini + E28-2G4M12SX</text>
+
+  <!-- ESP32-C3 SuperMini (Left) -->
+  <g transform="translate(100, 100)">
+    <rect x="0" y="0" width="140" height="300" rx="10" fill="#4B0082" stroke="black" stroke-width="2"/> <!-- Purple PCB -->
+    <rect x="40" y="270" width="60" height="30" fill="silver" rx="5"/> <!-- USB-C -->
+    <text x="70" y="140" font-family="Arial" font-size="16" fill="white" text-anchor="middle" font-weight="bold" transform="rotate(-90 70,140)">ESP32-C3 SuperMini</text>
+    
+    <!-- Pins Left Side -->
+    <g font-family="Arial" font-size="12" fill="white" text-anchor="start">
+      <text x="10" y="30">3.3V</text> <circle cx="5" cy="25" r="3" fill="#D4AF37"/>
+      <text x="10" y="60">GND</text> <circle cx="5" cy="55" r="3" fill="#D4AF37"/>
+      <text x="10" y="90">IO 0</text> <circle cx="5" cy="85" r="3" fill="#D4AF37"/>
+      <text x="10" y="120">IO 1</text> <circle cx="5" cy="115" r="3" fill="#D4AF37"/>
+      <text x="10" y="150">IO 2</text> <circle cx="5" cy="145" r="3" fill="#D4AF37"/>
+      <text x="10" y="180">IO 3</text> <circle cx="5" cy="175" r="3" fill="#D4AF37"/>
+      <text x="10" y="210">IO 4</text> <circle cx="5" cy="205" r="3" fill="#D4AF37"/>
+    </g>
+    
+    <!-- Pins Right Side (Simulated logic, physically usually on sides, but for diagram putting connections clearly) -->
+    <!-- Let's map physically closer to image representation if possible, but semantic is clearer here -->
+    <!-- Actually SuperMini has 2 rows of pins. Let's list meaningful ones for us on the right edge for easy wiring -->
+    <g transform="translate(140, 0)" text-anchor="end">
+       <!-- We will draw lines from these coordinates -->
+    </g>
+  </g>
+
+  <!-- Redrawing ESP32 Pins for easier wiring logic -->
+  <!-- 3.3V at (105, 125) -->
+  <!-- GND at (105, 155) -->
+  <!-- IO 2 at (105, 245) -->
+  <!-- IO 3 at (105, 275) -->
+  <!-- IO 4 at (105, 305) -->
+  <!-- IO 5 at (235, 305) - wait, let's just put dots on the board rect -->
+
+  <!-- Defined Connection Points on ESP32 (Approximate relative to top-left of board at 100,100) -->
+  <!-- 3.3V --> <circle cx="110" cy="130" r="5" fill="gold" stroke="black"/> <text x="120" y="135" font-family="Arial" font-size="12" fill="white">3.3V</text>
+  <!-- GND -->  <circle cx="110" cy="160" r="5" fill="gold" stroke="black"/> <text x="120" y="165" font-family="Arial" font-size="12" fill="white">GND</text>
+  
+  <!-- IO 4 (SCK) --> <circle cx="230" cy="130" r="5" fill="gold" stroke="black"/> <text x="190" y="135" font-family="Arial" font-size="12" fill="white" text-anchor="end">IO 4 (SCK)</text>
+  <!-- IO 5 (MISO) --> <circle cx="230" cy="160" r="5" fill="gold" stroke="black"/> <text x="190" y="165" font-family="Arial" font-size="12" fill="white" text-anchor="end">IO 5 (MISO)</text>
+  <!-- IO 6 (MOSI) --> <circle cx="230" cy="190" r="5" fill="gold" stroke="black"/> <text x="190" y="195" font-family="Arial" font-size="12" fill="white" text-anchor="end">IO 6 (MOSI)</text>
+  <!-- IO 7 (NSS) -->  <circle cx="230" cy="220" r="5" fill="gold" stroke="black"/> <text x="190" y="225" font-family="Arial" font-size="12" fill="white" text-anchor="end">IO 7 (CS)</text>
+  
+  <!-- IO 3 (BUSY) --> <circle cx="230" cy="250" r="5" fill="gold" stroke="black"/> <text x="190" y="255" font-family="Arial" font-size="12" fill="white" text-anchor="end">IO 3 (BUSY)</text>
+  <!-- IO 2 (DIO1) --> <circle cx="230" cy="280" r="5" fill="gold" stroke="black"/> <text x="190" y="285" font-family="Arial" font-size="12" fill="white" text-anchor="end">IO 2 (DIO1)</text>
+  <!-- IO 10 (RST) --> <circle cx="230" cy="310" r="5" fill="gold" stroke="black"/> <text x="190" y="315" font-family="Arial" font-size="12" fill="white" text-anchor="end">IO 10 (RST)</text>
+
+
+  <!-- E28-2G4M12SX (Right) -->
+  <g transform="translate(550, 150)">
+    <rect x="0" y="0" width="100" height="180" fill="#2E8B57" stroke="black" stroke-width="2"/> <!-- Green PCB -->
+    <rect x="20" y="-30" width="60" height="40" fill="#D4AF37" rx="2"/> <!-- Antenna connector/Area -->
+    <text x="50" y="90" font-family="Arial" font-size="14" fill="white" text-anchor="middle" font-weight="bold">E28-12SX</text>
+    
+    <!-- Pins (Left side of module) -->
+    <!-- VCC --> <circle cx="10" cy="20" r="5" fill="gold" stroke="black"/> <text x="20" y="25" font-family="Arial" font-size="12" fill="white">VCC</text>
+    <!-- GND --> <circle cx="10" cy="40" r="5" fill="gold" stroke="black"/> <text x="20" y="45" font-family="Arial" font-size="12" fill="white">GND</text>
+    <!-- SCK --> <circle cx="10" cy="60" r="5" fill="gold" stroke="black"/> <text x="20" y="65" font-family="Arial" font-size="12" fill="white">SCK</text>
+    <!-- MISO --> <circle cx="10" cy="80" r="5" fill="gold" stroke="black"/> <text x="20" y="85" font-family="Arial" font-size="12" fill="white">MISO</text>
+    <!-- MOSI --> <circle cx="10" cy="100" r="5" fill="gold" stroke="black"/> <text x="20" y="105" font-family="Arial" font-size="12" fill="white">MOSI</text>
+    <!-- NSS --> <circle cx="10" cy="120" r="5" fill="gold" stroke="black"/> <text x="20" y="125" font-family="Arial" font-size="12" fill="white">NSS</text>
+    <!-- BUSY --> <circle cx="10" cy="140" r="5" fill="gold" stroke="black"/> <text x="20" y="145" font-family="Arial" font-size="12" fill="white">BUSY</text>
+    <!-- DIO1 --> <circle cx="10" cy="160" r="5" fill="gold" stroke="black"/> <text x="20" y="165" font-family="Arial" font-size="12" fill="white">DIO1</text>
+    <!-- RST -->  <circle cx="90" cy="160" r="5" fill="gold" stroke="black"/> <text x="55" y="165" font-family="Arial" font-size="12" fill="white">RST (Right)</text>
+    <!-- Usually pins are all on edges. Let's assume standard spacing on left/right or bottom. For diagram simplicity, putting RST on right bottom corner representation -->
+  </g>
+
+  <!-- CAMERAS / WIRES -->
+  <!-- 3.3V (Red) -->
+  <path d="M 110 130 L 80 130 L 80 50 L 520 50 L 520 170 L 560 170" fill="none" stroke="red" stroke-width="3"/>
+  
+  <!-- GND (Black) -->
+  <path d="M 110 160 L 70 160 L 70 40 L 530 40 L 530 190 L 560 190" fill="none" stroke="black" stroke-width="3"/>
+
+  <!-- SCK (Yellow) - IO4 to SCK -->
+  <path d="M 230 130 L 350 130 L 350 210 L 560 210" fill="none" stroke="#FFA500" stroke-width="3"/> <!-- Orange/Yellow -->
+
+  <!-- MISO (Green) - IO5 to MISO -->
+  <path d="M 230 160 L 360 160 L 360 230 L 560 230" fill="none" stroke="green" stroke-width="3"/>
+
+  <!-- MOSI (Blue) - IO6 to MOSI -->
+  <path d="M 230 190 L 370 190 L 370 250 L 560 250" fill="none" stroke="blue" stroke-width="3"/>
+
+  <!-- NSS (Purple) - IO7 to NSS -->
+  <line x1="230" y1="220" x2="560" y2="270" stroke="purple" stroke-width="3"/>
+  <!-- Direct line looks messy, let's path -->
+  <path d="M 230 220 L 380 220 L 380 270 L 560 270" fill="none" stroke="purple" stroke-width="3"/>
+
+  <!-- BUSY (Brown) - IO3 to BUSY -->
+  <path d="M 230 250 L 390 250 L 390 290 L 560 290" fill="none" stroke="#8B4513" stroke-width="3"/>
+
+  <!-- DIO1 (Gray) - IO2 to DIO1 -->
+  <path d="M 230 280 L 400 280 L 400 310 L 560 310" fill="none" stroke="gray" stroke-width="3"/>
+  
+  <!-- RST (Cyan) - IO10 to RST -->
+  <path d="M 230 310 L 410 310 L 410 350 L 640 350 L 640 310" fill="none" stroke="cyan" stroke-width="3"/>
+
+  <!-- Legend -->
+  <rect x="550" y="380" width="200" height="100" fill="#f0f0f0" stroke="black"/>
+  <text x="560" y="400" font-family="Arial" font-size="14" font-weight="bold">Legend</text>
+  <text x="560" y="420" font-family="Arial" font-size="12" fill="red">VCC (3.3V)</text>
+  <text x="650" y="420" font-family="Arial" font-size="12" fill="black">GND</text>
+  <text x="560" y="440" font-family="Arial" font-size="12" fill="#FFA500">SCK (IO 4)</text>
+  <text x="650" y="440" font-family="Arial" font-size="12" fill="green">MISO (IO 5)</text>
+  <text x="560" y="460" font-family="Arial" font-size="12" fill="blue">MOSI (IO 6)</text>
+  <text x="650" y="460" font-family="Arial" font-size="12" fill="purple">CS (IO 7)</text>
+  <text x="560" y="480" font-family="Arial" font-size="12" fill="#8B4513">BUSY (IO 3)</text>
+  
+</svg>

@@ -1,0 +1,20 @@
+# PlatformIO
+.pio/
+.vscode/
+
+# Build artifacts
+*.o
+*.elf
+*.bin
+*.map
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Old/unused folders
+Arduino/
+master/
+slave/
+oled_test/
+C*tally_slave*/
