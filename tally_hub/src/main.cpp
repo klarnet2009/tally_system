@@ -369,8 +369,6 @@ void setup(){
   display.setTextWrap(false); display.clearDisplay(); display.display();
   
   pinMode(0, INPUT_PULLUP); // Boot button for locator
-  pinMode(33, OUTPUT);      // Onboard blue LED
-  digitalWrite(33, LOW);
 
   drawCenteredMsg("Wi-Fi: connecting...", WIFI_SSID);
   WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -406,7 +404,8 @@ void setup(){
 }
 
 void loop(){
-  if(WiFi.status()!=WL_CONNECTED){ static uint32_t lastRetry=0; static uint8_t lostFrame=0; if(millis()-lastRetry>WIFI_RETRY_MS){ lastRetry=millis(); WiFi.disconnect(); WiFi.begin(WIFI_SSID, WIFI_PASS);} drawLoadingScreen("Wi-Fi lost", "Reconnecting...", lostFrame++); delay(150); return; }
+  // WiFi reconnect (non-blocking)
+  if(WiFi.status()!=WL_CONNECTED){ static uint32_t lastRetry=0; if(millis()-lastRetry>WIFI_RETRY_MS){ lastRetry=millis(); WiFi.disconnect(); WiFi.begin(WIFI_SSID, WIFI_PASS);} }
 
   // if(!atemConnected && millis()-lastAtemAttempt > 500) tryConnectAtem(); // ATEM disabled for LoRa debug
 
@@ -472,27 +471,24 @@ void loop(){
         }
       }
     }
-    
-    // Locator / Ping (Button 0)
-    static uint32_t lastPing = 0;
-    if (digitalRead(0) == LOW && millis() - lastPing > 500) {
-        lastPing = millis();
-        drawCenteredMsg("LOCATOR", "Ping sent -> Cam 1");
-        
-        // Send 3 times for reliability + blink LED
-        for(int k=0; k<3; k++) {
-          digitalWrite(33, HIGH); // Blue LED ON
-          TallyPacket pkt = TallyProtocol::createPingPacket(1); 
-          uint8_t buf[TALLY_PACKET_SIZE];
-          TallyProtocol::serialize(pkt, buf);
-          radio.send(buf, TALLY_PACKET_SIZE);
-          g_loraTxCount++;
-          delay(100);
-          digitalWrite(33, LOW);  // Blue LED OFF
-          delay(50);
-        }
-        delay(2000); // Wait so user can see message
-    }
+  }
+
+  // Locator / Ping (Button 0) — works without ATEM
+  static uint32_t lastPing = 0;
+  if (digitalRead(0) == LOW && millis() - lastPing > 500) {
+      lastPing = millis();
+      drawCenteredMsg("LOCATOR", "Ping sent -> Cam 1");
+      
+      // Send 3 times for reliability
+      for(int k=0; k<3; k++) {
+        TallyPacket pkt = TallyProtocol::createPingPacket(1); 
+        uint8_t buf[TALLY_PACKET_SIZE];
+        TallyProtocol::serialize(pkt, buf);
+        radio.send(buf, TALLY_PACKET_SIZE);
+        g_loraTxCount++;
+        delay(50);
+      }
+      delay(2000); // Wait so user can see message
   }
 
   // ==== OLED (LoRa debug mode - always active) ====
