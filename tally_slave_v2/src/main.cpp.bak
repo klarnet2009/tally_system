@@ -1,0 +1,256 @@
+// ============================================================
+//  SUFIDE Tally Slave v2 — ESP32-C3 SuperMini + E28-2G4M12SX
+//  Hardware: WS2812B (GPIO 7), Buzzer (GPIO 8)
+//  Pinout verified per HARDWARE_GUIDE.md (2026-02-10)
+// ============================================================
+
+#include <Adafruit_NeoPixel.h>
+#include <Arduino.h>
+#include <E28_SX1280.h>
+#include <TallyProtocol.h>
+
+// ===== CONFIGURATION =====
+#define SLAVE_CAM_ID 1 // Camera ID this slave responds to
+
+// ===== HARDWARE PINS (from HARDWARE_GUIDE.md) =====
+// LoRa E28-2G4M12SX
+#define PIN_LORA_SCK 3
+#define PIN_LORA_MOSI 4
+#define PIN_LORA_MISO 5
+#define PIN_LORA_NRESET 6
+#define PIN_LORA_NSS 20
+#define PIN_LORA_BUSY 10
+#define PIN_LORA_DIO1 1
+#define PIN_LORA_RXEN -1 // Not present on 12dBm module
+#define PIN_LORA_TXEN -1 // Not present on 12dBm module
+
+// WS2812B RGB LED
+#define PIN_LED 7
+#define NUM_LEDS 1
+
+// Passive Buzzer
+#define PIN_BUZZER 8
+
+// ===== COLORS =====
+#define COLOR_OFF 0x000000
+#define COLOR_PROGRAM 0xFF0000   // Red
+#define COLOR_PREVIEW 0x00FF00   // Green
+#define COLOR_BOTH 0xFFFF00      // Yellow
+#define COLOR_PING 0x0000FF      // Blue (locator flash)
+#define COLOR_INIT_OK 0x00FF00   // Green
+#define COLOR_INIT_FAIL 0xFF0000 // Red
+
+// ===== GLOBALS =====
+Adafruit_NeoPixel led(NUM_LEDS, PIN_LED, NEO_GRB + NEO_KHZ800);
+E28Radio radio;
+
+uint32_t lastHeartbeat = 0;
+uint32_t lastRxTime = 0; // Track last received packet time
+bool loraConnected = false;
+uint8_t currentState = STATE_OFF;
+uint32_t rxCount = 0;  // Total packets received since last heartbeat
+uint32_t crcFails = 0; // CRC failures since last heartbeat
+bool signalLost = false;
+
+// ===== HELPERS =====
+void setColor(uint32_t color, uint8_t brightness = 80) {
+  led.setBrightness(brightness);
+  led.setPixelColor(0, color);
+  led.show();
+}
+
+void flashColor(uint32_t color, int times, int onMs, int offMs) {
+  for (int i = 0; i < times; i++) {
+    setColor(color, 120);
+    delay(onMs);
+    setColor(COLOR_OFF);
+    delay(offMs);
+  }
+}
+
+void beep(int freq, int durationMs) {
+  tone(PIN_BUZZER, freq, durationMs);
+  delay(durationMs);
+  noTone(PIN_BUZZER);
+}
+
+void locatorAlert() {
+  for (int i = 0; i < 5; i++) {
+    setColor(COLOR_PING, 200);
+    tone(PIN_BUZZER, 2400);
+    delay(80);
+    setColor(COLOR_OFF);
+    noTone(PIN_BUZZER);
+    delay(40);
+  }
+}
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  Serial.println("\n=============================");
+  Serial.println("  SUFIDE Tally Slave v2");
+  Serial.printf("  Camera ID: %d\n", SLAVE_CAM_ID);
+  Serial.println("=============================");
+
+  led.begin();
+  setColor(COLOR_OFF);
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  noTone(PIN_BUZZER);
+
+  Serial.print("[LoRa] Init... ");
+  loraConnected = radio.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI,
+                              PIN_LORA_NSS, PIN_LORA_BUSY, PIN_LORA_DIO1,
+                              PIN_LORA_NRESET, PIN_LORA_RXEN, PIN_LORA_TXEN);
+
+  if (loraConnected) {
+    Serial.println("OK");
+    flashColor(COLOR_INIT_OK, 3, 150, 100);
+    beep(1000, 100);
+    radio.startReceive();
+    lastRxTime = millis(); // Start signal timer
+    Serial.println("[LoRa] Listening...");
+  } else {
+    Serial.println("FAILED");
+    beep(400, 500);
+    while (1) {
+      setColor(COLOR_INIT_FAIL, 100);
+      delay(100);
+      setColor(COLOR_OFF);
+      delay(100);
+    }
+  }
+}
+
+// ===== LOOP =====
+void loop() {
+  if (!loraConnected)
+    return;
+
+  // Check for incoming packets
+  if (radio.available()) {
+    uint8_t buf[E28_MAX_PACKET_SIZE];
+    uint8_t len = radio.receive(buf, E28_MAX_PACKET_SIZE);
+
+    if (len > 0) {
+      TallyPacket pkt;
+      if (TallyProtocol::deserialize(buf, len, pkt)) {
+
+        if (pkt.cameraId == SLAVE_CAM_ID ||
+            pkt.cameraId == TALLY_BROADCAST_ID) {
+
+          lastRxTime = millis(); // Reset signal timer
+          signalLost = false;
+          rxCount++;
+
+          if (pkt.command == CMD_PING) {
+            Serial.println("[LOCATOR] Alert!");
+            locatorAlert();
+            radio.startReceive(); // Restore RX after locator delays
+          } else if (pkt.command == CMD_SET_STATE) {
+            // Only update LED + print on STATE CHANGE
+            if (pkt.state != currentState) {
+              currentState = pkt.state;
+              int rssi = radio.getRSSI();
+
+              switch (currentState) {
+              case STATE_PROGRAM:
+                setColor(COLOR_PROGRAM, 120);
+                Serial.printf("[TALLY] PROGRAM  RSSI:%d\n", rssi);
+                break;
+              case STATE_PREVIEW:
+                setColor(COLOR_PREVIEW, 80);
+                Serial.printf("[TALLY] PREVIEW  RSSI:%d\n", rssi);
+                break;
+              case STATE_BOTH:
+                setColor(COLOR_BOTH, 120);
+                Serial.printf("[TALLY] PROG+PREV  RSSI:%d\n", rssi);
+                break;
+              case STATE_OFF:
+              default:
+                setColor(COLOR_OFF);
+                Serial.printf("[TALLY] OFF  RSSI:%d\n", rssi);
+                break;
+              }
+            }
+          }
+          // Heartbeat: silent at high speed
+        }
+      } else {
+        // Actual CRC/deserialization failure
+        crcFails++;
+        if (crcFails <= 10) {
+          Serial.printf("[CRC_FAIL] len=%d raw: ", len);
+          for (int i = 0; i < len && i < 16; i++)
+            Serial.printf("%02X ", buf[i]);
+          Serial.println();
+        }
+      }
+    }
+    // Full RX re-arm (SX1280 requires standby before RX)
+    radio.startReceive();
+  }
+
+  // === SIGNAL LOST DETECTION ===
+  // If no packet received for 30 seconds
+  if (millis() - lastRxTime > 30000 && !signalLost) {
+    signalLost = true;
+    Serial.println("[WARN] Signal lost!");
+    beep(800, 300);
+  }
+
+  if (signalLost) {
+    // Pulse orange every 2 seconds
+    static uint32_t lastPulse = 0;
+    static bool pulseOn = false;
+    if (millis() - lastPulse > 1000) {
+      lastPulse = millis();
+      pulseOn = !pulseOn;
+      if (pulseOn) {
+        setColor(0xFF4500, 60); // Orange
+      } else {
+        setColor(COLOR_OFF);
+      }
+    }
+    // Short beep every 5 seconds
+    static uint32_t lastLostBeep = 0;
+    if (millis() - lastLostBeep > 5000) {
+      lastLostBeep = millis();
+      beep(600, 100);
+    }
+  }
+
+  // Heartbeat: log + restore RX every 10 seconds
+  if (millis() - lastHeartbeat > 10000) {
+    lastHeartbeat = millis();
+    uint32_t secSinceRx = (millis() - lastRxTime) / 1000;
+    Serial.printf("[STATUS] Up:%lus State:%d LastRX:%lus ago RX:%lu CRC:%lu\n",
+                  millis() / 1000, currentState, secSinceRx, rxCount, crcFails);
+    rxCount = 0;
+    crcFails = 0;
+    radio.startReceive(); // Restore RX mode (safety net)
+  }
+
+  // Serial commands (for testing)
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "test") {
+      Serial.println("[TEST] Locator alert...");
+      locatorAlert();
+    } else if (cmd == "red") {
+      setColor(COLOR_PROGRAM, 120);
+    } else if (cmd == "green") {
+      setColor(COLOR_PREVIEW, 80);
+    } else if (cmd == "off") {
+      setColor(COLOR_OFF);
+    } else if (cmd == "beep") {
+      beep(1000, 200);
+    } else if (cmd == "help") {
+      Serial.println("Commands: test, red, green, off, beep, help");
+    }
+  }
+}
