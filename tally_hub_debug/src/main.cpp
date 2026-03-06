@@ -105,8 +105,10 @@ void spiWriteCmd(uint8_t cmd, uint8_t *data, uint8_t len) {
   }
   digitalWrite(E28_PIN_NSS, LOW);
   SPI.transfer(cmd);
-  for (uint8_t i = 0; i < len; i++)
-    SPI.transfer(data[i]);
+  if (len > 0) {
+    // ⚡ Bolt: Use SPI block transfer to significantly reduce mutex/locking overhead compared to byte-by-byte loop
+    SPI.writeBytes(data, len);
+  }
   digitalWrite(E28_PIN_NSS, HIGH);
   // Wait BUSY again
   t0 = millis();
