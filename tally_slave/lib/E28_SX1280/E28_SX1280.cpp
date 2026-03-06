@@ -111,8 +111,9 @@ void E28Radio::writeCommand(uint8_t cmd, uint8_t* data, uint8_t len) {
     
     digitalWrite(_pinNSS, LOW);
     SPI.transfer(cmd);
-    for (uint8_t i = 0; i < len; i++) {
-        SPI.transfer(data[i]);
+    if (len > 0) {
+        // ⚡ Bolt: Use SPI block transfer to significantly reduce mutex/locking overhead compared to byte-by-byte loop
+        SPI.writeBytes(data, len);
     }
     digitalWrite(_pinNSS, HIGH);
     
@@ -125,8 +126,9 @@ void E28Radio::readCommand(uint8_t cmd, uint8_t* data, uint8_t len) {
     digitalWrite(_pinNSS, LOW);
     SPI.transfer(cmd);
     SPI.transfer(0x00);  // NOP
-    for (uint8_t i = 0; i < len; i++) {
-        data[i] = SPI.transfer(0x00);
+    if (len > 0) {
+        // ⚡ Bolt: Use SPI block transfer to significantly reduce mutex/locking overhead compared to byte-by-byte loop
+        SPI.transferBytes(NULL, data, len);
     }
     digitalWrite(_pinNSS, HIGH);
 }
@@ -213,8 +215,9 @@ bool E28Radio::send(uint8_t* data, uint8_t len) {
     digitalWrite(_pinNSS, LOW);
     SPI.transfer(SX1280_CMD_WRITE_BUFFER);
     SPI.transfer(0x00);  // Offset
-    for (uint8_t i = 0; i < len; i++) {
-        SPI.transfer(data[i]);
+    if (len > 0) {
+        // ⚡ Bolt: Use SPI block transfer to significantly reduce mutex/locking overhead compared to byte-by-byte loop
+        SPI.writeBytes(data, len);
     }
     digitalWrite(_pinNSS, HIGH);
     
@@ -257,8 +260,9 @@ bool E28Radio::sendAsync(uint8_t* data, uint8_t len) {
     digitalWrite(_pinNSS, LOW);
     SPI.transfer(SX1280_CMD_WRITE_BUFFER);
     SPI.transfer(0x00);
-    for (uint8_t i = 0; i < len; i++) {
-        SPI.transfer(data[i]);
+    if (len > 0) {
+        // ⚡ Bolt: Use SPI block transfer to significantly reduce mutex/locking overhead compared to byte-by-byte loop
+        SPI.writeBytes(data, len);
     }
     digitalWrite(_pinNSS, HIGH);
     
@@ -316,8 +320,9 @@ uint8_t E28Radio::receive(uint8_t* buffer, uint8_t maxLen) {
     SPI.transfer(SX1280_CMD_READ_BUFFER);
     SPI.transfer(bufferOffset);
     SPI.transfer(0x00);  // NOP
-    for (uint8_t i = 0; i < payloadLen; i++) {
-        buffer[i] = SPI.transfer(0x00);
+    if (payloadLen > 0) {
+        // ⚡ Bolt: Use SPI block transfer to significantly reduce mutex/locking overhead compared to byte-by-byte loop
+        SPI.transferBytes(NULL, buffer, payloadLen);
     }
     digitalWrite(_pinNSS, HIGH);
     
