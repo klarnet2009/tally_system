@@ -129,10 +129,17 @@ void E28Radio::writeCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
   waitBusy();
 
   digitalWrite(_pinNSS, LOW);
-  SPI.transfer(cmd);
   if (len > 0) {
-    // ⚡ Bolt: Use SPI block transfer to significantly reduce mutex/locking overhead compared to byte-by-byte loop
-    SPI.writeBytes(data, len);
+    // ⚡ Bolt: Coalesce cmd and data into a single block transfer
+    // Use a fixed stack buffer to avoid heap fragmentation and allocation overhead
+    uint8_t txBuf[260];
+
+    txBuf[0] = cmd;
+    memcpy(&txBuf[1], data, len);
+
+    SPI.writeBytes(txBuf, len + 1);
+  } else {
+    SPI.transfer(cmd);
   }
   digitalWrite(_pinNSS, HIGH);
 
@@ -143,11 +150,23 @@ void E28Radio::readCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
   waitBusy();
 
   digitalWrite(_pinNSS, LOW);
-  SPI.transfer(cmd);
-  SPI.transfer(0x00); // NOP
   if (len > 0) {
-    // ⚡ Bolt: Use SPI block transfer to significantly reduce mutex/locking overhead compared to byte-by-byte loop
-    SPI.transferBytes(NULL, data, len);
+    // ⚡ Bolt: Coalesce cmd, NOP, and read dummy bytes into a single block transfer
+    // Use fixed stack buffer to avoid heap overhead
+    uint8_t txBuf[260];
+    uint8_t rxBuf[260];
+    uint32_t totalLen = len + 2;
+
+    memset(txBuf, 0, totalLen);
+    txBuf[0] = cmd;
+    txBuf[1] = 0x00; // NOP
+
+    SPI.transferBytes(txBuf, rxBuf, totalLen);
+
+    memcpy(data, &rxBuf[2], len);
+  } else {
+    SPI.transfer(cmd);
+    SPI.transfer(0x00); // NOP
   }
   digitalWrite(_pinNSS, HIGH);
 }
@@ -232,11 +251,20 @@ bool E28Radio::send(uint8_t *data, uint8_t len) {
   // Write data to buffer
   waitBusy();
   digitalWrite(_pinNSS, LOW);
-  SPI.transfer(SX1280_CMD_WRITE_BUFFER);
-  SPI.transfer(0x00); // Offset
   if (len > 0) {
-    // ⚡ Bolt: Use SPI block transfer to significantly reduce mutex/locking overhead compared to byte-by-byte loop
-    SPI.writeBytes(data, len);
+    // ⚡ Bolt: Coalesce command, offset and payload into a single SPI transfer
+    // Use fixed stack buffer
+    uint8_t txBuf[260];
+    uint32_t totalLen = len + 2;
+
+    txBuf[0] = SX1280_CMD_WRITE_BUFFER;
+    txBuf[1] = 0x00; // Offset
+    memcpy(&txBuf[2], data, len);
+
+    SPI.writeBytes(txBuf, totalLen);
+  } else {
+    SPI.transfer(SX1280_CMD_WRITE_BUFFER);
+    SPI.transfer(0x00); // Offset
   }
   digitalWrite(_pinNSS, HIGH);
 
@@ -281,11 +309,20 @@ bool E28Radio::sendAsync(uint8_t *data, uint8_t len) {
   // Write data to buffer
   waitBusy();
   digitalWrite(_pinNSS, LOW);
-  SPI.transfer(SX1280_CMD_WRITE_BUFFER);
-  SPI.transfer(0x00);
   if (len > 0) {
-    // ⚡ Bolt: Use SPI block transfer to significantly reduce mutex/locking overhead compared to byte-by-byte loop
-    SPI.writeBytes(data, len);
+    // ⚡ Bolt: Coalesce command, offset and payload into a single SPI transfer
+    // Use fixed stack buffer
+    uint8_t txBuf[260];
+    uint32_t totalLen = len + 2;
+
+    txBuf[0] = SX1280_CMD_WRITE_BUFFER;
+    txBuf[1] = 0x00; // Offset
+    memcpy(&txBuf[2], data, len);
+
+    SPI.writeBytes(txBuf, totalLen);
+  } else {
+    SPI.transfer(SX1280_CMD_WRITE_BUFFER);
+    SPI.transfer(0x00); // Offset
   }
   digitalWrite(_pinNSS, HIGH);
 
@@ -383,12 +420,25 @@ uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
   // Read data from buffer
   waitBusy();
   digitalWrite(_pinNSS, LOW);
-  SPI.transfer(SX1280_CMD_READ_BUFFER);
-  SPI.transfer(bufferOffset);
-  SPI.transfer(0x00); // NOP
   if (payloadLen > 0) {
-    // ⚡ Bolt: Use SPI block transfer to significantly reduce mutex/locking overhead compared to byte-by-byte loop
-    SPI.transferBytes(NULL, buffer, payloadLen);
+    // ⚡ Bolt: Coalesce command, offset, NOP and read dummy bytes into a single SPI transfer
+    // Use fixed stack buffer
+    uint8_t txBuf[260];
+    uint8_t rxBuf[260];
+    uint32_t totalLen = payloadLen + 3;
+
+    memset(txBuf, 0, totalLen);
+    txBuf[0] = SX1280_CMD_READ_BUFFER;
+    txBuf[1] = bufferOffset;
+    txBuf[2] = 0x00; // NOP
+
+    SPI.transferBytes(txBuf, rxBuf, totalLen);
+
+    memcpy(buffer, &rxBuf[3], payloadLen);
+  } else {
+    SPI.transfer(SX1280_CMD_READ_BUFFER);
+    SPI.transfer(bufferOffset);
+    SPI.transfer(0x00); // NOP
   }
   digitalWrite(_pinNSS, HIGH);
 
@@ -434,10 +484,12 @@ void E28Radio::standby() {
 
 uint8_t E28Radio::getChipStatus() {
   digitalWrite(_pinNSS, LOW);
-  uint8_t status = SPI.transfer(SX1280_CMD_GET_STATUS);
-  SPI.transfer(0x00); // NOP
+  // ⚡ Bolt: Coalesce get status to avoid 2 separate single byte transfers
+  uint8_t txBuf[2] = {SX1280_CMD_GET_STATUS, 0x00};
+  uint8_t rxBuf[2] = {0, 0};
+  SPI.transferBytes(txBuf, rxBuf, 2);
   digitalWrite(_pinNSS, HIGH);
-  return status;
+  return rxBuf[0];
 }
 
 bool E28Radio::checkConnection() {
