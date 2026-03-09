@@ -28,6 +28,11 @@ E28Radio radio;
 uint32_t lastHeartbeat = 0;
 bool connected = false;
 
+// Non-blocking LED state
+uint8_t currentTallyState = STATE_OFF;
+uint32_t locatorStartTime = 0;
+bool isLocatorActive = false;
+
 void setup() {
     Serial.begin(115200);
     delay(2000);
@@ -75,18 +80,12 @@ void loop() {
                     Serial.printf("Tally Update: %d (CMD: %d, RSSI: %d)\n", pkt.state, pkt.command, radio.getRSSI());
                     
                     if (pkt.command == CMD_PING) {
-                        // Locator / Buzz
-                        for(int i=0; i<5; i++) {
-                            digitalWrite(PIN_LED, LED_ON); delay(50);
-                            digitalWrite(PIN_LED, LED_OFF); delay(50);
-                        }
+                        // ⚡ Bolt: Use non-blocking state machine for locator
+                        isLocatorActive = true;
+                        locatorStartTime = millis();
                     } 
-                    else if (pkt.state == STATE_PROGRAM) {
-                        digitalWrite(PIN_LED, LED_ON);
-                    } else if (pkt.state == STATE_PREVIEW) {
-                         digitalWrite(PIN_LED, LED_ON); // TODO: Blink?
-                    } else {
-                        digitalWrite(PIN_LED, LED_OFF);
+                    else {
+                        currentTallyState = pkt.state;
                     }
                 }
             } else {
@@ -102,5 +101,40 @@ void loop() {
     if (millis() - lastHeartbeat > 5000) {
         lastHeartbeat = millis();
         Serial.printf("Still alive. RSSI: %d\n", radio.getRSSI());
+    }
+
+    // ⚡ Bolt: Non-blocking LED state machine
+    uint32_t now = millis();
+
+    if (isLocatorActive) {
+        // Locator runs for 500ms
+        if (now - locatorStartTime < 500) {
+            // Fast blink (50ms ON / 50ms OFF)
+            if (((now - locatorStartTime) / 50) % 2 == 0) {
+                digitalWrite(PIN_LED, LED_ON);
+            } else {
+                digitalWrite(PIN_LED, LED_OFF);
+            }
+        } else {
+            // Locator finished
+            isLocatorActive = false;
+        }
+    }
+
+    if (!isLocatorActive) {
+        // Normal Tally State processing
+        if (currentTallyState == STATE_PROGRAM) {
+            // Solid ON
+            digitalWrite(PIN_LED, LED_ON);
+        } else if (currentTallyState == STATE_PREVIEW) {
+            // Slow blink (500ms ON / 500ms OFF)
+            if ((now / 500) % 2 == 0) {
+                digitalWrite(PIN_LED, LED_ON);
+            } else {
+                digitalWrite(PIN_LED, LED_OFF);
+            }
+        } else {
+            digitalWrite(PIN_LED, LED_OFF);
+        }
     }
 }
