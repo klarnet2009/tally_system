@@ -1,3 +1,6 @@
+#ifndef ARDUINO_H
+#define ARDUINO_H
+
 #include <stdint.h>
 #include <string.h>
 
@@ -24,3 +27,5 @@ public:
 };
 
 extern SPIClass SPI;
+
+#endif

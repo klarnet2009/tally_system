@@ -28,6 +28,24 @@ E28Radio radio;
 uint32_t lastHeartbeat = 0;
 bool connected = false;
 
+// ⚡ Bolt: State variables for non-blocking LED sequences
+TallyState currentTallyState = STATE_OFF;
+bool pingBlinkActive = false;
+uint8_t pingBlinksRemaining = 0;
+uint32_t lastPingBlinkTime = 0;
+bool pingBlinkState = false;
+
+// Helper to apply the current tally state to the LED
+void applyTallyState() {
+    if (currentTallyState == STATE_PROGRAM) {
+        digitalWrite(PIN_LED, LED_ON);
+    } else if (currentTallyState == STATE_PREVIEW) {
+        digitalWrite(PIN_LED, LED_ON); // TODO: Blink?
+    } else {
+        digitalWrite(PIN_LED, LED_OFF);
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     delay(2000);
@@ -75,18 +93,22 @@ void loop() {
                     Serial.printf("Tally Update: %d (CMD: %d, RSSI: %d)\n", pkt.state, pkt.command, radio.getRSSI());
                     
                     if (pkt.command == CMD_PING) {
-                        // Locator / Buzz
-                        for(int i=0; i<5; i++) {
-                            digitalWrite(PIN_LED, LED_ON); delay(50);
-                            digitalWrite(PIN_LED, LED_OFF); delay(50);
-                        }
-                    } 
-                    else if (pkt.state == STATE_PROGRAM) {
+                        // ⚡ Bolt: Trigger non-blocking Locator / Buzz
+                        // 10 transitions = 5 full blinks (ON/OFF)
+                        pingBlinkActive = true;
+                        pingBlinksRemaining = 10;
+                        pingBlinkState = true;
+                        lastPingBlinkTime = millis();
                         digitalWrite(PIN_LED, LED_ON);
-                    } else if (pkt.state == STATE_PREVIEW) {
-                         digitalWrite(PIN_LED, LED_ON); // TODO: Blink?
-                    } else {
-                        digitalWrite(PIN_LED, LED_OFF);
+                    }
+                    else {
+                        // Update standard tally state
+                        currentTallyState = static_cast<TallyState>(pkt.state);
+
+                        // Apply immediately if not currently pinging
+                        if (!pingBlinkActive) {
+                            applyTallyState();
+                        }
                     }
                 }
             } else {
@@ -98,6 +120,24 @@ void loop() {
         radio.startReceive();
     }
     
+    // ⚡ Bolt: Non-blocking Ping / Locator LED State Machine
+    if (pingBlinkActive) {
+        if (millis() - lastPingBlinkTime >= 50) {
+            lastPingBlinkTime = millis();
+            pingBlinksRemaining--;
+
+            if (pingBlinksRemaining > 0) {
+                // Toggle state
+                pingBlinkState = !pingBlinkState;
+                digitalWrite(PIN_LED, pingBlinkState ? LED_ON : LED_OFF);
+            } else {
+                // Done blinking, restore regular tally state
+                pingBlinkActive = false;
+                applyTallyState();
+            }
+        }
+    }
+
     // Heartbeat debug every 5s
     if (millis() - lastHeartbeat > 5000) {
         lastHeartbeat = millis();
