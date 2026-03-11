@@ -28,6 +28,12 @@ E28Radio radio;
 uint32_t lastHeartbeat = 0;
 bool connected = false;
 
+// ⚡ Bolt: State variables for non-blocking LED sequences
+TallyState currentTallyState = STATE_OFF;
+uint32_t locatorStartTime = 0;
+bool isLocatorActive = false;
+int lastLedState = -1;
+
 void setup() {
     Serial.begin(115200);
     delay(2000);
@@ -75,18 +81,13 @@ void loop() {
                     Serial.printf("Tally Update: %d (CMD: %d, RSSI: %d)\n", pkt.state, pkt.command, radio.getRSSI());
                     
                     if (pkt.command == CMD_PING) {
-                        // Locator / Buzz
-                        for(int i=0; i<5; i++) {
-                            digitalWrite(PIN_LED, LED_ON); delay(50);
-                            digitalWrite(PIN_LED, LED_OFF); delay(50);
-                        }
+                        // ⚡ Bolt: Trigger non-blocking Locator sequence
+                        isLocatorActive = true;
+                        locatorStartTime = millis();
                     } 
-                    else if (pkt.state == STATE_PROGRAM) {
-                        digitalWrite(PIN_LED, LED_ON);
-                    } else if (pkt.state == STATE_PREVIEW) {
-                         digitalWrite(PIN_LED, LED_ON); // TODO: Blink?
-                    } else {
-                        digitalWrite(PIN_LED, LED_OFF);
+                    else {
+                        // ⚡ Bolt: Store current state, LED updated by state machine
+                        currentTallyState = static_cast<TallyState>(pkt.state);
                     }
                 }
             } else {
@@ -98,6 +99,46 @@ void loop() {
         radio.startReceive();
     }
     
+    // ⚡ Bolt: Non-blocking LED state machine
+    int targetLedState = LED_OFF;
+
+    if (isLocatorActive) {
+        uint32_t elapsed = millis() - locatorStartTime;
+        if (elapsed > 500) {
+            // Sequence done (5 blinks x 100ms)
+            isLocatorActive = false;
+        } else {
+            // Blink every 50ms on, 50ms off
+            if ((elapsed % 100) < 50) {
+                targetLedState = LED_ON;
+            } else {
+                targetLedState = LED_OFF;
+            }
+        }
+    }
+
+    // Restore normal state if not in locator sequence
+    if (!isLocatorActive) {
+        if (currentTallyState == STATE_PROGRAM) {
+            targetLedState = LED_ON;
+        } else if (currentTallyState == STATE_PREVIEW) {
+            // Slow blink for preview
+            if ((millis() % 1000) < 500) {
+                targetLedState = LED_ON;
+            } else {
+                targetLedState = LED_OFF;
+            }
+        } else {
+            targetLedState = LED_OFF;
+        }
+    }
+
+    // Only perform hardware I/O if the state actually changed
+    if (targetLedState != lastLedState) {
+        digitalWrite(PIN_LED, targetLedState);
+        lastLedState = targetLedState;
+    }
+
     // Heartbeat debug every 5s
     if (millis() - lastHeartbeat > 5000) {
         lastHeartbeat = millis();
