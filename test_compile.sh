@@ -1,0 +1,1 @@
+g++ -fsyntax-only -I. -I./tally_slave/lib/E28_SX1280 -I./tally_slave/lib/TallyProtocol tally_slave/src/main.cpp tally_slave/lib/E28_SX1280/E28_SX1280.cpp tally_slave/lib/TallyProtocol/TallyProtocol.cpp
