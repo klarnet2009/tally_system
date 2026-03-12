@@ -1,3 +1,6 @@
+#ifndef ARDUINO_H
+#define ARDUINO_H
+
 #include <stdint.h>
 #include <string.h>
 
@@ -24,3 +27,14 @@ public:
 };
 
 extern SPIClass SPI;
+
+class SerialMock {
+public:
+    void begin(int baud) {}
+    void print(const char* str) {}
+    void println(const char* str = "") {}
+    void printf(const char* format, ...) {}
+};
+extern SerialMock Serial;
+
+#endif
