@@ -28,6 +28,45 @@ E28Radio radio;
 uint32_t lastHeartbeat = 0;
 bool connected = false;
 
+// State tracking for non-blocking LED updates
+TallyState currentTallyState = STATE_OFF;
+bool isLocatorActive = false;
+uint32_t locatorStartTime = 0;
+int lastLedState = -1; // -1 ensures it updates on first pass
+
+void updateLed() {
+    uint32_t now = millis();
+    int targetState = LED_OFF;
+
+    // Handle high-priority Locator (PING) sequence
+    if (isLocatorActive) {
+        if (now - locatorStartTime < 1000) { // 1 second duration
+            // 10Hz blink (100ms period)
+            targetState = ((now - locatorStartTime) % 100 < 50) ? LED_ON : LED_OFF;
+        } else {
+            isLocatorActive = false; // Locator done, fall through to tally state
+        }
+    }
+
+    // Normal Tally State processing
+    if (!isLocatorActive) {
+        if (currentTallyState == STATE_PROGRAM) {
+            targetState = LED_ON; // Solid
+        } else if (currentTallyState == STATE_PREVIEW) {
+            // 1Hz blink (1000ms period)
+            targetState = (now % 1000 < 500) ? LED_ON : LED_OFF;
+        } else { // STATE_OFF or unhandled (like STATE_BOTH) defaults to OFF
+            targetState = LED_OFF;
+        }
+    }
+
+    // Only update hardware if state actually changed to prevent bus/CPU overhead
+    if (targetState != lastLedState) {
+        digitalWrite(PIN_LED, targetState);
+        lastLedState = targetState;
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     delay(2000);
@@ -70,23 +109,17 @@ void loop() {
             // Parse packet
             TallyPacket pkt;
             if (TallyProtocol::deserialize(buf, len, pkt)) {
-                // Check if it's for us
-                if (pkt.cameraId == SLAVE_CAM_ID) {
+                // Check if it's for us or broadcast
+                if (pkt.cameraId == SLAVE_CAM_ID || pkt.cameraId == TALLY_BROADCAST_ID) {
                     Serial.printf("Tally Update: %d (CMD: %d, RSSI: %d)\n", pkt.state, pkt.command, radio.getRSSI());
                     
                     if (pkt.command == CMD_PING) {
-                        // Locator / Buzz
-                        for(int i=0; i<5; i++) {
-                            digitalWrite(PIN_LED, LED_ON); delay(50);
-                            digitalWrite(PIN_LED, LED_OFF); delay(50);
-                        }
-                    } 
-                    else if (pkt.state == STATE_PROGRAM) {
-                        digitalWrite(PIN_LED, LED_ON);
-                    } else if (pkt.state == STATE_PREVIEW) {
-                         digitalWrite(PIN_LED, LED_ON); // TODO: Blink?
+                        // ⚡ Bolt: Trigger non-blocking locator sequence
+                        isLocatorActive = true;
+                        locatorStartTime = millis();
                     } else {
-                        digitalWrite(PIN_LED, LED_OFF);
+                        // ⚡ Bolt: Update state and let updateLed() handle hardware changes
+                        currentTallyState = static_cast<TallyState>(pkt.state);
                     }
                 }
             } else {
@@ -98,6 +131,9 @@ void loop() {
         radio.startReceive();
     }
     
+    // Process LED state non-blockingly
+    updateLed();
+
     // Heartbeat debug every 5s
     if (millis() - lastHeartbeat > 5000) {
         lastHeartbeat = millis();
