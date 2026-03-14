@@ -28,6 +28,44 @@ E28Radio radio;
 uint32_t lastHeartbeat = 0;
 bool connected = false;
 
+// ⚡ Bolt: State tracking for non-blocking LED updates
+TallyState currentTallyState = STATE_OFF;
+uint32_t locatorStartTime = 0;
+uint32_t lastLedToggle = 0;
+bool ledIsOn = false;
+
+// ⚡ Bolt: Update LED non-blocking to prevent dropping LoRa packets
+void updateLed() {
+    uint32_t now = millis();
+
+    // 1. High-priority Locator (Ping) Sequence (10Hz fast blink for 1 sec)
+    if (locatorStartTime > 0) {
+        if (now - locatorStartTime > 500) { // 5 blinks * 100ms
+            locatorStartTime = 0; // End locator sequence, restore normal state
+        } else {
+            if (now - lastLedToggle >= 50) { // 50ms on / 50ms off = 100ms period
+                lastLedToggle = now;
+                ledIsOn = !ledIsOn;
+                digitalWrite(PIN_LED, ledIsOn ? LED_ON : LED_OFF);
+            }
+            return; // Skip normal tally logic while locating
+        }
+    }
+
+    // 2. Normal Tally States (matching original exact logic)
+    if (currentTallyState == STATE_PROGRAM || currentTallyState == STATE_PREVIEW) {
+        if (!ledIsOn) {
+            digitalWrite(PIN_LED, LED_ON);
+            ledIsOn = true;
+        }
+    } else {
+        if (ledIsOn) {
+            digitalWrite(PIN_LED, LED_OFF);
+            ledIsOn = false;
+        }
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     delay(2000);
@@ -62,6 +100,9 @@ void setup() {
 void loop() {
     if (!connected) return;
 
+    // ⚡ Bolt: Execute non-blocking LED state machine
+    updateLed();
+
     if (radio.available()) {
         uint8_t buf[E28_MAX_PACKET_SIZE];
         uint8_t len = radio.receive(buf, E28_MAX_PACKET_SIZE);
@@ -75,18 +116,15 @@ void loop() {
                     Serial.printf("Tally Update: %d (CMD: %d, RSSI: %d)\n", pkt.state, pkt.command, radio.getRSSI());
                     
                     if (pkt.command == CMD_PING) {
-                        // Locator / Buzz
-                        for(int i=0; i<5; i++) {
-                            digitalWrite(PIN_LED, LED_ON); delay(50);
-                            digitalWrite(PIN_LED, LED_OFF); delay(50);
-                        }
-                    } 
-                    else if (pkt.state == STATE_PROGRAM) {
+                        // ⚡ Bolt: Start non-blocking locator sequence
+                        locatorStartTime = millis();
+                        lastLedToggle = millis();
+                        ledIsOn = true;
                         digitalWrite(PIN_LED, LED_ON);
-                    } else if (pkt.state == STATE_PREVIEW) {
-                         digitalWrite(PIN_LED, LED_ON); // TODO: Blink?
-                    } else {
-                        digitalWrite(PIN_LED, LED_OFF);
+                    }
+                    else {
+                        // ⚡ Bolt: Update state variable, let updateLed() handle GPIO safely
+                        currentTallyState = static_cast<TallyState>(pkt.state);
                     }
                 }
             } else {
