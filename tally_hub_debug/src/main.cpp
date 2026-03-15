@@ -88,10 +88,12 @@ void oledShow() { oled.display(); }
 // Raw SPI send without using E28Radio class — minimal test
 uint8_t spiGetStatus() {
   digitalWrite(E28_PIN_NSS, LOW);
-  uint8_t status = SPI.transfer(SX1280_CMD_GET_STATUS);
-  uint8_t nop = SPI.transfer(0x00);
+  // ⚡ Bolt: Coalesce get status to avoid 2 separate single byte transfers locking overhead
+  uint8_t txBuf[2] = {SX1280_CMD_GET_STATUS, 0x00};
+  uint8_t rxBuf[2] = {0, 0};
+  SPI.transferBytes(txBuf, rxBuf, 2);
   digitalWrite(E28_PIN_NSS, HIGH);
-  return status;
+  return rxBuf[0];
 }
 
 // Send command via raw SPI
@@ -104,10 +106,15 @@ void spiWriteCmd(uint8_t cmd, uint8_t *data, uint8_t len) {
     yield();
   }
   digitalWrite(E28_PIN_NSS, LOW);
-  SPI.transfer(cmd);
   if (len > 0) {
-    // ⚡ Bolt: Use SPI block transfer to significantly reduce mutex/locking overhead compared to byte-by-byte loop
-    SPI.writeBytes(data, len);
+    // ⚡ Bolt: Fully coalesce cmd and data into a single block transfer
+    // Use fixed stack buffer to avoid heap fragmentation and allocation overhead
+    uint8_t txBuf[260];
+    txBuf[0] = cmd;
+    memcpy(&txBuf[1], data, len);
+    SPI.writeBytes(txBuf, len + 1);
+  } else {
+    SPI.transfer(cmd);
   }
   digitalWrite(E28_PIN_NSS, HIGH);
   // Wait BUSY again
