@@ -115,6 +115,9 @@ void E28Radio::reset() {
 }
 
 void E28Radio::waitBusy() {
+  // ⚡ Bolt: Fast path for high-frequency polling to avoid millis() overhead
+  if (digitalRead(_pinBUSY) == LOW) return;
+
   uint32_t timeout = millis() + 1000;
   while (digitalRead(_pinBUSY) == HIGH) {
     if (millis() > timeout) {
@@ -236,9 +239,19 @@ void E28Radio::clearIrqStatus() {
 }
 
 uint16_t E28Radio::getIrqStatus() {
-  uint8_t irqStatus[2];
-  readCommand(SX1280_CMD_GET_IRQ_STATUS, irqStatus, 2);
-  return ((uint16_t)irqStatus[0] << 8) | irqStatus[1];
+  // ⚡ Bolt: Fast-path inline SPI transfer to bypass readCommand's 520-byte
+  // stack allocation and memcpy overhead for this high-frequency poll.
+  waitBusy();
+  digitalWrite(_pinNSS, LOW);
+
+  uint8_t txBuf[4] = {SX1280_CMD_GET_IRQ_STATUS, 0x00, 0x00, 0x00};
+  uint8_t rxBuf[4] = {0};
+
+  SPI.transferBytes(txBuf, rxBuf, 4);
+  digitalWrite(_pinNSS, HIGH);
+  waitBusy();
+
+  return ((uint16_t)rxBuf[2] << 8) | rxBuf[3];
 }
 
 bool E28Radio::send(uint8_t *data, uint8_t len) {
