@@ -111,12 +111,19 @@ void E28Radio::writeCommand(uint8_t cmd, uint8_t* data, uint8_t len) {
     
     digitalWrite(_pinNSS, LOW);
     if (len > 0) {
-        // ⚡ Bolt: Coalesce cmd and data into a single block transfer
-        // Use fixed stack buffer to avoid heap fragmentation and allocation overhead
-        uint8_t txBuf[260];
-        txBuf[0] = cmd;
-        memcpy(&txBuf[1], data, len);
-        SPI.writeBytes(txBuf, len + 1);
+        // ⚡ Bolt: Fast-path for small writes (e.g. IRQ clears, config) to avoid large stack alloc/memcpy
+        if (len <= 8) {
+            uint8_t txBuf[9];
+            txBuf[0] = cmd;
+            for (int i=0; i<len; i++) txBuf[i+1] = data[i];
+            SPI.writeBytes(txBuf, len + 1);
+        } else {
+            // ⚡ Bolt: Coalesce cmd and data into a single block transfer for larger payloads
+            uint8_t txBuf[260];
+            txBuf[0] = cmd;
+            memcpy(&txBuf[1], data, len);
+            SPI.writeBytes(txBuf, len + 1);
+        }
     } else {
         SPI.transfer(cmd);
     }
@@ -130,18 +137,26 @@ void E28Radio::readCommand(uint8_t cmd, uint8_t* data, uint8_t len) {
     
     digitalWrite(_pinNSS, LOW);
     if (len > 0) {
-        // ⚡ Bolt: Coalesce cmd, NOP, and read dummy bytes into a single block transfer
-        // Use fixed stack buffer to avoid heap overhead
-        uint8_t txBuf[260];
-        uint8_t rxBuf[260];
-        uint32_t totalLen = len + 2;
+        // ⚡ Bolt: Fast-path for small reads (e.g. IRQ checks) to avoid large stack alloc/memcpy
+        if (len <= 8) {
+            uint8_t txBuf[10] = {cmd, 0x00}; // NOP
+            uint8_t rxBuf[10] = {0};
+            uint32_t totalLen = len + 2;
+            SPI.transferBytes(txBuf, rxBuf, totalLen);
+            for (int i=0; i<len; i++) data[i] = rxBuf[i+2];
+        } else {
+            // ⚡ Bolt: Coalesce cmd, NOP, and read dummy bytes into a single block transfer
+            uint8_t txBuf[260];
+            uint8_t rxBuf[260];
+            uint32_t totalLen = len + 2;
 
-        memset(txBuf, 0, totalLen);
-        txBuf[0] = cmd;
-        txBuf[1] = 0x00; // NOP
+            memset(txBuf, 0, totalLen);
+            txBuf[0] = cmd;
+            txBuf[1] = 0x00; // NOP
 
-        SPI.transferBytes(txBuf, rxBuf, totalLen);
-        memcpy(data, &rxBuf[2], len);
+            SPI.transferBytes(txBuf, rxBuf, totalLen);
+            memcpy(data, &rxBuf[2], len);
+        }
     } else {
         SPI.transfer(cmd);
         SPI.transfer(0x00); // NOP
