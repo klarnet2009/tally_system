@@ -96,6 +96,9 @@ void E28Radio::reset() {
 }
 
 void E28Radio::waitBusy() {
+    // ⚡ Bolt: Fast-path early return to avoid millis() and variable initialization overhead in tight polling loops
+    if (digitalRead(_pinBUSY) == LOW) return;
+
     uint32_t timeout = millis() + 1000;
     while (digitalRead(_pinBUSY) == HIGH) {
         if (millis() > timeout) {
