@@ -406,7 +406,22 @@ void setup(){
 }
 
 void loop(){
-  if(WiFi.status()!=WL_CONNECTED){ static uint32_t lastRetry=0; static uint8_t lostFrame=0; if(millis()-lastRetry>WIFI_RETRY_MS){ lastRetry=millis(); WiFi.disconnect(); WiFi.begin(WIFI_SSID, WIFI_PASS);} drawLoadingScreen("Wi-Fi lost", "Reconnecting...", lostFrame++); delay(150); return; }
+  // ⚡ Bolt: Non-blocking WiFi reconnect screen to keep background tasks responsive
+  if(WiFi.status()!=WL_CONNECTED){
+    static uint32_t lastRetry=0;
+    static uint32_t lastAnim=0;
+    static uint8_t lostFrame=0;
+    if(millis()-lastRetry>WIFI_RETRY_MS){
+      lastRetry=millis();
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+    if(millis()-lastAnim > 150){
+      lastAnim=millis();
+      drawLoadingScreen("Wi-Fi lost", "Reconnecting...", lostFrame++);
+    }
+    return;
+  }
 
   // if(!atemConnected && millis()-lastAtemAttempt > 500) tryConnectAtem(); // ATEM disabled for LoRa debug
 
