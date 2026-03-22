@@ -132,8 +132,8 @@ void loop() {
             }
         }
         
-        // Return to RX mode strictly? 
-        radio.startReceive();
+        // ⚡ Bolt: Fast RX re-arm to avoid standby/SPI overhead and prevent dropped packets
+        radio.clearRxIrq();
     }
     
     // Heartbeat debug every 5s

@@ -107,6 +107,7 @@ public:
     
     // Reception
     void startReceive();
+    void clearRxIrq(); // Lightweight: just clear IRQ, stay in continuous RX
     bool available();
     uint8_t receive(uint8_t* buffer, uint8_t maxLen);
     int8_t getRSSI();
