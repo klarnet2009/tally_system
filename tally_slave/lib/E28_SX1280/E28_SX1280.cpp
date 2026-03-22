@@ -350,8 +350,28 @@ void E28Radio::startReceive() {
     writeCommand(SX1280_CMD_SET_RX, rxParams, 3);
 }
 
+void E28Radio::clearRxIrq() {
+    // Fast RX re-arm: clear IRQ + restart continuous RX (no standby needed)
+    clearIrqStatus();
+    // Ensure LNA is enabled
+    if (_pinTXEN != -1)
+        digitalWrite(_pinTXEN, LOW);
+    if (_pinRXEN != -1)
+        digitalWrite(_pinRXEN, HIGH);
+    // Re-issue continuous RX command (forces back to RX if radio exited)
+    uint8_t rxParams[3] = {0xFF, 0xFF, 0xFF};
+    writeCommand(SX1280_CMD_SET_RX, rxParams, 3);
+}
+
 bool E28Radio::available() {
-    return (getIrqStatus() & 0x0002) != 0;  // RxDone bit
+    // Read IRQ register directly (no DIO1 pin check — unreliable on some boards)
+    uint16_t irq = getIrqStatus();
+    // Check for CRC error first — discard bad packet silently
+    if (irq & 0x0040) { // CrcError bit
+        clearIrqStatus();
+        return false;
+    }
+    return (irq & 0x0002) != 0;  // RxDone bit
 }
 
 uint8_t E28Radio::receive(uint8_t* buffer, uint8_t maxLen) {
