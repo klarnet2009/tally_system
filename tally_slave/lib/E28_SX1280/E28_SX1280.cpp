@@ -248,16 +248,25 @@ bool E28Radio::send(uint8_t* data, uint8_t len) {
     waitBusy();
     digitalWrite(_pinNSS, LOW);
     if (len > 0) {
-        // ⚡ Bolt: Coalesce command, offset and payload into a single SPI transfer
-        // Use fixed stack buffer
-        uint8_t txBuf[260];
-        uint32_t totalLen = len + 2;
+        // ⚡ Bolt: Fast-path for small payloads (e.g. 8-byte TallyPackets) to avoid memcpy and large stack buffers
+        if (len <= 8) {
+            uint8_t txBuf[10];
+            txBuf[0] = SX1280_CMD_WRITE_BUFFER;
+            txBuf[1] = 0x00; // Offset
+            for (int i=0; i<len; i++) txBuf[i+2] = data[i];
+            SPI.writeBytes(txBuf, len + 2);
+        } else {
+            // ⚡ Bolt: Coalesce command, offset and payload into a single SPI transfer
+            // Use fixed stack buffer
+            uint8_t txBuf[260];
+            uint32_t totalLen = len + 2;
 
-        txBuf[0] = SX1280_CMD_WRITE_BUFFER;
-        txBuf[1] = 0x00; // Offset
-        memcpy(&txBuf[2], data, len);
+            txBuf[0] = SX1280_CMD_WRITE_BUFFER;
+            txBuf[1] = 0x00; // Offset
+            memcpy(&txBuf[2], data, len);
 
-        SPI.writeBytes(txBuf, totalLen);
+            SPI.writeBytes(txBuf, totalLen);
+        }
     } else {
         SPI.transfer(SX1280_CMD_WRITE_BUFFER);
         SPI.transfer(0x00); // Offset
@@ -302,16 +311,25 @@ bool E28Radio::sendAsync(uint8_t* data, uint8_t len) {
     waitBusy();
     digitalWrite(_pinNSS, LOW);
     if (len > 0) {
-        // ⚡ Bolt: Coalesce command, offset and payload into a single SPI transfer
-        // Use fixed stack buffer
-        uint8_t txBuf[260];
-        uint32_t totalLen = len + 2;
+        // ⚡ Bolt: Fast-path for small payloads (e.g. 8-byte TallyPackets) to avoid memcpy and large stack buffers
+        if (len <= 8) {
+            uint8_t txBuf[10];
+            txBuf[0] = SX1280_CMD_WRITE_BUFFER;
+            txBuf[1] = 0x00; // Offset
+            for (int i=0; i<len; i++) txBuf[i+2] = data[i];
+            SPI.writeBytes(txBuf, len + 2);
+        } else {
+            // ⚡ Bolt: Coalesce command, offset and payload into a single SPI transfer
+            // Use fixed stack buffer
+            uint8_t txBuf[260];
+            uint32_t totalLen = len + 2;
 
-        txBuf[0] = SX1280_CMD_WRITE_BUFFER;
-        txBuf[1] = 0x00; // Offset
-        memcpy(&txBuf[2], data, len);
+            txBuf[0] = SX1280_CMD_WRITE_BUFFER;
+            txBuf[1] = 0x00; // Offset
+            memcpy(&txBuf[2], data, len);
 
-        SPI.writeBytes(txBuf, totalLen);
+            SPI.writeBytes(txBuf, totalLen);
+        }
     } else {
         SPI.transfer(SX1280_CMD_WRITE_BUFFER);
         SPI.transfer(0x00); // Offset
@@ -390,20 +408,29 @@ uint8_t E28Radio::receive(uint8_t* buffer, uint8_t maxLen) {
     waitBusy();
     digitalWrite(_pinNSS, LOW);
     if (payloadLen > 0) {
-        // ⚡ Bolt: Coalesce command, offset, NOP and read dummy bytes into a single SPI transfer
-        // Use fixed stack buffer
-        uint8_t txBuf[260];
-        uint8_t rxBuf[260];
-        uint32_t totalLen = payloadLen + 3;
+        // ⚡ Bolt: Fast-path for small payloads (e.g. 8-byte TallyPackets) to avoid memcpy and large stack buffers
+        if (payloadLen <= 8) {
+            uint8_t txBuf[11] = {SX1280_CMD_READ_BUFFER, bufferOffset, 0x00};
+            uint8_t rxBuf[11] = {0};
+            uint32_t totalLen = payloadLen + 3;
+            SPI.transferBytes(txBuf, rxBuf, totalLen);
+            for (int i=0; i<payloadLen; i++) buffer[i] = rxBuf[i+3];
+        } else {
+            // ⚡ Bolt: Coalesce command, offset, NOP and read dummy bytes into a single SPI transfer
+            // Use fixed stack buffer
+            uint8_t txBuf[260];
+            uint8_t rxBuf[260];
+            uint32_t totalLen = payloadLen + 3;
 
-        memset(txBuf, 0, totalLen);
-        txBuf[0] = SX1280_CMD_READ_BUFFER;
-        txBuf[1] = bufferOffset;
-        txBuf[2] = 0x00; // NOP
+            memset(txBuf, 0, totalLen);
+            txBuf[0] = SX1280_CMD_READ_BUFFER;
+            txBuf[1] = bufferOffset;
+            txBuf[2] = 0x00; // NOP
 
-        SPI.transferBytes(txBuf, rxBuf, totalLen);
+            SPI.transferBytes(txBuf, rxBuf, totalLen);
 
-        memcpy(buffer, &rxBuf[3], payloadLen);
+            memcpy(buffer, &rxBuf[3], payloadLen);
+        }
     } else {
         SPI.transfer(SX1280_CMD_READ_BUFFER);
         SPI.transfer(bufferOffset);
