@@ -511,7 +511,13 @@ void loop(){
   }
 
   // ==== OLED (LoRa debug mode - always active) ====
-  drawLoRaDebug();
+  // ⚡ Bolt: Rate-limit slow synchronous I2C OLED updates and SPI checks to 2Hz
+  // to avoid blocking the main loop and dropping LoRa packets.
+  static uint32_t lastLoRaDebugDraw = 0;
+  if (millis() - lastLoRaDebugDraw > 500) {
+    lastLoRaDebugDraw = millis();
+    drawLoRaDebug();
+  }
 
   delay(10);
 }
