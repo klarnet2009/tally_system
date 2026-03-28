@@ -343,7 +343,11 @@ void tryConnectAtem(){
   }
   target.fromString(cfgIP);
   
-  drawLoadingScreen("ATEM", ipToStr(target).c_str(), atemFrame++);
+  // ⚡ Bolt: Hoist IP string conversion to avoid redundant heap allocations in UI loop
+  String targetStr = ipToStr(target);
+  const char* targetCStr = targetStr.c_str();
+
+  drawLoadingScreen("ATEM", targetCStr, atemFrame++);
   
   if(!atem) atem = CreateAtemClient();
   atem->begin(target); atem->connect();
@@ -352,14 +356,14 @@ void tryConnectAtem(){
   while(millis()-t0 < 3000) {
     atem->loop(); 
     if(atem->connected()) break;
-    drawLoadingScreen("ATEM", ipToStr(target).c_str(), atemFrame++);
+    drawLoadingScreen("ATEM", targetCStr, atemFrame++);
     delay(50);
   }
   atemConnected = atem->connected();
   if(atemConnected) atemAddr = target;
   
-  if(atemConnected) drawCenteredMsg("ATEM: connected", ipToStr(target).c_str());
-  else drawCenteredMsg("ATEM: failed", ipToStr(target).c_str());
+  if(atemConnected) drawCenteredMsg("ATEM: connected", targetCStr);
+  else drawCenteredMsg("ATEM: failed", targetCStr);
 }
 
 void setup(){
