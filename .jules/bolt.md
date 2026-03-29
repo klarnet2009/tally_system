@@ -13,3 +13,7 @@
 ## 2026-03-24 - Redundant String Allocations in Polling/UI Loops
 **Learning:** Repeatedly constructing `String` objects (and converting them via `.c_str()`) within non-blocking polling loops or UI rendering sequences (e.g., connection attempts checking `millis()`) creates unnecessary heap allocations, memory fragmentation, and CPU overhead on ESP32 devices.
 **Action:** Always hoist invariant string constructions out of repetitive loops. Cache the resulting `String` object and its `.c_str()` pointer *before* entering the loop to ensure minimal footprint during high-frequency execution sequences.
+
+## 2026-03-29 - Unconditional Synchronous I2C UI Updates
+**Learning:** Unconditional synchronous I2C peripheral updates (like OLED screens via `drawLoRaDebug()`) within embedded `loop()` functions block the main loop significantly. This starvation prevents high-frequency background tasks (like LoRa radio polling) from executing in a timely manner, which can lead to dropped packets or increased latency.
+**Action:** Always rate-limit synchronous UI rendering and slow peripheral communication loops using non-blocking `millis()` timers (e.g., updating at 2-5Hz) to ensure critical system tasks remain responsive.
