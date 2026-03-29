@@ -515,7 +515,11 @@ void loop(){
   }
 
   // ==== OLED (LoRa debug mode - always active) ====
-  drawLoRaDebug();
+  static uint32_t lastLoRaDebugDraw = 0;
+  if (millis() - lastLoRaDebugDraw > 500) {
+    lastLoRaDebugDraw = millis();
+    drawLoRaDebug();
+  }
 
   delay(10);
 }
