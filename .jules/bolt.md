@@ -17,3 +17,7 @@
 ## 2026-03-29 - Unconditional Synchronous I2C UI Updates
 **Learning:** Unconditional synchronous I2C peripheral updates (like OLED screens via `drawLoRaDebug()`) within embedded `loop()` functions block the main loop significantly. This starvation prevents high-frequency background tasks (like LoRa radio polling) from executing in a timely manner, which can lead to dropped packets or increased latency.
 **Action:** Always rate-limit synchronous UI rendering and slow peripheral communication loops using non-blocking `millis()` timers (e.g., updating at 2-5Hz) to ensure critical system tasks remain responsive.
+
+## 2026-03-31 - Blocking Delays in Polling/UI Loops
+**Learning:** Sequential `delay()` calls in UI sequences (like the `LOCATOR` sequence taking ~2.5s) in embedded `loop()` functions cause massive starvation, completely halting critical background operations like `atem->loop()` (TCP connection), WiFi management, and NimBLE advertising. This results in connection drops and missed events.
+**Action:** Always replace blocking `delay()` sequences inside the main loop with non-blocking `millis()` state machines that track `elapsed` time and update system state incrementally, allowing high-frequency background tasks to run concurrently.

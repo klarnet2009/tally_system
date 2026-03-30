@@ -493,24 +493,41 @@ void loop(){
     }
     
     // Locator / Ping (Button 0)
-    static uint32_t lastPing = 0;
-    if (digitalRead(0) == LOW && millis() - lastPing > 500) {
-        lastPing = millis();
+    // ⚡ Bolt: Non-blocking LOCATOR state machine to prevent blocking ATEM/WiFi/NimBLE tasks
+    static uint32_t locatorStartTime = 0;
+    static uint8_t locatorStep = 0;
+
+    if (digitalRead(0) == LOW && locatorStep == 0) {
         drawCenteredMsg("LOCATOR", "Ping sent -> Cam 1");
-        
-        // Send 3 times for reliability + blink LED
-        for(int k=0; k<3; k++) {
-          digitalWrite(33, HIGH); // Blue LED ON
-          TallyPacket pkt = TallyProtocol::createPingPacket(1); 
-          uint8_t buf[TALLY_PACKET_SIZE];
-          TallyProtocol::serialize(pkt, buf);
-          radio.send(buf, TALLY_PACKET_SIZE);
-          g_loraTxCount++;
-          delay(100);
-          digitalWrite(33, LOW);  // Blue LED OFF
-          delay(50);
+        locatorStep = 1;
+        locatorStartTime = millis();
+    }
+
+    if (locatorStep > 0) {
+        uint32_t now = millis();
+        uint32_t elapsed = now - locatorStartTime;
+
+        // Steps 1, 3, 5: Turn LED ON, send ping (wait 50ms before steps 3 and 5)
+        if ((locatorStep == 1) || (locatorStep % 2 != 0 && locatorStep <= 5 && elapsed >= 50)) {
+            digitalWrite(33, HIGH);
+            TallyPacket pkt = TallyProtocol::createPingPacket(1);
+            uint8_t buf[TALLY_PACKET_SIZE];
+            TallyProtocol::serialize(pkt, buf);
+            radio.send(buf, TALLY_PACKET_SIZE);
+            g_loraTxCount++;
+            locatorStep++;
+            locatorStartTime = now;
         }
-        delay(2000); // Wait so user can see message
+        // Steps 2, 4, 6: Wait 100ms, turn LED OFF
+        else if (locatorStep % 2 == 0 && locatorStep <= 6 && elapsed >= 100) {
+            digitalWrite(33, LOW);
+            locatorStep++;
+            locatorStartTime = now;
+        }
+        // Wait 2000ms after sequence before allowing another ping
+        else if (locatorStep == 7 && elapsed >= 2000) {
+            locatorStep = 0;
+        }
     }
   }
 
