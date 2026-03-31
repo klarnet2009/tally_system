@@ -21,3 +21,7 @@
 ## 2026-03-31 - Blocking Delays in Polling/UI Loops
 **Learning:** Sequential `delay()` calls in UI sequences (like the `LOCATOR` sequence taking ~2.5s) in embedded `loop()` functions cause massive starvation, completely halting critical background operations like `atem->loop()` (TCP connection), WiFi management, and NimBLE advertising. This results in connection drops and missed events.
 **Action:** Always replace blocking `delay()` sequences inside the main loop with non-blocking `millis()` state machines that track `elapsed` time and update system state incrementally, allowing high-frequency background tasks to run concurrently.
+
+## 2026-04-01 - Fast-Path Opts in Protocol-Specific Wrappers
+**Learning:** Even when generic SPI `writeCommand` and `readCommand` abstractions have been optimized with fast-paths, higher-level protocol-specific wrappers like `send()`, `sendAsync()`, and `receive()` might still naively allocate maximum-size buffers (e.g., 260 bytes) and perform expensive memory copies for very small payloads (like 8-byte Tally packets). This introduces unnecessary CPU latency in tight event loops.
+**Action:** When working with embedded drivers that handle variable-length hardware payloads, always ensure that both the generic low-level abstractions AND the protocol-level interface functions (like `send`/`receive`) implement stack-allocation fast-paths for small payloads.
