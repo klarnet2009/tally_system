@@ -25,3 +25,11 @@
 ## 2026-04-01 - Fast-Path Opts in Protocol-Specific Wrappers
 **Learning:** Even when generic SPI `writeCommand` and `readCommand` abstractions have been optimized with fast-paths, higher-level protocol-specific wrappers like `send()`, `sendAsync()`, and `receive()` might still naively allocate maximum-size buffers (e.g., 260 bytes) and perform expensive memory copies for very small payloads (like 8-byte Tally packets). This introduces unnecessary CPU latency in tight event loops.
 **Action:** When working with embedded drivers that handle variable-length hardware payloads, always ensure that both the generic low-level abstractions AND the protocol-level interface functions (like `send`/`receive`) implement stack-allocation fast-paths for small payloads.
+
+## 2024-04-03 - [TallyProtocol: Eliminate memcpy overhead for tiny payloads]
+**Learning:** In C/C++ embedded environments, calling `memcpy` or `memset` for tiny, fixed-size payloads (like the 8-byte `TallyPacket`) incurs function call overhead that can be slower than executing a simple direct loop, as stack allocation and basic assignment are constant-time operations. This is a crucial fast-path optimization for tight, high-frequency protocol parsing.
+**Action:** When implementing protocol wrappers or packet serialization/deserialization for small, constant-size payloads (<= 8 bytes), prioritize direct array assignments or explicit loops over generic `memcpy` to eliminate unnecessary function overhead without compromising readability.
+
+## 2024-04-03 - [TallyProtocol: Fast-path early return on noisy packets]
+**Learning:** In radio communications like LoRa, the receiver can pick up noise or packets from other systems. The `deserialize` function was unconditionally copying the buffer into the packet struct and then validating the CRC, which is computationally expensive (a loop over 7 bytes). If the first byte isn't the `TALLY_START_BYTE`, the packet is invalid anyway.
+**Action:** Always add an early return fast-path to check for the start byte *before* performing expensive memory copies and CRC validation on incoming packets. This saves CPU cycles on the critical RX path, especially in noisy RF environments.
