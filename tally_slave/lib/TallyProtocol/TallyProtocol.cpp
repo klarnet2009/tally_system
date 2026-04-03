@@ -64,6 +64,11 @@ bool TallyProtocol::deserialize(const uint8_t* buffer, uint8_t len, TallyPacket&
         return false;
     }
     
+    // ⚡ Bolt: Fast-path early return to skip memcpy and CRC overhead for noisy/invalid packets
+    if (buffer[0] != TALLY_START_BYTE) {
+        return false;
+    }
+
     memcpy(&packet, buffer, TALLY_PACKET_SIZE);
     return validate(packet);
 }
