@@ -69,6 +69,11 @@ bool TallyProtocol::deserialize(const uint8_t* buffer, uint8_t len, TallyPacket&
         return false;
     }
 
+    // ⚡ Bolt: Fast-path early return to avoid memcpy and CRC overhead if command is out of bounds
+    if (buffer[1] < CMD_SET_STATE || buffer[1] > CMD_HEARTBEAT) {
+        return false;
+    }
+
     memcpy(&packet, buffer, TALLY_PACKET_SIZE);
     return validate(packet);
 }
@@ -78,14 +83,14 @@ bool TallyProtocol::validate(const TallyPacket& packet) {
     if (packet.start != TALLY_START_BYTE) {
         return false;
     }
-    
-    // Check CRC
-    if (packet.crc != calculateCRC(packet)) {
+
+    // Validate command (fast-path before expensive CRC calculation)
+    if (packet.command < CMD_SET_STATE || packet.command > CMD_HEARTBEAT) {
         return false;
     }
     
-    // Validate command
-    if (packet.command < CMD_SET_STATE || packet.command > CMD_HEARTBEAT) {
+    // Check CRC
+    if (packet.crc != calculateCRC(packet)) {
         return false;
     }
     
