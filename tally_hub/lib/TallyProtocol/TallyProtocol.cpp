@@ -69,6 +69,11 @@ bool TallyProtocol::deserialize(const uint8_t* buffer, uint8_t len, TallyPacket&
         return false;
     }
 
+    // ⚡ Bolt: Fast-path command validation before expensive memcpy and CRC calculation
+    if (buffer[1] < CMD_SET_STATE || buffer[1] > CMD_HEARTBEAT) {
+        return false;
+    }
+
     memcpy(&packet, buffer, TALLY_PACKET_SIZE);
     return validate(packet);
 }
