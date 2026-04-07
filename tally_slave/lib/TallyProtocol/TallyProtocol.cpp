@@ -84,13 +84,14 @@ bool TallyProtocol::validate(const TallyPacket& packet) {
         return false;
     }
     
-    // Check CRC
-    if (packet.crc != calculateCRC(packet)) {
+    // ⚡ Bolt: Fast-path command validation before expensive CRC calculation
+    // Validate command
+    if (packet.command < CMD_SET_STATE || packet.command > CMD_HEARTBEAT) {
         return false;
     }
     
-    // Validate command
-    if (packet.command < CMD_SET_STATE || packet.command > CMD_HEARTBEAT) {
+    // Check CRC
+    if (packet.crc != calculateCRC(packet)) {
         return false;
     }
     
