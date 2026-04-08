@@ -104,8 +104,10 @@ void loop() {
     updateLed();
 
     if (radio.available()) {
-        uint8_t buf[E28_MAX_PACKET_SIZE];
-        uint8_t len = radio.receive(buf, E28_MAX_PACKET_SIZE);
+        // ⚡ Bolt: Use TALLY_PACKET_SIZE to restrict RX length, guaranteeing the
+        // E28Radio::receive fast-path (<= 8 bytes) activates and avoids 260-byte block transfer on malformed packets.
+        uint8_t buf[TALLY_PACKET_SIZE];
+        uint8_t len = radio.receive(buf, TALLY_PACKET_SIZE);
         
         if (len > 0) {
             // Parse packet
