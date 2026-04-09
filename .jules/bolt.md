@@ -33,3 +33,7 @@
 ## 2024-04-03 - [TallyProtocol: Fast-path early return on noisy packets]
 **Learning:** In radio communications like LoRa, the receiver can pick up noise or packets from other systems. The `deserialize` function was unconditionally copying the buffer into the packet struct and then validating the CRC, which is computationally expensive (a loop over 7 bytes). If the first byte isn't the `TALLY_START_BYTE`, the packet is invalid anyway.
 **Action:** Always add an early return fast-path to check for the start byte *before* performing expensive memory copies and CRC validation on incoming packets. This saves CPU cycles on the critical RX path, especially in noisy RF environments.
+
+## 2026-04-09 - Algorithmic Fast-Path Early Returns in Broadcast Polling Loops
+**Learning:** In broadcast-heavy polling loops where a device continuously receives state packets for multiple clients (e.g., a hub broadcasting states for 8 cameras sequentially), it's highly inefficient for a slave to unconditionally perform memory copying (`memcpy`) and CRC validation on every single packet just to determine it's not the intended recipient.
+**Action:** Always implement a fast-path algorithmic early return before computationally expensive operations like deserialization. Inspect the relevant identifier bytes (e.g., `buf[2]` for camera ID) directly from the raw incoming buffer to immediately bypass processing for packets not destined for the current device, saving significant CPU cycles in high-frequency event loops.

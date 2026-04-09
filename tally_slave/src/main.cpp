@@ -110,27 +110,36 @@ void loop() {
         uint8_t len = radio.receive(buf, TALLY_PACKET_SIZE);
         
         if (len > 0) {
-            // Parse packet
-            TallyPacket pkt;
-            if (TallyProtocol::deserialize(buf, len, pkt)) {
-                // Check if it's for us
-                if (pkt.cameraId == SLAVE_CAM_ID) {
-                    Serial.printf("Tally Update: %d (CMD: %d, RSSI: %d)\n", pkt.state, pkt.command, radio.getRSSI());
-                    
-                    if (pkt.command == CMD_PING) {
-                        // ⚡ Bolt: Start non-blocking locator sequence
-                        locatorStartTime = millis();
-                        lastLedToggle = millis();
-                        ledIsOn = true;
-                        digitalWrite(PIN_LED, LED_ON);
-                    }
-                    else {
-                        // ⚡ Bolt: Update state variable, let updateLed() handle GPIO safely
-                        currentTallyState = static_cast<TallyState>(pkt.state);
-                    }
-                }
+            // ⚡ Bolt: Fast-path algorithmic early return for broadcast-heavy polling loops.
+            // The Hub continuously broadcasts state packets for up to 8 cameras sequentially.
+            // Bypassing TallyProtocol::deserialize() for the 7 packets meant for other cameras
+            // eliminates unnecessary memcpy operations and computationally expensive CRC validation
+            // loops, saving CPU cycles in the high-frequency event loop.
+            if (len >= 3 && buf[2] != SLAVE_CAM_ID) {
+                // Not for us, fast-path skip processing
             } else {
-                Serial.println("Invalid Packet");
+                // Parse packet
+                TallyPacket pkt;
+                if (TallyProtocol::deserialize(buf, len, pkt)) {
+                    // Check if it's for us (redundant but safe)
+                    if (pkt.cameraId == SLAVE_CAM_ID) {
+                        Serial.printf("Tally Update: %d (CMD: %d, RSSI: %d)\n", pkt.state, pkt.command, radio.getRSSI());
+
+                        if (pkt.command == CMD_PING) {
+                            // ⚡ Bolt: Start non-blocking locator sequence
+                            locatorStartTime = millis();
+                            lastLedToggle = millis();
+                            ledIsOn = true;
+                            digitalWrite(PIN_LED, LED_ON);
+                        }
+                        else {
+                            // ⚡ Bolt: Update state variable, let updateLed() handle GPIO safely
+                            currentTallyState = static_cast<TallyState>(pkt.state);
+                        }
+                    }
+                } else {
+                    Serial.println("Invalid Packet");
+                }
             }
         }
         
