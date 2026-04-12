@@ -37,3 +37,6 @@
 ## 2026-04-09 - Algorithmic Fast-Path Early Returns in Broadcast Polling Loops
 **Learning:** In broadcast-heavy polling loops where a device continuously receives state packets for multiple clients (e.g., a hub broadcasting states for 8 cameras sequentially), it's highly inefficient for a slave to unconditionally perform memory copying (`memcpy`) and CRC validation on every single packet just to determine it's not the intended recipient.
 **Action:** Always implement a fast-path algorithmic early return before computationally expensive operations like deserialization. Inspect the relevant identifier bytes (e.g., `buf[2]` for camera ID) directly from the raw incoming buffer to immediately bypass processing for packets not destined for the current device, saving significant CPU cycles in high-frequency event loops.
+## 2026-04-12 - Replaced blocking ATEM connection delay
+**Learning:** Connection logic that relies on `delay()` in `while` loops blocks critical background tasks like `WiFi.status()` and `atem->loop()`, which can lead to missed events and disconnections during outages.
+**Action:** Always refactor connection attempts inside the main loop to use a non-blocking `millis()` state machine, checking conditions and updating the UI progressively without yielding control indefinitely.

@@ -331,39 +331,40 @@ void drawLoRaDebug() {
 
 IPAddress findAtemInSubnet(){ IPAddress local=WiFi.localIP(); IPAddress test; for(int i=1;i<=254;i++){ test=IPAddress(local[0],local[1],local[2],i); if(test==local) continue; WiFiClient probe; probe.setTimeout(120); if(probe.connect(test,9910)){ probe.stop(); return test; } delay(5);} return IPAddress(0,0,0,0); }
 
+// ⚡ Bolt: State variables for non-blocking ATEM connection sequence
+static bool isConnectingAtem = false;
+static uint32_t atemConnectStart = 0;
+static uint32_t lastAtemFrameUpdate = 0;
+static uint8_t atemAnimFrame = 0;
+static String atemTargetStr = "";
+static IPAddress atemTargetIp;
+
 void tryConnectAtem(){
+  if (isConnectingAtem) return; // Prevent concurrent connection attempts
+
   lastAtemAttempt = millis();
-  uint8_t atemFrame = 0;
-  IPAddress target;
+  atemAnimFrame = 0;
   
   String cfgIP = String(ATEM_IP_STR);
   if(!cfgIP.length()) {
     drawCenteredMsg("ATEM: no IP set", "Set ATEM_IP_STR");
     return;
   }
-  target.fromString(cfgIP);
+  atemTargetIp.fromString(cfgIP);
   
   // ⚡ Bolt: Hoist IP string conversion to avoid redundant heap allocations in UI loop
-  String targetStr = ipToStr(target);
-  const char* targetCStr = targetStr.c_str();
+  atemTargetStr = ipToStr(atemTargetIp);
+  const char* targetCStr = atemTargetStr.c_str();
 
-  drawLoadingScreen("ATEM", targetCStr, atemFrame++);
+  drawLoadingScreen("ATEM", targetCStr, atemAnimFrame++);
   
   if(!atem) atem = CreateAtemClient();
-  atem->begin(target); atem->connect();
+  atem->begin(atemTargetIp); atem->connect();
   
-  uint32_t t0=millis(); 
-  while(millis()-t0 < 3000) {
-    atem->loop(); 
-    if(atem->connected()) break;
-    drawLoadingScreen("ATEM", targetCStr, atemFrame++);
-    delay(50);
-  }
-  atemConnected = atem->connected();
-  if(atemConnected) atemAddr = target;
-  
-  if(atemConnected) drawCenteredMsg("ATEM: connected", targetCStr);
-  else drawCenteredMsg("ATEM: failed", targetCStr);
+  // ⚡ Bolt: Initialize non-blocking connection state machine
+  isConnectingAtem = true;
+  atemConnectStart = millis();
+  lastAtemFrameUpdate = millis();
 }
 
 void setup(){
@@ -425,6 +426,32 @@ void loop(){
       drawLoadingScreen("Wi-Fi lost", "Reconnecting...", lostFrame++);
     }
     return;
+  }
+
+  // ⚡ Bolt: Non-blocking ATEM connection state machine
+  if (isConnectingAtem) {
+    atem->loop();
+
+    uint32_t now = millis();
+    if (atem->connected() || (now - atemConnectStart >= 3000)) {
+        // Connection sequence finished
+        isConnectingAtem = false;
+        atemConnected = atem->connected();
+
+        if(atemConnected) {
+            atemAddr = atemTargetIp;
+            drawCenteredMsg("ATEM: connected", atemTargetStr.c_str());
+        } else {
+            drawCenteredMsg("ATEM: failed", atemTargetStr.c_str());
+        }
+    } else {
+        // Update loading animation at 20Hz (every 50ms) without blocking
+        if (now - lastAtemFrameUpdate >= 50) {
+            lastAtemFrameUpdate = now;
+            drawLoadingScreen("ATEM", atemTargetStr.c_str(), atemAnimFrame++);
+        }
+    }
+    return; // Yield control back to loop to process other background tasks
   }
 
   // if(!atemConnected && millis()-lastAtemAttempt > 500) tryConnectAtem(); // ATEM disabled for LoRa debug
