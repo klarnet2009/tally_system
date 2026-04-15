@@ -79,6 +79,13 @@ static IAtemClient* atem = nullptr;
 static bool atemConnected = false;
 static IPAddress atemAddr; static uint32_t lastPoll = 0; static uint32_t lastAtemAttempt = 0;
 
+// ⚡ Bolt: State variables for non-blocking ATEM connection sequence
+static bool atemConnecting = false;
+static uint32_t atemConnectStartTime = 0;
+static uint32_t lastAtemFrameUpdate = 0;
+static uint8_t atemFrame = 0;
+static String targetStr;
+
 String ipToStr(IPAddress ip){ char b[20]; snprintf(b,sizeof(b), "%u.%u.%u.%u", ip[0],ip[1],ip[2],ip[3]); return String(b); }
 
 // ===== Improved OLED UI =====
@@ -333,7 +340,6 @@ IPAddress findAtemInSubnet(){ IPAddress local=WiFi.localIP(); IPAddress test; fo
 
 void tryConnectAtem(){
   lastAtemAttempt = millis();
-  uint8_t atemFrame = 0;
   IPAddress target;
   
   String cfgIP = String(ATEM_IP_STR);
@@ -343,27 +349,19 @@ void tryConnectAtem(){
   }
   target.fromString(cfgIP);
   
-  // ⚡ Bolt: Hoist IP string conversion to avoid redundant heap allocations in UI loop
-  String targetStr = ipToStr(target);
-  const char* targetCStr = targetStr.c_str();
-
-  drawLoadingScreen("ATEM", targetCStr, atemFrame++);
+  // ⚡ Bolt: Hoist IP string conversion and start non-blocking connection state machine
+  targetStr = ipToStr(target);
+  atemFrame = 0;
   
   if(!atem) atem = CreateAtemClient();
-  atem->begin(target); atem->connect();
+  atem->begin(target);
+  atem->connect();
   
-  uint32_t t0=millis(); 
-  while(millis()-t0 < 3000) {
-    atem->loop(); 
-    if(atem->connected()) break;
-    drawLoadingScreen("ATEM", targetCStr, atemFrame++);
-    delay(50);
-  }
-  atemConnected = atem->connected();
-  if(atemConnected) atemAddr = target;
+  atemConnecting = true;
+  atemConnectStartTime = millis();
+  lastAtemFrameUpdate = millis();
   
-  if(atemConnected) drawCenteredMsg("ATEM: connected", targetCStr);
-  else drawCenteredMsg("ATEM: failed", targetCStr);
+  drawLoadingScreen("ATEM", targetStr.c_str(), atemFrame++);
 }
 
 void setup(){
@@ -427,7 +425,32 @@ void loop(){
     return;
   }
 
-  // if(!atemConnected && millis()-lastAtemAttempt > 500) tryConnectAtem(); // ATEM disabled for LoRa debug
+  // if(!atemConnected && !atemConnecting && millis()-lastAtemAttempt > 500) tryConnectAtem(); // ATEM disabled for LoRa debug
+
+  // ⚡ Bolt: Execute non-blocking ATEM connection sequence
+  if(atemConnecting) {
+    atem->loop();
+    uint32_t now = millis();
+
+    if(now - lastAtemFrameUpdate > 50) {
+      lastAtemFrameUpdate = now;
+      drawLoadingScreen("ATEM", targetStr.c_str(), atemFrame++);
+    }
+
+    if(atem->connected() || now - atemConnectStartTime >= 3000) {
+      atemConnected = atem->connected();
+      if(atemConnected) {
+        IPAddress target;
+        target.fromString(targetStr);
+        atemAddr = target;
+        drawCenteredMsg("ATEM: connected", targetStr.c_str());
+      } else {
+        drawCenteredMsg("ATEM: failed", targetStr.c_str());
+      }
+      atemConnecting = false;
+    }
+    return;
+  }
 
   if(atemConnected){
     atem->loop();
