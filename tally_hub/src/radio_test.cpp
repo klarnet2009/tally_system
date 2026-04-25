@@ -75,7 +75,8 @@ void loop() {
     uint8_t len = radio.receive(buf, sizeof(buf));
     if (len > 0)
       rxCount++;
-    radio.startReceive();
+    // ⚡ Bolt: Fast RX re-arm to avoid standby/SPI overhead and prevent dropped packets
+    radio.clearRxIrq();
   }
 
   // === SEND NEXT COLOR EVERY 300ms ===
