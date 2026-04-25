@@ -40,3 +40,6 @@
 ## 2024-04-15 - Non-blocking state machines over delay()
 **Learning:** In ESP32 applications like this Tally system, connection loops (like ATEM client connection) often default to `delay()` inside `while` loops, severely blocking critical background tasks like `WiFi.status()` and NimBLE updates. Moving to a non-blocking `millis()` based state machine within the main `loop()` is crucial for maintaining real-time system responsiveness.
 **Action:** When finding blocking `delay()` calls inside hot loops or initialization sequences, extract them into explicit state machine variables integrated into the main non-blocking execution cycle.
+## 2026-04-25 - Continuous RX fast re-arm
+**Learning:** When re-arming continuous RX mode on SX1280 modules, a full re-initialization with `startReceive()` triggers a slow `standby()` and configuration delay. This introduces significant SPI transaction overhead and can lead to dropped packets in continuous reception scenarios.
+**Action:** Use a lightweight fast re-arm approach like `clearRxIrq()` (which simply clears the IRQ status and re-issues the continuous RX command without dropping to standby mode) to halve SPI overhead and minimize dropped packets.
