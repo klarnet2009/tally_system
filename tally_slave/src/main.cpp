@@ -115,7 +115,7 @@ void loop() {
             // Bypassing TallyProtocol::deserialize() for the 7 packets meant for other cameras
             // eliminates unnecessary memcpy operations and computationally expensive CRC validation
             // loops, saving CPU cycles in the high-frequency event loop.
-            if (len >= 3 && buf[2] != SLAVE_CAM_ID) {
+            if (len >= 3 && buf[2] != SLAVE_CAM_ID && buf[2] != TALLY_BROADCAST_ID) {
                 // Not for us, fast-path skip processing
             } else {
                 // Parse packet
