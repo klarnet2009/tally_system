@@ -247,14 +247,26 @@ void E28Radio::setPacketParams(uint8_t payloadLen) {
 }
 
 void E28Radio::clearIrqStatus() {
-  uint8_t clearAll[2] = {0xFF, 0xFF};
-  writeCommand(SX1280_CMD_CLR_IRQ_STATUS, clearAll, 2);
+  waitBusy();
+  digitalWrite(_pinNSS, LOW);
+  // ⚡ Bolt: Fast-path direct SPI transfer for highly-polled IRQ clear
+  // Eliminates writeCommand() overhead
+  uint8_t txBuf[3] = {SX1280_CMD_CLR_IRQ_STATUS, 0xFF, 0xFF};
+  SPI.writeBytes(txBuf, 3);
+  digitalWrite(_pinNSS, HIGH);
 }
 
 uint16_t E28Radio::getIrqStatus() {
-  uint8_t irqStatus[2];
-  readCommand(SX1280_CMD_GET_IRQ_STATUS, irqStatus, 2);
-  return ((uint16_t)irqStatus[0] << 8) | irqStatus[1];
+  waitBusy();
+  digitalWrite(_pinNSS, LOW);
+  // ⚡ Bolt: Fast-path direct SPI transfer for highly-polled IRQ register
+  // Eliminates readCommand() overhead (10-byte array initializations, for-loop memory copying)
+  // Command is 1 byte, NOP is 1 byte, and data is 2 bytes. Total 4 bytes
+  uint8_t txBuf[4] = {SX1280_CMD_GET_IRQ_STATUS, 0x00, 0x00, 0x00};
+  uint8_t rxBuf[4] = {0};
+  SPI.transferBytes(txBuf, rxBuf, 4);
+  digitalWrite(_pinNSS, HIGH);
+  return ((uint16_t)rxBuf[2] << 8) | rxBuf[3];
 }
 
 bool E28Radio::send(uint8_t *data, uint8_t len) {
@@ -439,12 +451,15 @@ uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
   // Wait for SX1280 to finish internal processing
   waitBusy();
 
-  // Get RX buffer status
-  uint8_t rxStatus[2];
-  readCommand(SX1280_CMD_GET_RX_BUFFER_STATUS, rxStatus, 2);
+  // Get RX buffer status (Fast-path SPI transfer)
+  digitalWrite(_pinNSS, LOW);
+  uint8_t rxStatusTx[4] = {SX1280_CMD_GET_RX_BUFFER_STATUS, 0x00, 0x00, 0x00};
+  uint8_t rxStatusRx[4];
+  SPI.transferBytes(rxStatusTx, rxStatusRx, 4);
+  digitalWrite(_pinNSS, HIGH);
 
-  uint8_t payloadLen = rxStatus[0];
-  uint8_t bufferOffset = rxStatus[1];
+  uint8_t payloadLen = rxStatusRx[2];
+  uint8_t bufferOffset = rxStatusRx[3];
 
   if (payloadLen > maxLen) {
     payloadLen = maxLen;

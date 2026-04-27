@@ -40,3 +40,7 @@
 ## 2024-04-15 - Non-blocking state machines over delay()
 **Learning:** In ESP32 applications like this Tally system, connection loops (like ATEM client connection) often default to `delay()` inside `while` loops, severely blocking critical background tasks like `WiFi.status()` and NimBLE updates. Moving to a non-blocking `millis()` based state machine within the main `loop()` is crucial for maintaining real-time system responsiveness.
 **Action:** When finding blocking `delay()` calls inside hot loops or initialization sequences, extract them into explicit state machine variables integrated into the main non-blocking execution cycle.
+
+## 2026-04-27 - Direct SPI Transfers in High-Frequency Hardware Polls
+**Learning:** Even when generic SPI `readCommand` and `writeCommand` abstractions have fast-paths for small payloads, the overhead of creating tiny wrapper arrays and entering the function call still adds up in ultra-high-frequency loops (like polling IRQ status). Bypassing the generic wrapper to use direct `SPI.transferBytes` inline eliminates function overhead completely for critical hardware registers.
+**Action:** For the most frequently polled hardware registers (e.g., IRQ checks, status flags), bypass generic read/write wrappers and implement the SPI transfer directly inline to squeeze out the last bit of latency.
