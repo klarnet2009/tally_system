@@ -56,7 +56,11 @@ TallyPacket TallyProtocol::createAckPacket(uint8_t cameraId) {
 }
 
 void TallyProtocol::serialize(const TallyPacket& packet, uint8_t* buffer) {
-    memcpy(buffer, &packet, TALLY_PACKET_SIZE);
+    // ⚡ Bolt: Eliminate memcpy overhead for tiny payloads (8 bytes)
+    const uint8_t* p = (const uint8_t*)&packet;
+    for (int i = 0; i < TALLY_PACKET_SIZE; i++) {
+        buffer[i] = p[i];
+    }
 }
 
 bool TallyProtocol::deserialize(const uint8_t* buffer, uint8_t len, TallyPacket& packet) {
@@ -74,7 +78,11 @@ bool TallyProtocol::deserialize(const uint8_t* buffer, uint8_t len, TallyPacket&
         return false;
     }
 
-    memcpy(&packet, buffer, TALLY_PACKET_SIZE);
+    // ⚡ Bolt: Eliminate memcpy overhead for tiny payloads (8 bytes)
+    uint8_t* p = (uint8_t*)&packet;
+    for (int i = 0; i < TALLY_PACKET_SIZE; i++) {
+        p[i] = buffer[i];
+    }
     return validate(packet);
 }
 

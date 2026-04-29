@@ -40,3 +40,7 @@
 ## 2024-04-15 - Non-blocking state machines over delay()
 **Learning:** In ESP32 applications like this Tally system, connection loops (like ATEM client connection) often default to `delay()` inside `while` loops, severely blocking critical background tasks like `WiFi.status()` and NimBLE updates. Moving to a non-blocking `millis()` based state machine within the main `loop()` is crucial for maintaining real-time system responsiveness.
 **Action:** When finding blocking `delay()` calls inside hot loops or initialization sequences, extract them into explicit state machine variables integrated into the main non-blocking execution cycle.
+
+## 2026-05-10 - Avoiding `memcpy` in serialization fast-paths
+**Learning:** `memcpy` can introduce function call overhead and prevents some simple loop optimizations by the compiler on specific targets when used for tiny arrays.
+**Action:** Replace `memcpy` in serialization and deserialization functions with direct pointer assignment loops for the exact known `TALLY_PACKET_SIZE` to bypass the function call overhead on tight loops.
