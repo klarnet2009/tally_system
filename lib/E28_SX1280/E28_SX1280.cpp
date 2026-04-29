@@ -247,14 +247,24 @@ void E28Radio::setPacketParams(uint8_t payloadLen) {
 }
 
 void E28Radio::clearIrqStatus() {
-  uint8_t clearAll[2] = {0xFF, 0xFF};
-  writeCommand(SX1280_CMD_CLR_IRQ_STATUS, clearAll, 2);
+  // ⚡ Bolt: Inline SPI transaction to bypass writeCommand wrapper overhead in high-frequency loops
+  waitBusy();
+  digitalWrite(_pinNSS, LOW);
+  uint8_t txBuf[3] = {SX1280_CMD_CLR_IRQ_STATUS, 0xFF, 0xFF};
+  SPI.writeBytes(txBuf, 3);
+  digitalWrite(_pinNSS, HIGH);
+  waitBusy();
 }
 
 uint16_t E28Radio::getIrqStatus() {
-  uint8_t irqStatus[2];
-  readCommand(SX1280_CMD_GET_IRQ_STATUS, irqStatus, 2);
-  return ((uint16_t)irqStatus[0] << 8) | irqStatus[1];
+  // ⚡ Bolt: Inline SPI transaction to bypass readCommand wrapper array creation and func call overhead
+  waitBusy();
+  digitalWrite(_pinNSS, LOW);
+  uint8_t txBuf[4] = {SX1280_CMD_GET_IRQ_STATUS, 0x00, 0x00, 0x00};
+  uint8_t rxBuf[4] = {0};
+  SPI.transferBytes(txBuf, rxBuf, 4);
+  digitalWrite(_pinNSS, HIGH);
+  return ((uint16_t)rxBuf[2] << 8) | rxBuf[3];
 }
 
 bool E28Radio::send(uint8_t *data, uint8_t len) {
