@@ -44,3 +44,6 @@
 ## 2026-05-10 - Avoiding `memcpy` in serialization fast-paths
 **Learning:** `memcpy` can introduce function call overhead and prevents some simple loop optimizations by the compiler on specific targets when used for tiny arrays.
 **Action:** Replace `memcpy` in serialization and deserialization functions with direct pointer assignment loops for the exact known `TALLY_PACKET_SIZE` to bypass the function call overhead on tight loops.
+## 2026-05-01 - Consolidated ATEM Tally Flag Retrieval
+**Learning:** Calling separate virtual functions `isOnAir()` and `isPreview()` in a tight polling loop to retrieve individual bits of the same underlying state (tally flags) creates redundant overhead. The underlying implementation was already making two identical `getTallyByIndexTallyFlags()` library calls.
+**Action:** When a library or hardware provides a combined bitmask of states, always expose a single method (like `getTallyFlags()`) through abstraction layers to retrieve the entire bitmask at once, rather than forcing callers to make multiple redundant virtual function calls for individual flags.

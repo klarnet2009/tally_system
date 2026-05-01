@@ -461,8 +461,9 @@ void loop(){
       uint8_t tallies[8]; uint16_t progMask=0, prevMask=0;
       for(int i=0;i<8;i++){
         uint8_t idx0 = TALLY_INPUTS[i]-1;
-        bool onAir   = atem->isOnAir(idx0);
-        bool preview = atem->isPreview(idx0);
+        uint8_t flags = atem->getTallyFlags(idx0);
+        bool onAir   = (flags & 0x01) != 0;
+        bool preview = (flags & 0x02) != 0;
         tallies[i] = onAir ? 2 : (preview ? 1 : 0);
         uint8_t human = TALLY_INPUTS[i]; if(onAir) progMask |= (1U << (human-1)); if(preview) prevMask |= (1U << (human-1));
       }

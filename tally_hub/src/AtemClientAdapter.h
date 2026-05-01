@@ -11,6 +11,7 @@ public:
   virtual bool connected() = 0;               // рукопожата ли сессия
   virtual bool isOnAir(uint8_t input) = 0;    // program tally
   virtual bool isPreview(uint8_t input) = 0;  // preview tally
+  virtual uint8_t getTallyFlags(uint8_t input) = 0; // bit 0 = program, bit 1 = preview
 };
 
 // Фабрика, чтобы выбрать реализацию в одном месте
