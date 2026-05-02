@@ -37,6 +37,7 @@
 ## 2026-04-09 - Algorithmic Fast-Path Early Returns in Broadcast Polling Loops
 **Learning:** In broadcast-heavy polling loops where a device continuously receives state packets for multiple clients (e.g., a hub broadcasting states for 8 cameras sequentially), it's highly inefficient for a slave to unconditionally perform memory copying (`memcpy`) and CRC validation on every single packet just to determine it's not the intended recipient.
 **Action:** Always implement a fast-path algorithmic early return before computationally expensive operations like deserialization. Inspect the relevant identifier bytes (e.g., `buf[2]` for camera ID) directly from the raw incoming buffer to immediately bypass processing for packets not destined for the current device, saving significant CPU cycles in high-frequency event loops.
+
 ## 2024-04-15 - Non-blocking state machines over delay()
 **Learning:** In ESP32 applications like this Tally system, connection loops (like ATEM client connection) often default to `delay()` inside `while` loops, severely blocking critical background tasks like `WiFi.status()` and NimBLE updates. Moving to a non-blocking `millis()` based state machine within the main `loop()` is crucial for maintaining real-time system responsiveness.
 **Action:** When finding blocking `delay()` calls inside hot loops or initialization sequences, extract them into explicit state machine variables integrated into the main non-blocking execution cycle.
@@ -44,6 +45,11 @@
 ## 2026-05-10 - Avoiding `memcpy` in serialization fast-paths
 **Learning:** `memcpy` can introduce function call overhead and prevents some simple loop optimizations by the compiler on specific targets when used for tiny arrays.
 **Action:** Replace `memcpy` in serialization and deserialization functions with direct pointer assignment loops for the exact known `TALLY_PACKET_SIZE` to bypass the function call overhead on tight loops.
+
 ## 2026-05-01 - Consolidated ATEM Tally Flag Retrieval
 **Learning:** Calling separate virtual functions `isOnAir()` and `isPreview()` in a tight polling loop to retrieve individual bits of the same underlying state (tally flags) creates redundant overhead. The underlying implementation was already making two identical `getTallyByIndexTallyFlags()` library calls.
 **Action:** When a library or hardware provides a combined bitmask of states, always expose a single method (like `getTallyFlags()`) through abstraction layers to retrieve the entire bitmask at once, rather than forcing callers to make multiple redundant virtual function calls for individual flags.
+
+## 2026-05-11 - Fast RX re-arming
+**Learning:** When re-arming continuous RX mode on SX1280 modules, avoid full re-initialization like `startReceive()` which triggers a slow `standby()` and configuration delay. Instead, use a lightweight fast re-arm (e.g., `clearRxIrq()`) to clear the IRQ and re-issue the continuous RX command, halving SPI transaction overhead and minimizing dropped packets.
+**Action:** Replace `startReceive()` with `clearRxIrq()` for RX re-arming in loops checking for available radio packets.
