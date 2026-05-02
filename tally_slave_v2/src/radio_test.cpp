@@ -97,8 +97,8 @@ void loop() {
       Serial.printf("[RX] Unknown pkt len=%d\n", len);
     }
 
-    // Re-arm receiver
-    radio.startReceive();
+    // ⚡ Bolt: Fast RX re-arm to avoid standby/SPI overhead and prevent dropped packets
+    radio.clearRxIrq();
   }
 
   // === STATUS EVERY 10s ===
