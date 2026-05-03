@@ -53,3 +53,7 @@
 ## 2026-05-11 - Fast RX re-arming
 **Learning:** When re-arming continuous RX mode on SX1280 modules, avoid full re-initialization like `startReceive()` which triggers a slow `standby()` and configuration delay. Instead, use a lightweight fast re-arm (e.g., `clearRxIrq()`) to clear the IRQ and re-issue the continuous RX command, halving SPI transaction overhead and minimizing dropped packets.
 **Action:** Replace `startReceive()` with `clearRxIrq()` for RX re-arming in loops checking for available radio packets.
+
+## 2026-05-15 - Fast-path TxDone polling to prevent SPI bus starvation
+**Learning:** In SX1280 radio driver loops waiting for transmission completion (like `isTxDone`), unconditionally checking the interrupt status via SPI (`getIrqStatus()`) can hammer the SPI bus and waste CPU cycles, especially since a single SPI transfer takes microseconds compared to nanoseconds for a GPIO read.
+**Action:** When a hardware interrupt pin like `DIO1` is available and mapped to the relevant interrupt (like TxDone), always implement a fast-path that checks the pin using `digitalRead()` first. Only fall back to querying the full status over SPI if the pin indicates an event has occurred.
