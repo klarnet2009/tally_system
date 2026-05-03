@@ -320,7 +320,7 @@ bool E28Radio::send(uint8_t *data, uint8_t len) {
 
   // Wait for TX done
   uint32_t timeout = millis() + 100;   // 100ms TxDone timeout (packet is <5ms)
-  while (!(getIrqStatus() & 0x0001)) { // TxDone bit
+  while (!isTxDone()) { // TxDone bit
     if (millis() > timeout) {
       if (_pinTXEN != -1)
         digitalWrite(_pinTXEN, LOW);
@@ -386,7 +386,7 @@ bool E28Radio::sendAsync(uint8_t *data, uint8_t len) {
 
   // Wait for TX done with timeout
   uint32_t t0 = millis();
-  while (!(getIrqStatus() & 0x0001)) { // TxDone bit
+  while (!isTxDone()) { // TxDone bit
     if (millis() - t0 > 500) {
       if (_pinTXEN != -1)
         digitalWrite(_pinTXEN, LOW);
@@ -402,7 +402,13 @@ bool E28Radio::sendAsync(uint8_t *data, uint8_t len) {
   return true;
 }
 
-bool E28Radio::isTxDone() { return (getIrqStatus() & 0x0001) != 0; }
+bool E28Radio::isTxDone() {
+  // ⚡ Bolt: Fast-path hardware pin polling prevents SPI bus starvation during TxDone wait
+  if (_pinDIO1 != -1 && digitalRead(_pinDIO1) == LOW) {
+    return false;
+  }
+  return (getIrqStatus() & 0x0001) != 0;
+}
 
 void E28Radio::startReceive() {
   standby();
