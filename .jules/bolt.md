@@ -57,3 +57,11 @@
 ## 2026-05-15 - Fast-path TxDone polling to prevent SPI bus starvation
 **Learning:** In SX1280 radio driver loops waiting for transmission completion (like `isTxDone`), unconditionally checking the interrupt status via SPI (`getIrqStatus()`) can hammer the SPI bus and waste CPU cycles, especially since a single SPI transfer takes microseconds compared to nanoseconds for a GPIO read.
 **Action:** When a hardware interrupt pin like `DIO1` is available and mapped to the relevant interrupt (like TxDone), always implement a fast-path that checks the pin using `digitalRead()` first. Only fall back to querying the full status over SPI if the pin indicates an event has occurred.
+
+## 2026-05-04 - Algorithmic string prefix validation fast-path
+**Learning:** Using `strlen()` to validate string length when only a small, fixed-size prefix is required creates unnecessary O(N) overhead, especially for long, untrusted inputs (e.g., from serial communication).
+**Action:** Replace `strlen(str) < prefix_len` checks with O(1) direct null-terminator checks (e.g., `str[0] == '\0' || str[1] == '\0'`) to prevent unnecessary full string traversals.
+
+## 2026-05-04 - Manual loops vs memcpy compiler intrinsics
+**Learning:** Replacing `memcpy` with manual byte-by-byte `for` loops to "optimize" tiny fixed-size data transfers (e.g., 8-byte packets) is a performance anti-pattern. Modern compilers correctly identify fixed-size `memcpy` calls and optimize them into highly efficient intrinsic instructions (e.g., 64-bit register moves) which are significantly faster than naive loops.
+**Action:** Never replace `memcpy` with manual loops for fixed-size memory operations; trust the compiler intrinsics.
