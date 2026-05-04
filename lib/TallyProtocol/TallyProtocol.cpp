@@ -56,11 +56,8 @@ TallyPacket TallyProtocol::createAckPacket(uint8_t cameraId) {
 }
 
 void TallyProtocol::serialize(const TallyPacket& packet, uint8_t* buffer) {
-    // ⚡ Bolt: Eliminate memcpy overhead for tiny payloads (8 bytes)
-    const uint8_t* p = (const uint8_t*)&packet;
-    for (int i = 0; i < TALLY_PACKET_SIZE; i++) {
-        buffer[i] = p[i];
-    }
+    // ⚡ Bolt: Rely on compiler intrinsics for fixed-size memory copies instead of manual loops
+    memcpy(buffer, &packet, TALLY_PACKET_SIZE);
 }
 
 bool TallyProtocol::deserialize(const uint8_t* buffer, uint8_t len, TallyPacket& packet) {
@@ -78,11 +75,9 @@ bool TallyProtocol::deserialize(const uint8_t* buffer, uint8_t len, TallyPacket&
         return false;
     }
 
-    // ⚡ Bolt: Eliminate memcpy overhead for tiny payloads (8 bytes)
-    uint8_t* p = (uint8_t*)&packet;
-    for (int i = 0; i < TALLY_PACKET_SIZE; i++) {
-        p[i] = buffer[i];
-    }
+    // ⚡ Bolt: Rely on compiler intrinsics for fixed-size memory copies instead of manual loops
+    memcpy(&packet, buffer, TALLY_PACKET_SIZE);
+
     return validate(packet);
 }
 
@@ -126,7 +121,8 @@ bool TallyProtocol::parseSerialCommand(const char* cmd, uint8_t& cameraId, Tally
     // T2P = Camera 2 Preview
     // etc.
     
-    if (cmd == nullptr || strlen(cmd) < 3) {
+    // ⚡ Bolt: Fast-path O(1) length check avoids O(N) strlen traversal on potentially long inputs
+    if (cmd == nullptr || cmd[0] == '\0' || cmd[1] == '\0' || cmd[2] == '\0') {
         return false;
     }
     
