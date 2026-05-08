@@ -56,6 +56,7 @@ TallyPacket TallyProtocol::createAckPacket(uint8_t cameraId) {
 }
 
 void TallyProtocol::serialize(const TallyPacket& packet, uint8_t* buffer) {
+    // ⚡ Bolt: Rely on compiler intrinsics for fixed-size memory copies instead of manual loops
     memcpy(buffer, &packet, TALLY_PACKET_SIZE);
 }
 
@@ -74,7 +75,9 @@ bool TallyProtocol::deserialize(const uint8_t* buffer, uint8_t len, TallyPacket&
         return false;
     }
 
+    // ⚡ Bolt: Rely on compiler intrinsics for fixed-size memory copies instead of manual loops
     memcpy(&packet, buffer, TALLY_PACKET_SIZE);
+
     return validate(packet);
 }
 
@@ -99,15 +102,11 @@ bool TallyProtocol::validate(const TallyPacket& packet) {
 }
 
 uint8_t TallyProtocol::calculateCRC(const TallyPacket& packet) {
+    static_assert(TALLY_PACKET_SIZE == 8, "Packet size changed, update CRC unrolling");
     const uint8_t* data = (const uint8_t*)&packet;
-    uint8_t crc = 0;
     
-    // XOR all bytes except the CRC byte itself
-    for (uint8_t i = 0; i < TALLY_PACKET_SIZE - 1; i++) {
-        crc ^= data[i];
-    }
-    
-    return crc;
+    // ⚡ Bolt: Manually unroll the XOR loop for 7 bytes to eliminate branching and loop overhead
+    return data[0] ^ data[1] ^ data[2] ^ data[3] ^ data[4] ^ data[5] ^ data[6];
 }
 
 bool TallyProtocol::parseSerialCommand(const char* cmd, uint8_t& cameraId, TallyState& state) {
@@ -118,7 +117,8 @@ bool TallyProtocol::parseSerialCommand(const char* cmd, uint8_t& cameraId, Tally
     // T2P = Camera 2 Preview
     // etc.
     
-    if (cmd == nullptr || strlen(cmd) < 3) {
+    // ⚡ Bolt: Fast-path O(1) length check avoids O(N) strlen traversal on potentially long inputs
+    if (cmd == nullptr || cmd[0] == '\0' || cmd[1] == '\0' || cmd[2] == '\0') {
         return false;
     }
     
