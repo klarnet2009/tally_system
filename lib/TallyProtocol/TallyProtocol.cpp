@@ -102,15 +102,11 @@ bool TallyProtocol::validate(const TallyPacket& packet) {
 }
 
 uint8_t TallyProtocol::calculateCRC(const TallyPacket& packet) {
+    static_assert(TALLY_PACKET_SIZE == 8, "Packet size changed, update CRC unrolling");
     const uint8_t* data = (const uint8_t*)&packet;
-    uint8_t crc = 0;
     
-    // XOR all bytes except the CRC byte itself
-    for (uint8_t i = 0; i < TALLY_PACKET_SIZE - 1; i++) {
-        crc ^= data[i];
-    }
-    
-    return crc;
+    // ⚡ Bolt: Manually unroll the XOR loop for 7 bytes to eliminate branching and loop overhead
+    return data[0] ^ data[1] ^ data[2] ^ data[3] ^ data[4] ^ data[5] ^ data[6];
 }
 
 bool TallyProtocol::parseSerialCommand(const char* cmd, uint8_t& cameraId, TallyState& state) {

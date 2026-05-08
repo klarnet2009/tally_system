@@ -65,3 +65,7 @@
 ## 2026-05-04 - Manual loops vs memcpy compiler intrinsics
 **Learning:** Replacing `memcpy` with manual byte-by-byte `for` loops to "optimize" tiny fixed-size data transfers (e.g., 8-byte packets) is a performance anti-pattern. Modern compilers correctly identify fixed-size `memcpy` calls and optimize them into highly efficient intrinsic instructions (e.g., 64-bit register moves) which are significantly faster than naive loops.
 **Action:** Never replace `memcpy` with manual loops for fixed-size memory operations; trust the compiler intrinsics.
+
+## 2024-05-18 - Loop unrolling for tiny CRC calculations
+**Learning:** In embedded systems using compilers optimized for size (`-Os`), small fixed-size arithmetic loops (like XORing 7 bytes for a CRC) often are not automatically unrolled. This leaves unnecessary branch and loop counter overhead in critical serialization/deserialization fast-paths.
+**Action:** Manually unroll small, fixed-size loops where performance is critical. Guard the unrolled implementation with a `static_assert` on the expected array/packet size to prevent regressions if data structures change in the future.
