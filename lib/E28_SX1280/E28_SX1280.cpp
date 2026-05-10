@@ -137,7 +137,8 @@ void E28Radio::writeCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
     if (len <= 8) {
       uint8_t txBuf[9];
       txBuf[0] = cmd;
-      for (int i=0; i<len; i++) txBuf[i+1] = data[i];
+      // ⚡ Bolt: Rely on compiler intrinsics for memory copies instead of manual loops
+      memcpy(&txBuf[1], data, len);
       SPI.writeBytes(txBuf, len + 1);
     } else {
       // ⚡ Bolt: Coalesce cmd and data into a single block transfer for larger payloads
@@ -165,7 +166,8 @@ void E28Radio::readCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
       uint8_t rxBuf[10] = {0};
       uint32_t totalLen = len + 2;
       SPI.transferBytes(txBuf, rxBuf, totalLen);
-      for (int i=0; i<len; i++) data[i] = rxBuf[i+2];
+      // ⚡ Bolt: Rely on compiler intrinsics for memory copies instead of manual loops
+      memcpy(data, &rxBuf[2], len);
     } else {
       // ⚡ Bolt: Coalesce cmd, NOP, and read dummy bytes into a single block transfer
       uint8_t txBuf[260];
@@ -284,7 +286,8 @@ bool E28Radio::send(uint8_t *data, uint8_t len) {
         uint32_t totalLen = len + 2;
         txBuf[0] = SX1280_CMD_WRITE_BUFFER;
         txBuf[1] = 0x00; // Offset
-        for (int i=0; i<len; i++) txBuf[i+2] = data[i];
+        // ⚡ Bolt: Rely on compiler intrinsics for memory copies instead of manual loops
+        memcpy(&txBuf[2], data, len);
         SPI.writeBytes(txBuf, totalLen);
     } else {
         // ⚡ Bolt: Coalesce command, offset and payload into a single SPI transfer
@@ -352,7 +355,8 @@ bool E28Radio::sendAsync(uint8_t *data, uint8_t len) {
         uint32_t totalLen = len + 2;
         txBuf[0] = SX1280_CMD_WRITE_BUFFER;
         txBuf[1] = 0x00; // Offset
-        for (int i=0; i<len; i++) txBuf[i+2] = data[i];
+        // ⚡ Bolt: Rely on compiler intrinsics for memory copies instead of manual loops
+        memcpy(&txBuf[2], data, len);
         SPI.writeBytes(txBuf, totalLen);
     } else {
         // ⚡ Bolt: Coalesce command, offset and payload into a single SPI transfer
@@ -482,7 +486,8 @@ uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
 
         SPI.transferBytes(txBuf, rxBuf, totalLen);
 
-        for (int i=0; i<payloadLen; i++) buffer[i] = rxBuf[i+3];
+        // ⚡ Bolt: Rely on compiler intrinsics for memory copies instead of manual loops
+        memcpy(buffer, &rxBuf[3], payloadLen);
     } else {
         // ⚡ Bolt: Coalesce command, offset, NOP and read dummy bytes into a single SPI transfer
         // Use fixed stack buffer
