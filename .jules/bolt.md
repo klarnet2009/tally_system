@@ -69,3 +69,6 @@
 ## 2024-05-18 - Loop unrolling for tiny CRC calculations
 **Learning:** In embedded systems using compilers optimized for size (`-Os`), small fixed-size arithmetic loops (like XORing 7 bytes for a CRC) often are not automatically unrolled. This leaves unnecessary branch and loop counter overhead in critical serialization/deserialization fast-paths.
 **Action:** Manually unroll small, fixed-size loops where performance is critical. Guard the unrolled implementation with a `static_assert` on the expected array/packet size to prevent regressions if data structures change in the future.
+## 2026-05-19 - Compiler Intrinsics for memcpy
+**Learning:** Replacing `memcpy` with manual byte-by-byte `for` loops to 'optimize' small payloads actually degrades performance by preventing the compiler from generating highly optimized intrinsic instructions (like 32-bit or 64-bit register moves) for fixed-size memory transfers.
+**Action:** Always rely on standard `memcpy` for fixed-size buffer transfers instead of writing manual loops, especially when the buffer size is known or small.
