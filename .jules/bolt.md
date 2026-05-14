@@ -72,3 +72,4 @@
 ## 2026-05-19 - Compiler Intrinsics for memcpy
 **Learning:** Replacing `memcpy` with manual byte-by-byte `for` loops to 'optimize' small payloads actually degrades performance by preventing the compiler from generating highly optimized intrinsic instructions (like 32-bit or 64-bit register moves) for fixed-size memory transfers.
 **Action:** Always rely on standard `memcpy` for fixed-size buffer transfers instead of writing manual loops, especially when the buffer size is known or small.
+## 2026-05-20 - Avoid floating-point trigonometric calls in render loops\n**Learning:** Floating point calculations like `sin()` and `cos()` are extremely slow on MCUs. In a hot render loop (like `drawSpinner`), computing trigonometric values repeatedly can cause UI thread starvation or skipped frames.\n**Action:** Use a statically precomputed `const float` lookup table (LUT) when angles are known in advance (e.g., 8-step circle), completely eliminating the runtime math overhead.
