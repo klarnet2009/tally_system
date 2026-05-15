@@ -72,3 +72,7 @@
 ## 2026-05-19 - Compiler Intrinsics for memcpy
 **Learning:** Replacing `memcpy` with manual byte-by-byte `for` loops to 'optimize' small payloads actually degrades performance by preventing the compiler from generating highly optimized intrinsic instructions (like 32-bit or 64-bit register moves) for fixed-size memory transfers.
 **Action:** Always rely on standard `memcpy` for fixed-size buffer transfers instead of writing manual loops, especially when the buffer size is known or small.
+
+## 2026-05-19 - Removed trailing waitBusy() blocking calls
+**Learning:** In SPI drivers for modules with hardware busy pins (like SX1280), appending a synchronous `waitBusy()` call at the *end* of an SPI transaction unnecessarily starves the CPU. Since every SPI transaction correctly calls `waitBusy()` at its *beginning* to ensure hardware readiness, a trailing wait prevents the CPU from doing productive concurrent work (like toggling GPIOs or looping) while the radio is busy.
+**Action:** Always place hardware readiness checks at the beginning of the transaction method and remove trailing synchronous waits to allow CPU execution to overlap with peripheral processing.

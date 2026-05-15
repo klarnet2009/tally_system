@@ -152,7 +152,7 @@ void E28Radio::writeCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
   }
   digitalWrite(_pinNSS, HIGH);
 
-  waitBusy();
+  // ⚡ Bolt: Removed redundant trailing waitBusy() to allow CPU execution (e.g. GPIO toggling) to overlap with radio BUSY time
 }
 
 void E28Radio::readCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
@@ -255,7 +255,7 @@ void E28Radio::clearIrqStatus() {
   uint8_t txBuf[3] = {SX1280_CMD_CLR_IRQ_STATUS, 0xFF, 0xFF};
   SPI.writeBytes(txBuf, 3);
   digitalWrite(_pinNSS, HIGH);
-  waitBusy();
+  // ⚡ Bolt: Removed redundant trailing waitBusy() to overlap CPU execution with radio BUSY time
 }
 
 uint16_t E28Radio::getIrqStatus() {
