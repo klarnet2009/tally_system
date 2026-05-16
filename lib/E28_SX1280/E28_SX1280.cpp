@@ -459,12 +459,15 @@ uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
   // Wait for SX1280 to finish internal processing
   waitBusy();
 
-  // Get RX buffer status
-  uint8_t rxStatus[2];
-  readCommand(SX1280_CMD_GET_RX_BUFFER_STATUS, rxStatus, 2);
+  // ⚡ Bolt: Inline GET_RX_BUFFER_STATUS to bypass readCommand wrapper overhead and redundant waitBusy() on hot RX path
+  digitalWrite(_pinNSS, LOW);
+  uint8_t txBufStatus[4] = {SX1280_CMD_GET_RX_BUFFER_STATUS, 0x00, 0x00, 0x00};
+  uint8_t rxBufStatus[4] = {0};
+  SPI.transferBytes(txBufStatus, rxBufStatus, 4);
+  digitalWrite(_pinNSS, HIGH);
 
-  uint8_t payloadLen = rxStatus[0];
-  uint8_t bufferOffset = rxStatus[1];
+  uint8_t payloadLen = rxBufStatus[2];
+  uint8_t bufferOffset = rxBufStatus[3];
 
   if (payloadLen > maxLen) {
     payloadLen = maxLen;

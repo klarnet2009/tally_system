@@ -76,3 +76,7 @@
 ## 2026-05-19 - Removed trailing waitBusy() blocking calls
 **Learning:** In SPI drivers for modules with hardware busy pins (like SX1280), appending a synchronous `waitBusy()` call at the *end* of an SPI transaction unnecessarily starves the CPU. Since every SPI transaction correctly calls `waitBusy()` at its *beginning* to ensure hardware readiness, a trailing wait prevents the CPU from doing productive concurrent work (like toggling GPIOs or looping) while the radio is busy.
 **Action:** Always place hardware readiness checks at the beginning of the transaction method and remove trailing synchronous waits to allow CPU execution to overlap with peripheral processing.
+
+## 2026-05-19 - Redundant waitBusy in Hot RX Path
+**Learning:** Generic SPI wrapper functions (like `readCommand`) often include defensive `waitBusy()` checks. When reading simple registers sequentially (like getting the payload length right after checking if RX is done), calling the wrapper can introduce a redundant `waitBusy()` call that wastes CPU cycles on the critical RX path immediately after the hardware has already signaled readiness.
+**Action:** When performing simple, sequential SPI reads on a critical hot path (like `receive()`), inline the SPI transaction (e.g., using `SPI.transferBytes()`) instead of using generic wrappers. This eliminates redundant hardware wait loops, generic function overhead, and unnecessary memory copies.
