@@ -200,10 +200,13 @@ void drawCenteredMsg(const char *l1, const char *l2 = nullptr) {
 
 // Animated spinner: 8 dots around a circle, one filled at a time
 static void drawSpinner(int cx, int cy, int r, uint8_t frame) {
-  const float step = 3.14159265f * 2.0f / 8.0f;
+  // ⚡ Bolt: 8-entry static float Lookup Tables for 45-degree multiples to avoid expensive trig calls
+  static const float COS_LUT[8] = {1.0f, 0.70710678f, 0.0f, -0.70710678f, -1.0f, -0.70710678f, 0.0f, 0.70710678f};
+  static const float SIN_LUT[8] = {0.0f, 0.70710678f, 1.0f, 0.70710678f, 0.0f, -0.70710678f, -1.0f, -0.70710678f};
+
   for (int i = 0; i < 8; i++) {
-    int dx = cx + (int)(cos(step * i) * r);
-    int dy = cy + (int)(sin(step * i) * r);
+    int dx = cx + (int)(COS_LUT[i] * r);
+    int dy = cy + (int)(SIN_LUT[i] * r);
     if (i == (frame % 8)) {
       display.fillCircle(dx, dy, 2, WHITE); // Active dot
     } else {

@@ -80,3 +80,6 @@
 ## 2026-05-19 - Redundant waitBusy in Hot RX Path
 **Learning:** Generic SPI wrapper functions (like `readCommand`) often include defensive `waitBusy()` checks. When reading simple registers sequentially (like getting the payload length right after checking if RX is done), calling the wrapper can introduce a redundant `waitBusy()` call that wastes CPU cycles on the critical RX path immediately after the hardware has already signaled readiness.
 **Action:** When performing simple, sequential SPI reads on a critical hot path (like `receive()`), inline the SPI transaction (e.g., using `SPI.transferBytes()`) instead of using generic wrappers. This eliminates redundant hardware wait loops, generic function overhead, and unnecessary memory copies.
+## 2026-05-21 - Trigonometric Lookup Tables
+**Learning:** Computing `cos()` and `sin()` inside high-frequency animation loops (like `drawSpinner`) introduces significant floating-point overhead on embedded systems.
+**Action:** Use static lookup tables (LUTs) for fixed-angle calculations (e.g., multiples of 45 degrees) to bypass trigonometric function overhead.
