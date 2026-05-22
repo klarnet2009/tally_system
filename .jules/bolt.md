@@ -83,3 +83,7 @@
 ## 2026-05-21 - Trigonometric Lookup Tables
 **Learning:** Computing `cos()` and `sin()` inside high-frequency animation loops (like `drawSpinner`) introduces significant floating-point overhead on embedded systems.
 **Action:** Use static lookup tables (LUTs) for fixed-angle calculations (e.g., multiples of 45 degrees) to bypass trigonometric function overhead.
+
+## 2026-05-22 - [Cache repetitive parsing logic in connection loops]
+**Learning:** In microcontroller environments where connection functions (like `tryConnectAtem`) are called repeatedly or contain busy loops, performing `String` instantiation and IP parsing on every call causes unnecessary heap fragmentation and wastes CPU cycles. Using static variables to cache parsed values on the first successful run dramatically improves performance without increasing code complexity.
+**Action:** When working on embedded C++ network or initialization loops, cache the results of expensive String operations and parsing routines using static variables to avoid redundant dynamic memory allocations.
