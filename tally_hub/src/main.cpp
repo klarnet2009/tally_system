@@ -415,16 +415,24 @@ IPAddress findAtemInSubnet() {
 void tryConnectAtem() {
   lastAtemAttempt = millis();
   uint8_t atemFrame = 0;
-  IPAddress target;
 
-  String cfgIP = String(ATEM_IP_STR);
-  if (!cfgIP.length()) {
-    drawCenteredMsg("ATEM: no IP set", "Set ATEM_IP_STR");
-    return;
+  // ⚡ Bolt: Cache parsed IPAddress and String representation to avoid repeated heap allocation/parsing on every connection attempt
+  static IPAddress target;
+  static String targetStr;
+  static bool cached = false;
+
+  if (!cached) {
+    String cfgIP = String(ATEM_IP_STR);
+    if (!cfgIP.length()) {
+      drawCenteredMsg("ATEM: no IP set", "Set ATEM_IP_STR");
+      return;
+    }
+    target.fromString(cfgIP);
+    targetStr = ipToStr(target);
+    cached = true;
   }
-  target.fromString(cfgIP);
 
-  drawLoadingScreen("ATEM", ipToStr(target).c_str(), atemFrame++);
+  drawLoadingScreen("ATEM", targetStr.c_str(), atemFrame++);
 
   if (!atem)
     atem = CreateAtemClient();
@@ -436,7 +444,7 @@ void tryConnectAtem() {
     atem->loop();
     if (atem->connected())
       break;
-    drawLoadingScreen("ATEM", ipToStr(target).c_str(), atemFrame++);
+    drawLoadingScreen("ATEM", targetStr.c_str(), atemFrame++);
     delay(50);
   }
   atemConnected = atem->connected();
@@ -444,9 +452,9 @@ void tryConnectAtem() {
     atemAddr = target;
 
   if (atemConnected)
-    drawCenteredMsg("ATEM: connected", ipToStr(target).c_str());
+    drawCenteredMsg("ATEM: connected", targetStr.c_str());
   else
-    drawCenteredMsg("ATEM: failed", ipToStr(target).c_str());
+    drawCenteredMsg("ATEM: failed", targetStr.c_str());
 }
 
 void setup() {
