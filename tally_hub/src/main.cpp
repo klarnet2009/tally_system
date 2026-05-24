@@ -40,6 +40,36 @@ static E28Radio radio;
 static uint8_t g_lastTallies[8] = {0};
 static uint32_t g_loraTxCount = 0; // TX packet counter
 
+// ⚡ Bolt: Non-blocking transmission queue to prevent delay() stalls in main loop
+#define LORA_QUEUE_SIZE 16
+static TallyPacket g_loraQueue[LORA_QUEUE_SIZE];
+static uint8_t g_loraQueueHead = 0;
+static uint8_t g_loraQueueTail = 0;
+
+static void enqueueLora(const TallyPacket &pkt) {
+  uint8_t nextHead = (g_loraQueueHead + 1) % LORA_QUEUE_SIZE;
+  if (nextHead != g_loraQueueTail) { // Queue not full
+    g_loraQueue[g_loraQueueHead] = pkt;
+    g_loraQueueHead = nextHead;
+  }
+}
+
+static void processLoraQueue() {
+  static uint32_t lastTxTime = 0;
+
+  if (g_loraQueueHead != g_loraQueueTail) {
+    // ⚡ Bolt: Enforce minimum 2ms gap between packets non-blockingly
+    if (millis() - lastTxTime >= 2) {
+      uint8_t buf[TALLY_PACKET_SIZE];
+      TallyProtocol::serialize(g_loraQueue[g_loraQueueTail], buf);
+      radio.send(buf, TALLY_PACKET_SIZE);
+      g_loraTxCount++;
+      lastTxTime = millis();
+      g_loraQueueTail = (g_loraQueueTail + 1) % LORA_QUEUE_SIZE;
+    }
+  }
+}
+
 static uint8_t crc8(const uint8_t *p, size_t n) {
   uint8_t c = 0;
   for (size_t i = 0; i < n; i++)
@@ -520,6 +550,8 @@ void setup() {
 }
 
 void loop() {
+  processLoraQueue();
+
   // WiFi reconnect (non-blocking)
   if (WiFi.status() != WL_CONNECTED) {
     static uint32_t lastRetry = 0;
@@ -599,13 +631,8 @@ void loop() {
             uint8_t camId = TALLY_INPUTS[i];
             TallyPacket pkt = TallyProtocol::createSetStatePacket(camId, ts);
 
-            uint8_t buf[TALLY_PACKET_SIZE];
-            TallyProtocol::serialize(pkt, buf);
-
-            radio.send(buf, TALLY_PACKET_SIZE);
-            g_loraTxCount++;
-            // Serial.printf("LoRa TX: Cam %d -> %d\n", camId, ts);
-            delay(2); // Small delay to avoid packet collision if consecutive
+            // ⚡ Bolt: Enqueue packet non-blockingly instead of blocking main loop with delay(2)
+            enqueueLora(pkt);
           }
           g_lastTallies[i] = tallies[i];
         }
@@ -628,27 +655,40 @@ void loop() {
 
     TallyState ts = testRed ? STATE_PROGRAM : STATE_PREVIEW;
     TallyPacket pkt = TallyProtocol::createSetStatePacket(1, ts);
-    uint8_t buf[TALLY_PACKET_SIZE];
-    TallyProtocol::serialize(pkt, buf);
-    radio.send(buf, TALLY_PACKET_SIZE);
-    g_loraTxCount++;
+    enqueueLora(pkt);
   }
 
   // Locator / Ping (Button 0) — works without ATEM
-  static uint32_t lastPing = 0;
-  if (digitalRead(0) == LOW && millis() - lastPing > 500) {
-    lastPing = millis();
-    drawCenteredMsg("LOCATOR", "Ping sent -> Cam 1");
+  // ⚡ Bolt: Non-blocking locator logic using enqueueLora
+  static uint32_t locatorStartTime = 0;
+  static uint8_t locatorStep = 0;
 
-    for (int k = 0; k < 3; k++) {
+  if (digitalRead(0) == LOW && locatorStep == 0) {
+    drawCenteredMsg("LOCATOR", "Ping sent -> Cam 1");
+    locatorStep = 1;
+    locatorStartTime = millis();
+  }
+
+  if (locatorStep > 0) {
+    uint32_t now = millis();
+    uint32_t elapsed = now - locatorStartTime;
+
+    // Steps 1, 3, 5: Enqueue ping (wait 50ms before steps 3 and 5)
+    if ((locatorStep == 1) || (locatorStep % 2 != 0 && locatorStep <= 5 && elapsed >= 50)) {
       TallyPacket pkt = TallyProtocol::createPingPacket(1);
-      uint8_t buf[TALLY_PACKET_SIZE];
-      TallyProtocol::serialize(pkt, buf);
-      radio.send(buf, TALLY_PACKET_SIZE);
-      g_loraTxCount++;
-      delay(50);
+      enqueueLora(pkt);
+      locatorStep++;
+      locatorStartTime = now;
     }
-    delay(2000);
+    // Steps 2, 4, 6: Wait 100ms
+    else if (locatorStep % 2 == 0 && locatorStep <= 6 && elapsed >= 100) {
+      locatorStep++;
+      locatorStartTime = now;
+    }
+    // Wait 2000ms after sequence before allowing another ping
+    else if (locatorStep == 7 && elapsed >= 2000) {
+      locatorStep = 0;
+    }
   }
 
   // ==== OLED (LoRa debug mode - always active) ====

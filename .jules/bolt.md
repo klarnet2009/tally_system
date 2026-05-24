@@ -86,3 +86,7 @@
 ## 2026-05-23 - [ATEM IPAddress string cache optimization]
 **Learning:** In network connection routines (e.g., `tryConnectAtem`), continuous instantiation and parsing of constant string macros inside non-blocking states or retries can cause significant heap fragmentation and slow down loops unnecessarily.
 **Action:** Cache the `IPAddress` and its string representation using `static` variables and a `bool` initialization flag. This optimization reduces heap fragmentation and improves execution speed by preventing repeated allocations, especially for strings originating from constant macros like `ATEM_IP_STR`.
+
+## 2024-05-19 - [Non-Blocking TX Queue]
+**Learning:** The Hub firmware previously used blocking `delay(2)` and `delay(50)` calls in the main loop to prevent packet collisions during bulk LoRa transmissions and locator sequences. This stalled the entire `loop()`, starving concurrent background tasks (like WiFi state, ATEM keepalives, and UI updates).
+**Action:** Replaced sequential `delay()`-based transmission logic with a non-blocking circular `g_loraQueue` and a `processLoraQueue()` state machine that dispatches one packet every 2ms. This decouples fast event polling from physical transmission limits, dramatically improving overall system concurrency.
