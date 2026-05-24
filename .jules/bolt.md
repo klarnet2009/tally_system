@@ -83,3 +83,6 @@
 ## 2026-05-21 - Trigonometric Lookup Tables
 **Learning:** Computing `cos()` and `sin()` inside high-frequency animation loops (like `drawSpinner`) introduces significant floating-point overhead on embedded systems.
 **Action:** Use static lookup tables (LUTs) for fixed-angle calculations (e.g., multiples of 45 degrees) to bypass trigonometric function overhead.
+## 2026-05-23 - [ATEM IPAddress string cache optimization]
+**Learning:** In network connection routines (e.g., `tryConnectAtem`), continuous instantiation and parsing of constant string macros inside non-blocking states or retries can cause significant heap fragmentation and slow down loops unnecessarily.
+**Action:** Cache the `IPAddress` and its string representation using `static` variables and a `bool` initialization flag. This optimization reduces heap fragmentation and improves execution speed by preventing repeated allocations, especially for strings originating from constant macros like `ATEM_IP_STR`.
