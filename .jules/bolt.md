@@ -90,3 +90,7 @@
 ## 2024-05-19 - [Non-Blocking TX Queue]
 **Learning:** The Hub firmware previously used blocking `delay(2)` and `delay(50)` calls in the main loop to prevent packet collisions during bulk LoRa transmissions and locator sequences. This stalled the entire `loop()`, starving concurrent background tasks (like WiFi state, ATEM keepalives, and UI updates).
 **Action:** Replaced sequential `delay()`-based transmission logic with a non-blocking circular `g_loraQueue` and a `processLoraQueue()` state machine that dispatches one packet every 2ms. This decouples fast event polling from physical transmission limits, dramatically improving overall system concurrency.
+
+## 2024-05-26 - [Non-Blocking ATEM Polling Loop Optimization]
+**Learning:** Returning from the main super-loop during an ATEM network disconnect check blocks all sub-tasks located after it. This leads to starvation of independent concurrent tasks such as local UI rendering, internal test features, and non-blocking radio communications.
+**Action:** Always wrap conditionally required network routines within guarded execution blocks (e.g., `if (connected) { ... } else { ... }`) rather than using bare `return;` statements in the main execution `loop()`, ensuring the continuous running of all independent event handlers and state machines.

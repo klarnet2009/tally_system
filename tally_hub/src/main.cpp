@@ -570,8 +570,9 @@ void loop() {
     if (!atem->connected()) {
       atemConnected = false;
       lastAtemAttempt = millis() + ATEM_RETRY_MS;
-      return;
-    }
+      // ⚡ Bolt: Removed blocking 'return' statement to allow independent tasks (like UI and radio logic)
+      // to continue executing normally during network/ATEM outages, improving overall system responsiveness.
+    } else {
 
     if (millis() - lastPoll > POLL_MS) {
       lastPoll = millis();
@@ -637,6 +638,7 @@ void loop() {
           g_lastTallies[i] = tallies[i];
         }
       }
+    }
     }
   }
 
