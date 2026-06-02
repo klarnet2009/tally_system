@@ -339,9 +339,9 @@ void drawTallyGrid(const uint8_t tallies[8]) {
 
 // ===== LoRa Debug Screen =====
 void drawLoRaDebug() {
-  radio.checkConnection();
+  // ⚡ Bolt: Eliminate redundant SPI checkConnection() by deriving connection state directly from getChipStatus()
   uint8_t st = radio.getChipStatus();
-  bool connected = radio.isConnected();
+  bool connected = (st != 0xFF && st != 0x00);
 
   display.clearDisplay();
   display.setTextSize(1);
