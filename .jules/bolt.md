@@ -90,3 +90,7 @@
 ## 2024-05-19 - [Non-Blocking TX Queue]
 **Learning:** The Hub firmware previously used blocking `delay(2)` and `delay(50)` calls in the main loop to prevent packet collisions during bulk LoRa transmissions and locator sequences. This stalled the entire `loop()`, starving concurrent background tasks (like WiFi state, ATEM keepalives, and UI updates).
 **Action:** Replaced sequential `delay()`-based transmission logic with a non-blocking circular `g_loraQueue` and a `processLoraQueue()` state machine that dispatches one packet every 2ms. This decouples fast event polling from physical transmission limits, dramatically improving overall system concurrency.
+
+## 2024-06-05 - [Eliminated redundant hardware transaction by deriving status]
+**Learning:** In SPI drivers, executing sequential blocking SPI queries for related states (e.g., calling `checkConnection()` immediately after `getChipStatus()`) introduces redundant hardware transactions. The secondary connection state can often be derived directly from the primary status byte returned by the initial query.
+**Action:** Avoid making redundant hardware queries. Instead, derive secondary connection states directly from the primary status byte returned by the initial query to reduce CPU overhead and SPI bus traffic.
