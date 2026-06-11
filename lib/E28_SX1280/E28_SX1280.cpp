@@ -4,10 +4,13 @@ E28Radio::E28Radio() {
   _sf = LORA_SF7;
   _bw = LORA_BW_0400;
   _cr = LORA_CR_4_5;
+  _preambleByte = 0x0C; // 12 symbols
   _power = 1; // Low power mode: ~14dBm with PA (safe for USB power)
   _lastRSSI = 0;
   _lastSNR = 0;
   _connected = false;
+  _txActive = false;
+  _txStartMs = 0;
 }
 
 bool E28Radio::begin() {
@@ -247,9 +250,24 @@ void E28Radio::setModulationParams() {
   writeCommand(SX1280_CMD_SET_MODULATION_PARAMS, modParams, 3);
 }
 
+void E28Radio::setPreambleLength(uint16_t symbols) {
+  // SX1280 LoRa preamble byte: (exponent << 4) | mantissa,
+  // length = mantissa * 2^exponent. Round up so the preamble is never
+  // shorter than requested (matters for duty-cycle RX detection windows).
+  uint8_t exp = 0;
+  uint16_t mant = symbols;
+  while (mant > 15 && exp < 15) {
+    mant = (mant + 1) / 2;
+    exp++;
+  }
+  if (mant > 15)
+    mant = 15;
+  _preambleByte = (uint8_t)((exp << 4) | mant);
+}
+
 void E28Radio::setPacketParams(uint8_t payloadLen) {
   uint8_t pktParams[7] = {
-      0x0C,            // Preamble length (12 symbols)
+      _preambleByte,   // Preamble length (default 0x0C = 12 symbols)
       0x00,            // Header type: explicit
       payloadLen,      // Payload length
       0x01,            // CRC on
@@ -355,8 +373,8 @@ bool E28Radio::send(uint8_t *data, uint8_t len) {
   return true;
 }
 
-bool E28Radio::sendAsync(uint8_t *data, uint8_t len) {
-  if (!_connected)
+bool E28Radio::startSend(uint8_t *data, uint8_t len) {
+  if (!_connected || _txActive)
     return false;
 
   standby();
@@ -405,21 +423,25 @@ bool E28Radio::sendAsync(uint8_t *data, uint8_t len) {
   uint8_t txParams[3] = {0x00, 0x00, 0x00};
   writeCommand(SX1280_CMD_SET_TX, txParams, 3);
 
-  // Wait for TX done with timeout
-  uint32_t t0 = millis();
-  while (!isTxDone()) { // TxDone bit
-    if (millis() - t0 > 500) {
-      if (_pinTXEN != -1)
-        digitalWrite(_pinTXEN, LOW);
-      standby();
-      return false;
-    }
-    yield();
-  }
+  _txActive = true;
+  _txStartMs = millis();
+  return true;
+}
+
+bool E28Radio::checkTxDone() {
+  if (!_txActive)
+    return true;
+
+  // 100ms cap mirrors the blocking send(); a tally packet is on air <15ms
+  if (!isTxDone() && millis() - _txStartMs <= 100)
+    return false;
+
+  // Teardown (same order as blocking send): IRQ clear, PA off, standby
   clearIrqStatus();
   if (_pinTXEN != -1)
     digitalWrite(_pinTXEN, LOW);
   standby();
+  _txActive = false;
   return true;
 }
 
@@ -449,6 +471,28 @@ void E28Radio::startReceive() {
   // Start continuous RX
   uint8_t rxParams[3] = {0xFF, 0xFF, 0xFF}; // Continuous RX
   writeCommand(SX1280_CMD_SET_RX, rxParams, 3);
+}
+
+void E28Radio::startReceiveDutyCycle(uint16_t rxCount, uint16_t sleepCount,
+                                     uint8_t periodBase) {
+  if (!_connected)
+    return;
+
+  standby();
+  setPacketParams(E28_MAX_PACKET_SIZE);
+  clearIrqStatus();
+
+  // Enable LNA
+  if (_pinTXEN != -1)
+    digitalWrite(_pinTXEN, LOW);
+  if (_pinRXEN != -1)
+    digitalWrite(_pinRXEN, HIGH);
+  delayMicroseconds(50);
+
+  uint8_t params[5] = {periodBase, (uint8_t)(rxCount >> 8),
+                       (uint8_t)(rxCount & 0xFF), (uint8_t)(sleepCount >> 8),
+                       (uint8_t)(sleepCount & 0xFF)};
+  writeCommand(SX1280_CMD_SET_RX_DUTY_CYCLE, params, 5);
 }
 
 void E28Radio::clearRxIrq() {

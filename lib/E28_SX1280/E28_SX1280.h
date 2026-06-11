@@ -48,6 +48,7 @@
 #define SX1280_CMD_SET_BUFFER_BASE_ADDR 0x8F
 #define SX1280_CMD_GET_RX_BUFFER_STATUS 0x17
 #define SX1280_CMD_GET_PACKET_STATUS 0x1D
+#define SX1280_CMD_SET_RX_DUTY_CYCLE 0x94
 #define SX1280_CMD_CLR_IRQ_STATUS 0x97
 #define SX1280_CMD_SET_DIO_IRQ_PARAMS 0x8D
 #define SX1280_CMD_GET_IRQ_STATUS 0x15
@@ -102,19 +103,33 @@ public:
   void setSpreadingFactor(uint8_t sf);   // SF5 to SF12
   void setBandwidth(uint8_t bw);         // Use LORA_BW_* constants
   void setCodingRate(uint8_t cr);        // Use LORA_CR_* constants
+  void setPreambleLength(uint16_t symbols);
 
-  // Transmission
+  // Transmission (blocking)
   bool send(uint8_t *data, uint8_t len);
-  bool sendAsync(uint8_t *data, uint8_t len);
   bool isTxDone();
+
+  // Transmission (non-blocking): startSend() kicks the TX and returns;
+  // poll checkTxDone() — it tears down (IRQ clear, PA off, standby) when done
+  bool startSend(uint8_t *data, uint8_t len);
+  bool checkTxDone();
+  bool txActive() { return _txActive; }
 
   // Reception
   void startReceive();
+  // Duty-cycled RX: radio autonomously alternates RX/sleep, DIO1 fires on
+  // RxDone. periodBase 0x02 = 1ms units, so counts are milliseconds.
+  // Caller MUST re-issue after every DIO1 event (chip exits the cycle on any
+  // RxDone, even CRC errors) and avoid SPI polling between events (any NSS
+  // edge during the sleep phase silently kills the cycle).
+  void startReceiveDutyCycle(uint16_t rxCount, uint16_t sleepCount,
+                             uint8_t periodBase = 0x02);
   void clearRxIrq(); // Lightweight: just clear IRQ, stay in continuous RX
   bool available();
   uint8_t receive(uint8_t *buffer, uint8_t maxLen);
   int8_t getRSSI();
   int8_t getSNR();
+  int8_t dio1Pin() const { return _pinDIO1; }
 
   // Power management
   void sleep();
@@ -134,8 +149,11 @@ private:
   uint8_t _sf;
   uint8_t _bw;
   uint8_t _cr;
+  uint8_t _preambleByte; // SX1280 encoding: (exponent << 4) | mantissa
   int8_t _power;
   bool _connected;
+  bool _txActive;
+  uint32_t _txStartMs;
 
   int8_t _lastRSSI;
   int8_t _lastSNR;
