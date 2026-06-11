@@ -14,7 +14,10 @@
 #define TALLY_RF_FREQ_HZ 2480000000UL
 
 #define TALLY_REFRESH_MS 500      // Periodic STATE_ALL re-send = link heartbeat
-#define TALLY_SIGNAL_LOST_MS 3000 // Slave alarms after this much radio silence
+// Derived from the heartbeat so they track it automatically. Raising
+// TALLY_REFRESH_MS must not silently desync the receivers' timers.
+#define TALLY_SIGNAL_LOST_MS (6 * TALLY_REFRESH_MS) // Alarm after 6 missed beats
+#define TALLY_RX_REARM_MS (3 * TALLY_REFRESH_MS)    // RX safety-net re-arm
 
 // TX preamble 40 symbols (~12.6 ms at SF7/BW406): guarantees a full RX window
 // of a duty-cycled receiver (3 ms on / 6 ms off) lands inside the preamble

@@ -5,11 +5,13 @@ E28Radio::E28Radio() {
   _bw = LORA_BW_0400;
   _cr = LORA_CR_4_5;
   _preambleByte = 0x0C; // 12 symbols
+  _frequency = 2400000000UL; // SX1280 default; callers override via setFrequency
   _power = 1; // Low power mode: ~14dBm with PA (safe for USB power)
   _lastRSSI = 0;
   _lastSNR = 0;
   _connected = false;
   _txActive = false;
+  _txSuccess = false;
   _txStartMs = 0;
 }
 
@@ -62,6 +64,7 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
   // Wait for chip to be ready
   delay(10);
   _connected = true; // assume present; waitBusy() clears this on stuck BUSY
+  _txActive = false; // a re-init (e.g. field recovery) abandons any in-flight TX
   waitBusy();
 
   // Early bail before the config sequence: with no module each command below
@@ -79,8 +82,9 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
   uint8_t packetType = SX1280_PACKET_TYPE_LORA;
   writeCommand(SX1280_CMD_SET_PACKET_TYPE, &packetType, 1);
 
-  // Set default frequency (2.4 GHz)
-  setFrequency(2400000000);
+  // Apply the stored frequency (defaults to 2.4 GHz; setFrequency() persists
+  // the caller's choice so it survives a re-init)
+  setFrequency(_frequency);
 
   // Set default TX power
   setTxPower(_power);
@@ -203,6 +207,7 @@ void E28Radio::readCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
 }
 
 void E28Radio::setFrequency(uint32_t frequency) {
+  _frequency = frequency; // remember so begin()/re-init re-applies it
   // Frequency = (rfFreq * Fxtal) / 2^18
   // Fxtal = 52 MHz for SX1280
   // 64-bit integer math: float loses precision at 2.4e9 (24-bit mantissa)
@@ -433,8 +438,13 @@ bool E28Radio::checkTxDone() {
     return true;
 
   // 100ms cap mirrors the blocking send(); a tally packet is on air <15ms
-  if (!isTxDone() && millis() - _txStartMs <= 100)
+  bool done = isTxDone();
+  if (!done && millis() - _txStartMs <= 100)
     return false;
+
+  // done == true: real TxDone; done == false: 100ms timeout (TX failed).
+  // Callers count drops on !txSucceeded() so a stuck PA/antenna fault shows up.
+  _txSuccess = done;
 
   // Teardown (same order as blocking send): IRQ clear, PA off, standby
   clearIrqStatus();

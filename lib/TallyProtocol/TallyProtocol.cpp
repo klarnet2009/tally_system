@@ -90,6 +90,9 @@ bool TallyProtocol::validate(const TallyPacket& packet) {
 }
 
 uint8_t TallyProtocol::calculateCRC(const TallyPacket& packet) {
+    // serialize()/deserialize() memcpy the struct as the wire format, so its
+    // size must equal TALLY_PACKET_SIZE; the unrolled CRC below assumes 8 bytes.
+    static_assert(sizeof(TallyPacket) == TALLY_PACKET_SIZE, "TallyPacket layout != wire size");
     static_assert(TALLY_PACKET_SIZE == 8, "Packet size changed, update CRC unrolling");
     const uint8_t* data = (const uint8_t*)&packet;
     return data[0] ^ data[1] ^ data[2] ^ data[3] ^ data[4] ^ data[5] ^ data[6];

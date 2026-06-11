@@ -110,10 +110,13 @@ public:
   bool isTxDone();
 
   // Transmission (non-blocking): startSend() kicks the TX and returns;
-  // poll checkTxDone() — it tears down (IRQ clear, PA off, standby) when done
+  // poll checkTxDone() — it tears down (IRQ clear, PA off, standby) when done.
+  // After checkTxDone() returns true, txSucceeded() tells real TxDone (true)
+  // apart from the 100ms timeout/failure path (false).
   bool startSend(uint8_t *data, uint8_t len);
   bool checkTxDone();
   bool txActive() { return _txActive; }
+  bool txSucceeded() const { return _txSuccess; }
 
   // Reception
   void startReceive();
@@ -149,10 +152,12 @@ private:
   uint8_t _sf;
   uint8_t _bw;
   uint8_t _cr;
-  uint8_t _preambleByte; // SX1280 encoding: (exponent << 4) | mantissa
+  uint8_t _preambleByte;  // SX1280 encoding: (exponent << 4) | mantissa
+  uint32_t _frequency;    // Hz; re-applied by begin() so it survives re-init
   int8_t _power;
   bool _connected;
   bool _txActive;
+  bool _txSuccess;        // result of the last completed async TX
   uint32_t _txStartMs;
 
   int8_t _lastRSSI;
