@@ -14,9 +14,22 @@
 #include "config.h"
 
 static E28Radio radio;
-static uint8_t g_lastTallies[8] = {0};
+static uint8_t g_tallies[8] = {0};   // Last polled per-camera states (for OLED)
 static uint32_t g_loraTxCount = 0;   // TX packet counter
 static uint32_t g_loraDropCount = 0; // Packets lost: queue overflow / radio down
+
+// begin() resets the chip to its 2400 MHz/12-symbol defaults, so frequency and
+// preamble must be reapplied on every (re)init — including in-field recovery
+static bool radioInit() {
+  bool ok = radio.begin(E28_PIN_SCK, E28_PIN_MISO, E28_PIN_MOSI, E28_PIN_NSS,
+                        E28_PIN_BUSY, E28_PIN_DIO1, E28_PIN_RESET, E28_PIN_RXEN,
+                        E28_PIN_TXEN);
+  if (ok) {
+    radio.setFrequency(TALLY_RF_FREQ_HZ);
+    radio.setPreambleLength(TALLY_PREAMBLE_SYMBOLS);
+  }
+  return ok;
+}
 
 // ⚡ Bolt: Non-blocking transmission queue to prevent delay() stalls in main loop
 #define LORA_QUEUE_SIZE 16
@@ -35,7 +48,17 @@ static void enqueueLora(const TallyPacket &pkt) {
 }
 
 static void processLoraQueue() {
-  static uint32_t lastTxTime = 0;
+  static uint32_t lastTxDoneTime = 0;
+
+  // Finish the in-flight transmission first (checkTxDone tears down PA/IRQ);
+  // the loop never blocks on TX airtime (~15ms with the long preamble)
+  if (radio.txActive()) {
+    if (radio.checkTxDone()) {
+      g_loraTxCount++;
+      lastTxDoneTime = millis();
+    }
+    return;
+  }
 
   if (g_loraQueueHead != g_loraQueueTail) {
     // Radio down: drain the packet as a drop instead of stalling on SPI
@@ -44,14 +67,13 @@ static void processLoraQueue() {
       g_loraQueueTail = (g_loraQueueTail + 1) % LORA_QUEUE_SIZE;
       return;
     }
-    // ⚡ Bolt: Enforce minimum 2ms gap between packets non-blockingly
-    if (millis() - lastTxTime >= 2) {
+    // Minimum 2ms gap between packets, enforced non-blockingly
+    if (millis() - lastTxDoneTime >= 2) {
       uint8_t buf[TALLY_PACKET_SIZE];
       TallyProtocol::serialize(g_loraQueue[g_loraQueueTail], buf);
-      radio.send(buf, TALLY_PACKET_SIZE);
-      g_loraTxCount++;
-      lastTxTime = millis();
-      g_loraQueueTail = (g_loraQueueTail + 1) % LORA_QUEUE_SIZE;
+      if (radio.startSend(buf, TALLY_PACKET_SIZE)) {
+        g_loraQueueTail = (g_loraQueueTail + 1) % LORA_QUEUE_SIZE;
+      }
     }
   }
 }
@@ -433,9 +455,7 @@ void setup() {
   for (int attempt = 1; attempt <= 5; attempt++) {
     drawCenteredMsg("LoRa init...",
                     (String("Attempt ") + String(attempt) + "/5").c_str());
-    radioOk = radio.begin(E28_PIN_SCK, E28_PIN_MISO, E28_PIN_MOSI, E28_PIN_NSS,
-                          E28_PIN_BUSY, E28_PIN_DIO1, E28_PIN_RESET,
-                          E28_PIN_RXEN, E28_PIN_TXEN);
+    radioOk = radioInit();
     if (radioOk)
       break;
     delay(500);
@@ -454,9 +474,7 @@ void loop() {
     static uint32_t lastRadioRetry = 0;
     if (millis() - lastRadioRetry > 10000) {
       lastRadioRetry = millis();
-      radio.begin(E28_PIN_SCK, E28_PIN_MISO, E28_PIN_MOSI, E28_PIN_NSS,
-                  E28_PIN_BUSY, E28_PIN_DIO1, E28_PIN_RESET, E28_PIN_RXEN,
-                  E28_PIN_TXEN);
+      radioInit();
     }
   }
 
@@ -483,13 +501,12 @@ void loop() {
 
     if (millis() - lastPoll > POLL_MS) {
       lastPoll = millis();
-      uint8_t tallies[8];
       uint16_t progMask = 0, prevMask = 0;
       for (int i = 0; i < 8; i++) {
         uint8_t idx0 = TALLY_INPUTS[i] - 1;
         bool onAir = atem->isOnAir(idx0);
         bool preview = atem->isPreview(idx0);
-        tallies[i] = onAir ? 2 : (preview ? 1 : 0);
+        g_tallies[i] = onAir ? 2 : (preview ? 1 : 0);
         uint8_t human = TALLY_INPUTS[i];
         if (onAir)
           progMask |= (1U << (human - 1));
@@ -497,62 +514,39 @@ void loop() {
           prevMask |= (1U << (human - 1));
       }
 
-      // ==== Проверка изменений ====
+      // One STATE_ALL broadcast carries all cameras; the periodic re-send
+      // doubles as the link heartbeat for the slaves' signal-lost detection
       static uint16_t lastProgMask = 0xFFFF;
       static uint16_t lastPrevMask = 0xFFFF;
-      static uint32_t lastDisplayUpdate = 0;
+      static uint32_t lastStateSend = 0;
 
       bool tallyChanged =
           (progMask != lastProgMask) || (prevMask != lastPrevMask);
-      bool timeToRefresh = (millis() - lastDisplayUpdate >
-                            2000); // Обновляем инфо раз в 2 сек (RSSI, статус)
 
-      if (tallyChanged || timeToRefresh) {
+      if (tallyChanged || millis() - lastStateSend >= TALLY_REFRESH_MS) {
         lastProgMask = progMask;
         lastPrevMask = prevMask;
-        lastDisplayUpdate = millis();
-
-        // ==== LoRa E28 Send ====
-        // Iterate cameras and send update if changed OR if it's a periodic
-        // refresh
-        for (int i = 0; i < 8; i++) {
-          bool stateChanged = (tallies[i] != g_lastTallies[i]);
-          if (stateChanged || timeToRefresh) {
-            // Determine state
-            TallyState ts = STATE_OFF;
-            if (tallies[i] == 2)
-              ts = STATE_PROGRAM;
-            else if (tallies[i] == 1)
-              ts = STATE_PREVIEW;
-
-            uint8_t camId = TALLY_INPUTS[i];
-            TallyPacket pkt = TallyProtocol::createSetStatePacket(camId, ts);
-
-            // ⚡ Bolt: Enqueue packet non-blockingly instead of blocking main loop with delay(2)
-            enqueueLora(pkt);
-          }
-          g_lastTallies[i] = tallies[i];
-        }
+        lastStateSend = millis();
+        enqueueLora(TallyProtocol::createStateAllPacket(progMask, prevMask));
       }
     }
   }
 
-  // === STATE TOGGLE: every 1 second (RED ↔ GREEN) ===
+  // === TEST STREAM: cam 1 RED <-> GREEN every 1s, broadcast at refresh rate ===
   static uint32_t lastToggle = 0;
   static bool testRed = true;
+  static uint32_t lastTestSend = 0;
+  bool testToggled = false;
   if (millis() - lastToggle > 1000) {
     lastToggle = millis();
     testRed = !testRed;
+    testToggled = true;
   }
-
-  // === TX at 10Hz: send current state every 100ms ===
-  static uint32_t lastTestSend = 0;
-  if (millis() - lastTestSend > 100) { // 10Hz = 100ms
+  if (testToggled || millis() - lastTestSend >= TALLY_REFRESH_MS) {
     lastTestSend = millis();
-
-    TallyState ts = testRed ? STATE_PROGRAM : STATE_PREVIEW;
-    TallyPacket pkt = TallyProtocol::createSetStatePacket(1, ts);
-    enqueueLora(pkt);
+    uint16_t prog = testRed ? 0x0001 : 0x0000;
+    uint16_t prev = testRed ? 0x0000 : 0x0001;
+    enqueueLora(TallyProtocol::createStateAllPacket(prog, prev));
   }
 
   // Locator / Ping (Button 0) — works without ATEM

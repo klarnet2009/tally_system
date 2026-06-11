@@ -3,8 +3,10 @@
 #include <TallyProtocol.h>
 
 // ===== CONFIGURATION =====
-// Slave ID (Hardcoded for now, TODO: Dip Switch or WiFi config)
+// Slave ID (override per device via -DSLAVE_CAM_ID=n build flag)
+#ifndef SLAVE_CAM_ID
 #define SLAVE_CAM_ID    1
+#endif
 
 // ESP32-C3 SuperMini Pins
 #define SLAVE_PIN_SCK     4
@@ -34,6 +36,11 @@ uint32_t locatorStartTime = 0;
 uint32_t lastLedToggle = 0;
 bool ledIsOn = false;
 
+// Link supervision: the hub re-broadcasts STATE_ALL every TALLY_REFRESH_MS,
+// so radio silence longer than TALLY_SIGNAL_LOST_MS means the link is down
+uint32_t lastRxTime = 0;
+bool signalLost = false;
+
 // ⚡ Bolt: Update LED non-blocking to prevent dropping LoRa packets
 void updateLed() {
     uint32_t now = millis();
@@ -52,7 +59,17 @@ void updateLed() {
         }
     }
 
-    // 2. Normal Tally States (any non-OFF state lights the LED, incl. STATE_BOTH)
+    // 2. Signal lost: slow blink so the operator knows the state is stale
+    if (signalLost) {
+        if (now - lastLedToggle >= 500) {
+            lastLedToggle = now;
+            ledIsOn = !ledIsOn;
+            digitalWrite(PIN_LED, ledIsOn ? LED_ON : LED_OFF);
+        }
+        return;
+    }
+
+    // 3. Normal Tally States (any non-OFF state lights the LED, incl. STATE_BOTH)
     if (currentTallyState != STATE_OFF) {
         if (!ledIsOn) {
             digitalWrite(PIN_LED, LED_ON);
@@ -80,7 +97,7 @@ void setup() {
     Serial.print("LoRa Init... ");
     // Init with explicit pins for C3
     if (radio.begin(SLAVE_PIN_SCK, SLAVE_PIN_MISO, SLAVE_PIN_MOSI,
-                    SLAVE_PIN_NSS, SLAVE_PIN_BUSY, SLAVE_PIN_DIO1, 
+                    SLAVE_PIN_NSS, SLAVE_PIN_BUSY, SLAVE_PIN_DIO1,
                     SLAVE_PIN_RESET, SLAVE_PIN_RXEN, SLAVE_PIN_TXEN)) {
         Serial.println("OK");
         connected = true;
@@ -93,8 +110,13 @@ void setup() {
         while(1) { digitalWrite(PIN_LED, LED_ON); delay(50); digitalWrite(PIN_LED, LED_OFF); delay(50); }
     }
 
+    // Shared RF profile (begin() leaves the chip on its 2400 MHz default)
+    radio.setFrequency(TALLY_RF_FREQ_HZ);
+    radio.setPreambleLength(TALLY_PREAMBLE_SYMBOLS);
+
     // Set to RX mode
     radio.startReceive();
+    lastRxTime = millis();
 }
 
 void loop() {
@@ -110,31 +132,34 @@ void loop() {
         uint8_t len = radio.receive(buf, TALLY_PACKET_SIZE);
         
         if (len > 0) {
-            // ⚡ Bolt: Fast-path algorithmic early return for broadcast-heavy polling loops.
-            // The Hub continuously broadcasts state packets for up to 8 cameras sequentially.
-            // Bypassing TallyProtocol::deserialize() for the 7 packets meant for other cameras
-            // eliminates unnecessary memcpy operations and computationally expensive CRC validation
-            // loops, saving CPU cycles in the high-frequency event loop.
-            if (len >= 3 && buf[2] != SLAVE_CAM_ID && buf[2] != TALLY_BROADCAST_ID) {
-                // Not for us, fast-path skip processing
+            // Fast-path skip for foreign tally networks (byte2 = netId)
+            if (len >= 3 && buf[2] != TALLY_NET_ID) {
+                // Not our network, skip processing
             } else {
                 // Parse packet
                 TallyPacket pkt;
                 if (TallyProtocol::deserialize(buf, len, pkt)) {
-                    // For us or broadcast (heartbeat etc.)
-                    if (pkt.cameraId == SLAVE_CAM_ID || pkt.cameraId == TALLY_BROADCAST_ID) {
-                        Serial.printf("Tally Update: %d (CMD: %d, RSSI: %d)\n", pkt.state, pkt.command, radio.getRSSI());
+                    // Any valid packet from our hub proves the link is alive
+                    lastRxTime = millis();
+                    if (signalLost) {
+                        signalLost = false;
+                        Serial.println("[LINK] Signal restored");
+                    }
 
-                        if (pkt.command == CMD_PING) {
+                    if (pkt.command == CMD_PING) {
+                        if (pkt.payload[0] == SLAVE_CAM_ID ||
+                            pkt.payload[0] == TALLY_BROADCAST_ID) {
                             // ⚡ Bolt: Start non-blocking locator sequence
                             locatorStartTime = millis();
                             lastLedToggle = millis();
                             ledIsOn = true;
                             digitalWrite(PIN_LED, LED_ON);
                         }
-                        else {
-                            // ⚡ Bolt: Update state variable, let updateLed() handle GPIO safely
-                            currentTallyState = static_cast<TallyState>(pkt.state);
+                    } else if (pkt.command == CMD_STATE_ALL) {
+                        TallyState ts = TallyProtocol::stateForCamera(pkt, SLAVE_CAM_ID);
+                        if (ts != currentTallyState) {
+                            currentTallyState = ts;
+                            Serial.printf("Tally Update: %d (RSSI: %d)\n", ts, radio.getRSSI());
                         }
                     }
                 } else {
@@ -147,6 +172,12 @@ void loop() {
         radio.clearRxIrq();
     }
     
+    // Signal-lost detection (hub broadcasts at TALLY_REFRESH_MS)
+    if (!signalLost && millis() - lastRxTime > TALLY_SIGNAL_LOST_MS) {
+        signalLost = true;
+        Serial.println("[LINK] Signal lost!");
+    }
+
     // Heartbeat debug every 5s
     if (millis() - lastHeartbeat > 5000) {
         lastHeartbeat = millis();
