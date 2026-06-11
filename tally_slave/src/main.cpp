@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <E28_SX1280.h>
+#include <TallyLink.h>
 #include <TallyProtocol.h>
 #include <TallyRadio.h>
 
@@ -19,7 +20,7 @@
 #define SLAVE_PIN_RESET   10
 
 // No HS/PA control on 12dBm module
-#define SLAVE_PIN_RXEN    -1  
+#define SLAVE_PIN_RXEN    -1
 #define SLAVE_PIN_TXEN    -1
 
 // Tally LED
@@ -27,20 +28,16 @@
 #define LED_ON          LOW
 #define LED_OFF         HIGH
 
+// Protocol dispatch + link supervision live in TallyLink (shared with slave
+// v2); this file only renders states on the single mono LED.
 E28Radio radio;
+TallyLink tallyLink;
 uint32_t lastHeartbeat = 0;
-bool connected = false;
 
 // ⚡ Bolt: State tracking for non-blocking LED updates
-TallyState currentTallyState = STATE_OFF;
 uint32_t locatorStartTime = 0;
 uint32_t lastLedToggle = 0;
 bool ledIsOn = false;
-
-// Link supervision: the hub re-broadcasts STATE_ALL every TALLY_REFRESH_MS,
-// so radio silence longer than TALLY_SIGNAL_LOST_MS means the link is down
-uint32_t lastRxTime = 0;
-bool signalLost = false;
 
 // ⚡ Bolt: Update LED non-blocking to prevent dropping LoRa packets
 void updateLed() {
@@ -61,7 +58,7 @@ void updateLed() {
     }
 
     // 2. Signal lost: slow blink so the operator knows the state is stale
-    if (signalLost) {
+    if (tallyLink.signalLost()) {
         if (now - lastLedToggle >= 500) {
             lastLedToggle = now;
             ledIsOn = !ledIsOn;
@@ -71,7 +68,7 @@ void updateLed() {
     }
 
     // 3. Normal Tally States (any non-OFF state lights the LED, incl. STATE_BOTH)
-    if (currentTallyState != STATE_OFF) {
+    if (tallyLink.state() != STATE_OFF) {
         if (!ledIsOn) {
             digitalWrite(PIN_LED, LED_ON);
             ledIsOn = true;
@@ -82,6 +79,24 @@ void updateLed() {
             ledIsOn = false;
         }
     }
+}
+
+// ===== TallyLink presentation callbacks =====
+void onTallyState(TallyState ts) {
+    // updateLed() renders tallyLink.state() every loop pass; just log here
+    Serial.printf("Tally Update: %d (RSSI: %d)\n", ts, radio.getRSSI());
+}
+
+void onLocatorPing() {
+    // ⚡ Bolt: Start non-blocking locator sequence
+    locatorStartTime = millis();
+    lastLedToggle = millis();
+    ledIsOn = true;
+    digitalWrite(PIN_LED, LED_ON);
+}
+
+void onLinkChange(bool lost) {
+    Serial.println(lost ? "[LINK] Signal lost!" : "[LINK] Signal restored");
 }
 
 void setup() {
@@ -101,21 +116,20 @@ void setup() {
                     SLAVE_PIN_NSS, SLAVE_PIN_BUSY, SLAVE_PIN_DIO1,
                     SLAVE_PIN_RESET, SLAVE_PIN_RXEN, SLAVE_PIN_TXEN)) {
         Serial.println("OK");
-        connected = true;
         // Blink LED to confirm init
         for(int i=0; i<3; i++) { digitalWrite(PIN_LED, LED_ON); delay(100); digitalWrite(PIN_LED, LED_OFF); delay(100); }
     } else {
         Serial.println("FAILED! Check Wiring.");
-        connected = false;
         // Fast blink error
         while(1) { digitalWrite(PIN_LED, LED_ON); delay(50); digitalWrite(PIN_LED, LED_OFF); delay(50); }
     }
 
     tallyApplyRadioProfile(radio);
 
+    tallyLink.begin(SLAVE_CAM_ID, onTallyState, onLocatorPing, onLinkChange);
+
     // Set to RX mode
     radio.startReceive();
-    lastRxTime = millis();
 }
 
 // Re-init the radio if a runtime fault (stuck BUSY) latched it disconnected,
@@ -131,14 +145,12 @@ void tryRadioRecover() {
                     SLAVE_PIN_RESET, SLAVE_PIN_RXEN, SLAVE_PIN_TXEN)) {
         tallyApplyRadioProfile(radio);
         radio.startReceive();
-        lastRxTime = millis();
+        tallyLink.noteAlive();
         Serial.println("[LoRa] Recovered");
     }
 }
 
 void loop() {
-    if (!connected) return;
-
     tryRadioRecover();
 
     // ⚡ Bolt: Execute non-blocking LED state machine
@@ -154,46 +166,18 @@ void loop() {
         uint8_t buf[TALLY_PACKET_SIZE];
         uint8_t len = radio.receive(buf, TALLY_PACKET_SIZE);
 
-        // deserialize() already rejects foreign netId before any memcpy/CRC,
-        // so no separate pre-filter is needed here.
         if (len > 0) {
-            TallyPacket pkt;
-            if (TallyProtocol::deserialize(buf, len, pkt)) {
-                // Any valid packet from our hub proves the link is alive
-                lastRxTime = millis();
-                if (signalLost) {
-                    signalLost = false;
-                    Serial.println("[LINK] Signal restored");
-                }
-
-                if (pkt.command == CMD_PING) {
-                    if (pkt.payload[0] == SLAVE_CAM_ID ||
-                        pkt.payload[0] == TALLY_BROADCAST_ID) {
-                        // ⚡ Bolt: Start non-blocking locator sequence
-                        locatorStartTime = millis();
-                        lastLedToggle = millis();
-                        ledIsOn = true;
-                        digitalWrite(PIN_LED, LED_ON);
-                    }
-                } else if (pkt.command == CMD_STATE_ALL) {
-                    TallyState ts = TallyProtocol::stateForCamera(pkt, SLAVE_CAM_ID);
-                    if (ts != currentTallyState) {
-                        currentTallyState = ts;
-                        Serial.printf("Tally Update: %d (RSSI: %d)\n", ts, radio.getRSSI());
-                    }
-                }
-            }
+            // Invalid packets (noise/foreign netId/CRC) are skipped silently —
+            // a neighbouring LoRa system must not spam the serial console
+            tallyLink.onPacket(buf, len);
         }
 
         // ⚡ Bolt: Fast RX re-arm to avoid standby/SPI overhead and prevent dropped packets
-        radio.clearRxIrq();
+        radio.rearmAfterIrq();
     }
 
-    // Signal-lost detection (hub broadcasts at TALLY_REFRESH_MS)
-    if (!signalLost && millis() - lastRxTime > TALLY_SIGNAL_LOST_MS) {
-        signalLost = true;
-        Serial.println("[LINK] Signal lost!");
-    }
+    // Signal-lost timer (hub broadcasts at TALLY_REFRESH_MS)
+    tallyLink.tick();
 
     // Heartbeat debug every 5s
     if (millis() - lastHeartbeat > 5000) {

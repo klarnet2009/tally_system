@@ -1,42 +1,28 @@
 // ============================================================
 //  SUFIDE Tally Slave v2 — ESP32-C3 SuperMini + E28-2G4M12SX
 //  Hardware: WS2812B (GPIO 7), Buzzer (GPIO 8)
-//  Pinout verified per HARDWARE_GUIDE.md (2026-02-10)
+//  Pinout verified per HARDWARE_GUIDE.md (2026-02-10), see pins.h
 //
 //  RX is interrupt-driven (DIO1) and, with -DPOWER_SAVE, duty-cycled:
 //  the radio sleeps ~66% of the time and still catches every packet
 //  thanks to the hub's 40-symbol preamble (see TallyConfig.h).
+//  Protocol dispatch + link supervision live in TallyLink (shared with
+//  slave v1); this file only renders states on the LED/buzzer.
 // ============================================================
 
 #include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
 #include <E28_SX1280.h>
+#include <TallyLink.h>
 #include <TallyProtocol.h>
 #include <TallyRadio.h>
+
+#include "pins.h"
 
 // ===== CONFIGURATION =====
 #ifndef SLAVE_CAM_ID
 #define SLAVE_CAM_ID 1 // Camera ID this slave responds to (-DSLAVE_CAM_ID=n)
 #endif
-
-// ===== HARDWARE PINS (from HARDWARE_GUIDE.md) =====
-// LoRa E28-2G4M12SX
-#define PIN_LORA_SCK 3
-#define PIN_LORA_MOSI 4
-#define PIN_LORA_MISO 5
-#define PIN_LORA_NRESET 6
-#define PIN_LORA_NSS 20
-#define PIN_LORA_BUSY 10
-#define PIN_LORA_DIO1 1
-#define PIN_LORA_RXEN -1 // Not present on 12dBm module
-#define PIN_LORA_TXEN -1
-
-// WS2812B RGB LED
-#define PIN_LED 7
-#define NUM_LEDS 1
-
-// Passive Buzzer
-#define PIN_BUZZER 8
 
 // ===== COLORS =====
 #define COLOR_OFF 0x000000
@@ -51,14 +37,11 @@
 // ===== GLOBALS =====
 Adafruit_NeoPixel led(NUM_LEDS, PIN_LED, NEO_GRB + NEO_KHZ800);
 E28Radio radio;
+TallyLink tallyLink;
 
 uint32_t lastHeartbeat = 0;
-uint32_t lastRxTime = 0; // Track last received packet time
-bool loraConnected = false;
-TallyState currentState = STATE_OFF;
-uint32_t rxCount = 0;  // Total packets received since last heartbeat
-uint32_t crcFails = 0; // CRC failures since last heartbeat
-bool signalLost = false;
+uint32_t rxCount = 0;  // Valid packets since last heartbeat
+uint32_t rxFails = 0;  // Rejected packets (noise/CRC/foreign) since heartbeat
 
 // DIO1 fires on RxDone/CrcError; the loop drains the event and re-arms RX
 static volatile bool g_dio1Flag = false;
@@ -93,7 +76,7 @@ void beep(int freq, int durationMs) {
 }
 
 void applyTallyColor() {
-  switch (currentState) {
+  switch (tallyLink.state()) {
   case STATE_PROGRAM:
     setColor(COLOR_PROGRAM, 120);
     break;
@@ -110,18 +93,13 @@ void applyTallyColor() {
   }
 }
 
-// Arm the receiver. Under POWER_SAVE the chip exits the duty cycle after
-// every RxDone (even CRC errors), so this must be called after each DIO1
-// event; without POWER_SAVE a cheap IRQ-clear keeps continuous RX going.
-void rearmReceive(bool full = false) {
+// Arm the receiver in the mode this build uses; after this, the driver's
+// rearmAfterIrq()/restartReceive() remember and re-issue the right thing.
+void armReceive() {
 #ifdef POWER_SAVE
-  (void)full;
   radio.startReceiveDutyCycle(TALLY_DC_RX_MS, TALLY_DC_SLEEP_MS);
 #else
-  if (full)
-    radio.startReceive();
-  else
-    radio.clearRxIrq();
+  radio.startReceive();
 #endif
 }
 
@@ -144,7 +122,7 @@ void updateLocator() {
     // Don't paint the (possibly stale) tally colour over a dead link — that
     // could show solid RED ("you're live") on data minutes old. Hand straight
     // back to the orange signal-lost indication.
-    if (signalLost)
+    if (tallyLink.signalLost())
       setColor(COLOR_LOST, 60);
     else
       applyTallyColor();
@@ -161,6 +139,50 @@ void updateLocator() {
       setColor(COLOR_OFF);
       noTone(PIN_BUZZER);
     }
+  }
+}
+
+// ===== TallyLink presentation callbacks =====
+void onTallyState(TallyState ts) {
+  Serial.printf("[TALLY] State:%d RSSI:%d\n", ts, radio.getRSSI());
+  if (!locatorActive && !tallyLink.signalLost())
+    applyTallyColor();
+}
+
+void onLocatorPing() {
+  Serial.println("[LOCATOR] Alert!");
+  startLocator();
+}
+
+void onLinkChange(bool lost) {
+  if (lost) {
+    Serial.println("[WARN] Signal lost!");
+    tone(PIN_BUZZER, 800, 300); // non-blocking beep
+  } else {
+    Serial.println("[LINK] Signal restored");
+    if (!locatorActive)
+      applyTallyColor();
+  }
+}
+
+// Re-init the radio if a runtime fault (stuck BUSY) latched it disconnected.
+// Without this a single glitch would leave the receiver permanently deaf,
+// since every RX call is a guarded no-op while _connected is false.
+void tryRadioRecover() {
+  static uint32_t lastTry = 0;
+  if (radio.isConnected())
+    return;
+  if (millis() - lastTry < 10000)
+    return;
+  lastTry = millis();
+  Serial.println("[LoRa] Recovering...");
+  if (radio.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS,
+                  PIN_LORA_BUSY, PIN_LORA_DIO1, PIN_LORA_NRESET, PIN_LORA_RXEN,
+                  PIN_LORA_TXEN)) {
+    tallyApplyRadioProfile(radio);
+    armReceive();
+    tallyLink.noteAlive();
+    Serial.println("[LoRa] Recovered");
   }
 }
 
@@ -189,22 +211,11 @@ void setup() {
   noTone(PIN_BUZZER);
 
   Serial.print("[LoRa] Init... ");
-  loraConnected = radio.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI,
-                              PIN_LORA_NSS, PIN_LORA_BUSY, PIN_LORA_DIO1,
-                              PIN_LORA_NRESET, PIN_LORA_RXEN, PIN_LORA_TXEN);
+  bool ok = radio.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI,
+                        PIN_LORA_NSS, PIN_LORA_BUSY, PIN_LORA_DIO1,
+                        PIN_LORA_NRESET, PIN_LORA_RXEN, PIN_LORA_TXEN);
 
-  if (loraConnected) {
-    Serial.println("OK");
-    flashColor(COLOR_INIT_OK, 3, 150, 100);
-    beep(1000, 100);
-
-    tallyApplyRadioProfile(radio);
-
-    attachInterrupt(digitalPinToInterrupt(PIN_LORA_DIO1), onDio1, RISING);
-    rearmReceive(true);
-    lastRxTime = millis(); // Start signal timer
-    Serial.println("[LoRa] Listening...");
-  } else {
+  if (!ok) {
     Serial.println("FAILED");
     beep(400, 500);
     while (1) {
@@ -214,34 +225,22 @@ void setup() {
       delay(100);
     }
   }
-}
 
-// Re-init the radio if a runtime fault (stuck BUSY) latched it disconnected.
-// Without this a single glitch would leave the receiver permanently deaf,
-// since every RX call is a guarded no-op while _connected is false.
-void tryRadioRecover() {
-  static uint32_t lastTry = 0;
-  if (radio.isConnected())
-    return;
-  if (millis() - lastTry < 10000)
-    return;
-  lastTry = millis();
-  Serial.println("[LoRa] Recovering...");
-  if (radio.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS,
-                  PIN_LORA_BUSY, PIN_LORA_DIO1, PIN_LORA_NRESET, PIN_LORA_RXEN,
-                  PIN_LORA_TXEN)) {
-    tallyApplyRadioProfile(radio);
-    rearmReceive(true);
-    lastRxTime = millis();
-    Serial.println("[LoRa] Recovered");
-  }
+  Serial.println("OK");
+  flashColor(COLOR_INIT_OK, 3, 150, 100);
+  beep(1000, 100);
+
+  tallyApplyRadioProfile(radio);
+
+  tallyLink.begin(SLAVE_CAM_ID, onTallyState, onLocatorPing, onLinkChange);
+
+  attachInterrupt(digitalPinToInterrupt(PIN_LORA_DIO1), onDio1, RISING);
+  armReceive();
+  Serial.println("[LoRa] Listening...");
 }
 
 // ===== LOOP =====
 void loop() {
-  if (!loraConnected)
-    return;
-
   tryRadioRecover();
   updateLocator();
 
@@ -255,36 +254,12 @@ void loop() {
       uint8_t len = radio.receive(buf, TALLY_PACKET_SIZE);
 
       if (len > 0) {
-        TallyPacket pkt;
-        if (TallyProtocol::deserialize(buf, len, pkt)) {
-          lastRxTime = millis(); // Any valid packet proves the link is alive
+        if (tallyLink.onPacket(buf, len)) {
           rxCount++;
-          if (signalLost) {
-            signalLost = false;
-            Serial.println("[LINK] Signal restored");
-            if (!locatorActive)
-              applyTallyColor();
-          }
-
-          if (pkt.command == CMD_PING) {
-            if (pkt.payload[0] == SLAVE_CAM_ID ||
-                pkt.payload[0] == TALLY_BROADCAST_ID) {
-              Serial.println("[LOCATOR] Alert!");
-              startLocator();
-            }
-          } else if (pkt.command == CMD_STATE_ALL) {
-            TallyState ts = TallyProtocol::stateForCamera(pkt, SLAVE_CAM_ID);
-            if (ts != currentState) {
-              currentState = ts;
-              Serial.printf("[TALLY] State:%d RSSI:%d\n", ts, radio.getRSSI());
-              if (!locatorActive && !signalLost)
-                applyTallyColor();
-            }
-          }
         } else {
-          crcFails++;
-          if (crcFails <= 10) {
-            Serial.printf("[CRC_FAIL] len=%d raw: ", len);
+          rxFails++;
+          if (rxFails <= 10) {
+            Serial.printf("[RX_FAIL] len=%d raw: ", len);
             for (int i = 0; i < len && i < 16; i++)
               Serial.printf("%02X ", buf[i]);
             Serial.println();
@@ -293,17 +268,13 @@ void loop() {
       }
     }
     // Unconditional re-arm: RxDone (even a CRC error) ends the duty cycle
-    rearmReceive();
+    radio.rearmAfterIrq();
   }
 
-  // === SIGNAL LOST DETECTION (hub broadcasts every TALLY_REFRESH_MS) ===
-  if (!signalLost && millis() - lastRxTime > TALLY_SIGNAL_LOST_MS) {
-    signalLost = true;
-    Serial.println("[WARN] Signal lost!");
-    tone(PIN_BUZZER, 800, 300); // non-blocking beep
-  }
+  // === LINK SUPERVISION (hub broadcasts every TALLY_REFRESH_MS) ===
+  tallyLink.tick();
 
-  if (signalLost && !locatorActive) {
+  if (tallyLink.signalLost() && !locatorActive) {
     // Pulse orange every second
     static uint32_t lastPulse = 0;
     static bool pulseOn = false;
@@ -324,20 +295,20 @@ void loop() {
   // Restores RX no matter what state the chip fell into (duty cycle ended,
   // missed interrupt, ...). Cheap and idempotent.
   static uint32_t lastRearm = 0;
-  if (millis() - lastRxTime > TALLY_RX_REARM_MS &&
+  if (tallyLink.msSinceLastRx() > TALLY_RX_REARM_MS &&
       millis() - lastRearm > TALLY_RX_REARM_MS) {
     lastRearm = millis();
-    rearmReceive(true);
+    radio.restartReceive();
   }
 
   // Heartbeat: status log every 10 seconds
   if (millis() - lastHeartbeat > 10000) {
     lastHeartbeat = millis();
-    uint32_t secSinceRx = (millis() - lastRxTime) / 1000;
-    Serial.printf("[STATUS] Up:%lus State:%d LastRX:%lus ago RX:%lu CRC:%lu\n",
-                  millis() / 1000, currentState, secSinceRx, rxCount, crcFails);
+    Serial.printf("[STATUS] Up:%lus State:%d LastRX:%lus ago RX:%lu Fail:%lu\n",
+                  millis() / 1000, tallyLink.state(), tallyLink.msSinceLastRx() / 1000,
+                  rxCount, rxFails);
     rxCount = 0;
-    crcFails = 0;
+    rxFails = 0;
   }
 
   // Serial commands (for testing)
@@ -345,19 +316,19 @@ void loop() {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
 
-    // red/green/off drive currentState (not just the LED) so the next
+    // red/green/off drive the link state (not just the LED) so the next
     // heartbeat doesn't leave a stale test colour stuck on the pixel
     if (cmd == "test") {
       Serial.println("[TEST] Locator alert...");
       startLocator();
     } else if (cmd == "red") {
-      currentState = STATE_PROGRAM;
+      tallyLink.forceState(STATE_PROGRAM);
       applyTallyColor();
     } else if (cmd == "green") {
-      currentState = STATE_PREVIEW;
+      tallyLink.forceState(STATE_PREVIEW);
       applyTallyColor();
     } else if (cmd == "off") {
-      currentState = STATE_OFF;
+      tallyLink.forceState(STATE_OFF);
       applyTallyColor();
     } else if (cmd == "beep") {
       beep(1000, 200);
@@ -366,7 +337,8 @@ void loop() {
     }
   }
 
-#ifdef POWER_SAVE
-  delay(5); // FreeRTOS idle -> CPU clock-gating between events
-#endif
+  // FreeRTOS idle -> CPU clock-gating between events. Kept outside the
+  // POWER_SAVE ifdef: RX is DIO1-driven either way, so a non-power-save
+  // build gains nothing from spinning at 100% CPU.
+  delay(5);
 }
