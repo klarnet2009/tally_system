@@ -84,9 +84,13 @@ Adafruit_SSD1306 display(128, 64, &I2Cbus, -1);
 
 static IAtemClient *atem = nullptr;
 static bool atemConnected = false;
-static IPAddress atemAddr;
 static uint32_t lastPoll = 0;
 static uint32_t lastAtemAttempt = 0;
+
+// Current tally masks broadcast to the slaves (updated by the ATEM poll,
+// re-sent every TALLY_REFRESH_MS as the link heartbeat)
+static uint16_t g_progMask = 0;
+static uint16_t g_prevMask = 0;
 
 String ipToStr(IPAddress ip) {
   char b[20];
@@ -377,51 +381,60 @@ void drawLoRaDebug() {
   display.display();
 }
 
-void tryConnectAtem() {
-  lastAtemAttempt = millis();
-  uint8_t atemFrame = 0;
+// ===== ATEM connection: non-blocking state machine =====
+// Never blocks the loop — the radio queue, locator and OLED keep running
+// while the connection is (re)established in the background.
+enum AtemPhase : uint8_t { ATEM_IDLE, ATEM_CONNECTING, ATEM_RUNNING };
+static AtemPhase atemPhase = ATEM_IDLE;
+static uint32_t atemAttemptStart = 0;
 
-  // ⚡ Bolt: Cache target IP Address and its string representation to avoid repeated
-  // String instantiation and parsing from constant ATEM_IP_STR, reducing heap
-  // fragmentation and improving setup speed.
-  static bool ipCached = false;
+static void atemTick() {
+  // Resolve the configured IP once
+  static bool ipParsed = false;
+  static bool ipValid = false;
   static IPAddress target;
-  static String targetStr;
-
-  if (!ipCached) {
+  if (!ipParsed) {
+    ipParsed = true;
     String cfgIP = String(ATEM_IP_STR);
-    if (!cfgIP.length()) {
-      drawCenteredMsg("ATEM: no IP set", "Set ATEM_IP_STR");
-      return;
+    if (cfgIP.length())
+      ipValid = target.fromString(cfgIP);
+  }
+  if (!ipValid)
+    return; // no ATEM configured — hub keeps broadcasting last-known masks
+
+  switch (atemPhase) {
+  case ATEM_IDLE:
+    if (WiFi.status() == WL_CONNECTED &&
+        millis() - lastAtemAttempt > ATEM_RETRY_MS) {
+      lastAtemAttempt = millis();
+      if (!atem)
+        atem = CreateAtemClient();
+      atem->begin(target);
+      atem->connect();
+      atemAttemptStart = millis();
+      atemPhase = ATEM_CONNECTING;
     }
-    target.fromString(cfgIP);
-    targetStr = ipToStr(target);
-    ipCached = true;
-  }
+    break;
 
-  drawLoadingScreen("ATEM", targetStr.c_str(), atemFrame++);
-
-  if (!atem)
-    atem = CreateAtemClient();
-  atem->begin(target);
-  atem->connect();
-
-  uint32_t t0 = millis();
-  while (millis() - t0 < 3000) {
+  case ATEM_CONNECTING:
     atem->loop();
-    if (atem->connected())
-      break;
-    drawLoadingScreen("ATEM", targetStr.c_str(), atemFrame++);
-    delay(50);
-  }
-  atemConnected = atem->connected();
-  if (atemConnected)
-    atemAddr = target;
+    if (atem->connected()) {
+      atemConnected = true;
+      atemPhase = ATEM_RUNNING;
+    } else if (millis() - atemAttemptStart > 5000) {
+      atemPhase = ATEM_IDLE; // next try after ATEM_RETRY_MS
+    }
+    break;
 
-  if (atemConnected)
-    drawCenteredMsg("ATEM: connected", targetStr.c_str());
-  else
-    drawCenteredMsg("ATEM: failed", targetStr.c_str());
+  case ATEM_RUNNING:
+    atem->loop();
+    if (!atem->connected()) {
+      atemConnected = false;
+      atemPhase = ATEM_IDLE;
+      lastAtemAttempt = millis();
+    }
+    break;
+  }
 }
 
 void setup() {
@@ -488,65 +501,50 @@ void loop() {
     }
   }
 
-  // if(!atemConnected && millis()-lastAtemAttempt > 500) tryConnectAtem(); //
-  // ATEM disabled for LoRa debug
-
-  if (atemConnected) {
-    atem->loop();
-    if (!atem->connected()) {
-      atemConnected = false;
-      lastAtemAttempt = millis() + ATEM_RETRY_MS;
-      return;
-    }
-
-    if (millis() - lastPoll > POLL_MS) {
-      lastPoll = millis();
-      uint16_t progMask = 0, prevMask = 0;
-      for (int i = 0; i < 8; i++) {
-        uint8_t idx0 = TALLY_INPUTS[i] - 1;
-        bool onAir = atem->isOnAir(idx0);
-        bool preview = atem->isPreview(idx0);
-        g_tallies[i] = onAir ? 2 : (preview ? 1 : 0);
-        uint8_t human = TALLY_INPUTS[i];
-        if (onAir)
-          progMask |= (1U << (human - 1));
-        if (preview)
-          prevMask |= (1U << (human - 1));
-      }
-
-      // One STATE_ALL broadcast carries all cameras; the periodic re-send
-      // doubles as the link heartbeat for the slaves' signal-lost detection
-      static uint16_t lastProgMask = 0xFFFF;
-      static uint16_t lastPrevMask = 0xFFFF;
-      static uint32_t lastStateSend = 0;
-
-      bool tallyChanged =
-          (progMask != lastProgMask) || (prevMask != lastPrevMask);
-
-      if (tallyChanged || millis() - lastStateSend >= TALLY_REFRESH_MS) {
-        lastProgMask = progMask;
-        lastPrevMask = prevMask;
-        lastStateSend = millis();
-        enqueueLora(TallyProtocol::createStateAllPacket(progMask, prevMask));
-      }
-    }
-  }
-
-  // === TEST STREAM: cam 1 RED <-> GREEN every 1s, broadcast at refresh rate ===
+#ifdef LORA_TEST_MODE
+  // === TEST STREAM: cam 1 RED <-> GREEN every 1s (radio bring-up without ATEM)
   static uint32_t lastToggle = 0;
   static bool testRed = true;
-  static uint32_t lastTestSend = 0;
-  bool testToggled = false;
   if (millis() - lastToggle > 1000) {
     lastToggle = millis();
     testRed = !testRed;
-    testToggled = true;
+    g_progMask = testRed ? 0x0001 : 0x0000;
+    g_prevMask = testRed ? 0x0000 : 0x0001;
+    g_tallies[0] = testRed ? 2 : 1;
   }
-  if (testToggled || millis() - lastTestSend >= TALLY_REFRESH_MS) {
-    lastTestSend = millis();
-    uint16_t prog = testRed ? 0x0001 : 0x0000;
-    uint16_t prev = testRed ? 0x0000 : 0x0001;
-    enqueueLora(TallyProtocol::createStateAllPacket(prog, prev));
+#else
+  atemTick();
+
+  if (atemConnected && millis() - lastPoll > POLL_MS) {
+    lastPoll = millis();
+    g_progMask = 0;
+    g_prevMask = 0;
+    for (int i = 0; i < 8; i++) {
+      uint8_t idx0 = TALLY_INPUTS[i] - 1;
+      bool onAir = atem->isOnAir(idx0);
+      bool preview = atem->isPreview(idx0);
+      g_tallies[i] = onAir ? 2 : (preview ? 1 : 0);
+      uint8_t human = TALLY_INPUTS[i];
+      if (onAir)
+        g_progMask |= (1U << (human - 1));
+      if (preview)
+        g_prevMask |= (1U << (human - 1));
+    }
+  }
+#endif
+
+  // === STATE_ALL broadcast: on change + every TALLY_REFRESH_MS (heartbeat).
+  // Runs even with ATEM down — losing the switcher must not look like a dead
+  // radio link to the slaves; they keep showing the last known masks.
+  static uint32_t lastStateSend = 0;
+  static uint16_t lastSentProg = 0xFFFF;
+  static uint16_t lastSentPrev = 0xFFFF;
+  bool masksChanged = (g_progMask != lastSentProg) || (g_prevMask != lastSentPrev);
+  if (masksChanged || millis() - lastStateSend >= TALLY_REFRESH_MS) {
+    lastSentProg = g_progMask;
+    lastSentPrev = g_prevMask;
+    lastStateSend = millis();
+    enqueueLora(TallyProtocol::createStateAllPacket(g_progMask, g_prevMask));
   }
 
   // Locator / Ping (Button 0) — works without ATEM
@@ -582,17 +580,24 @@ void loop() {
     }
   }
 
-  // ==== OLED (LoRa debug mode - always active) ====
-  static uint32_t lastLoRaDebugDraw = 0;
+  // ==== OLED: tally grid when ATEM is live, debug screen otherwise ====
+  static uint32_t lastDraw = 0;
 
-  // ⚡ Bolt: Prevent slow, blocking I2C screen updates (drawLoRaDebug) during high-priority non-blocking UI sequences (like LOCATOR).
-  // 📊 Impact: Saves ~35ms of blocking I2C transfer time per 500ms tick and prevents UI flickering/overwriting.
-  // 🔬 Measurement: Observe LOCATOR message stability on OLED and profile I2C bus utilization.
+  // ⚡ Bolt: Prevent slow, blocking I2C screen updates during high-priority
+  // non-blocking UI sequences (like LOCATOR).
   bool uiActive = (locatorStep > 0);
 
-  if (!uiActive && (millis() - lastLoRaDebugDraw > 500)) {
-    lastLoRaDebugDraw = millis();
-    drawLoRaDebug();
+  if (!uiActive && (millis() - lastDraw > 500)) {
+    lastDraw = millis();
+    if (atemConnected) {
+      display.clearDisplay();
+      drawStatusBar(ipToStr(WiFi.localIP()), WiFi.status() == WL_CONNECTED,
+                    radio.isConnected(), true);
+      drawTallyGrid(g_tallies);
+      display.display();
+    } else {
+      drawLoRaDebug();
+    }
   }
 
   delay(10);
