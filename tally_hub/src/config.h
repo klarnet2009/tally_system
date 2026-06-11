@@ -40,5 +40,6 @@ static uint8_t TALLY_INPUTS[8] = {1,2,3,4,5,6,7,8};
 
 // Периоды
 #define WIFI_RETRY_MS  8000
-#define ATEM_RETRY_MS  5000
+#define ATEM_RETRY_MS  5000          // Wait between connection attempts
+#define ATEM_CONNECT_TIMEOUT_MS 5000 // Give up a single attempt after this
 #define POLL_MS         100

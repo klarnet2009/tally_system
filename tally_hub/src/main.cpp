@@ -11,23 +11,31 @@
 #include "AtemClientAdapter.h"
 #include "E28_SX1280.h"
 #include "TallyProtocol.h"
+#include "TallyRadio.h"
 #include "config.h"
 
 static E28Radio radio;
-static uint8_t g_tallies[8] = {0};   // Last polled per-camera states (for OLED)
 static uint32_t g_loraTxCount = 0;   // TX packet counter
-static uint32_t g_loraDropCount = 0; // Packets lost: queue overflow / radio down
+static uint32_t g_loraDropCount = 0; // Packets lost: queue overflow / radio / TX fail
 
-// begin() resets the chip to its 2400 MHz/12-symbol defaults, so frequency and
-// preamble must be reapplied on every (re)init — including in-field recovery
+// Current tally masks broadcast to the slaves; the OLED grid is derived from
+// these too, so there is one source of truth for "what's on air".
+static uint16_t g_progMask = 0;
+static uint16_t g_prevMask = 0;
+
+// ATEM connection phase. atemPhase == ATEM_RUNNING is the single "connected"
+// signal (no separate shadow flag to keep in sync).
+enum AtemPhase : uint8_t { ATEM_IDLE, ATEM_CONNECTING, ATEM_RUNNING };
+static AtemPhase atemPhase = ATEM_IDLE;
+
+// begin() resets the chip to its 2.4 GHz default frequency, so the shared RF
+// profile must be reapplied on every (re)init — including in-field recovery
 static bool radioInit() {
   bool ok = radio.begin(E28_PIN_SCK, E28_PIN_MISO, E28_PIN_MOSI, E28_PIN_NSS,
                         E28_PIN_BUSY, E28_PIN_DIO1, E28_PIN_RESET, E28_PIN_RXEN,
                         E28_PIN_TXEN);
-  if (ok) {
-    radio.setFrequency(TALLY_RF_FREQ_HZ);
-    radio.setPreambleLength(TALLY_PREAMBLE_SYMBOLS);
-  }
+  if (ok)
+    tallyApplyRadioProfile(radio);
   return ok;
 }
 
@@ -54,7 +62,12 @@ static void processLoraQueue() {
   // the loop never blocks on TX airtime (~15ms with the long preamble)
   if (radio.txActive()) {
     if (radio.checkTxDone()) {
-      g_loraTxCount++;
+      // A 100ms timeout (stuck PA/antenna fault) counts as a drop, not a TX,
+      // so the OLED drop counter surfaces a failing radio instead of hiding it
+      if (radio.txSucceeded())
+        g_loraTxCount++;
+      else
+        g_loraDropCount++;
       lastTxDoneTime = millis();
     }
     return;
@@ -83,14 +96,8 @@ TwoWire I2Cbus = TwoWire(0);
 Adafruit_SSD1306 display(128, 64, &I2Cbus, -1);
 
 static IAtemClient *atem = nullptr;
-static bool atemConnected = false;
 static uint32_t lastPoll = 0;
 static uint32_t lastAtemAttempt = 0;
-
-// Current tally masks broadcast to the slaves (updated by the ATEM poll,
-// re-sent every TALLY_REFRESH_MS as the link heartbeat)
-static uint16_t g_progMask = 0;
-static uint16_t g_prevMask = 0;
 
 String ipToStr(IPAddress ip) {
   char b[20];
@@ -276,7 +283,11 @@ static void drawCell(int x, int y, int w, int h, uint8_t camNum,
   }
 }
 
-void drawTallyGrid(const uint8_t tallies[8]) {
+// Derived from the same masks we broadcast, so the OLED can never disagree
+// with the slaves. The mono display can't show a distinct BOTH colour, so a
+// camera that is both on-air and in preview renders as PROGRAM (filled) —
+// on-air is the safety-critical state to surface.
+void drawTallyGrid(uint16_t progMask, uint16_t prevMask) {
   const int cols = 4, rows = 2;
   const int cellW = 128 / cols;          // 32px
   const int cellH = (64 - HDR_H) / rows; // 27px
@@ -285,9 +296,11 @@ void drawTallyGrid(const uint8_t tallies[8]) {
   for (int r = 0; r < rows; r++) {
     for (int c = 0; c < cols; c++) {
       int idx = r * cols + c;
+      uint16_t bit = 1U << (TALLY_INPUTS[idx] - 1);
+      uint8_t status = (progMask & bit) ? 2 : ((prevMask & bit) ? 1 : 0);
       int x = c * cellW;
       int y = yOff + r * cellH;
-      drawCell(x, y, cellW, cellH, TALLY_INPUTS[idx], tallies[idx]);
+      drawCell(x, y, cellW, cellH, TALLY_INPUTS[idx], status);
     }
   }
 }
@@ -376,7 +389,7 @@ void drawLoRaDebug() {
   uint32_t sec = millis() / 1000;
   display.print(sec);
   display.print("s ");
-  display.print(atemConnected ? "[ATEM OK]" : "[NO ATEM]");
+  display.print(atemPhase == ATEM_RUNNING ? "[ATEM OK]" : "[NO ATEM]");
 
   display.display();
 }
@@ -384,8 +397,6 @@ void drawLoRaDebug() {
 // ===== ATEM connection: non-blocking state machine =====
 // Never blocks the loop — the radio queue, locator and OLED keep running
 // while the connection is (re)established in the background.
-enum AtemPhase : uint8_t { ATEM_IDLE, ATEM_CONNECTING, ATEM_RUNNING };
-static AtemPhase atemPhase = ATEM_IDLE;
 static uint32_t atemAttemptStart = 0;
 
 static void atemTick() {
@@ -419,9 +430,8 @@ static void atemTick() {
   case ATEM_CONNECTING:
     atem->loop();
     if (atem->connected()) {
-      atemConnected = true;
       atemPhase = ATEM_RUNNING;
-    } else if (millis() - atemAttemptStart > 5000) {
+    } else if (millis() - atemAttemptStart > ATEM_CONNECT_TIMEOUT_MS) {
       atemPhase = ATEM_IDLE; // next try after ATEM_RETRY_MS
     }
     break;
@@ -429,7 +439,6 @@ static void atemTick() {
   case ATEM_RUNNING:
     atem->loop();
     if (!atem->connected()) {
-      atemConnected = false;
       atemPhase = ATEM_IDLE;
       lastAtemAttempt = millis();
     }
@@ -510,24 +519,20 @@ void loop() {
     testRed = !testRed;
     g_progMask = testRed ? 0x0001 : 0x0000;
     g_prevMask = testRed ? 0x0000 : 0x0001;
-    g_tallies[0] = testRed ? 2 : 1;
   }
 #else
   atemTick();
 
-  if (atemConnected && millis() - lastPoll > POLL_MS) {
+  if (atemPhase == ATEM_RUNNING && millis() - lastPoll > POLL_MS) {
     lastPoll = millis();
     g_progMask = 0;
     g_prevMask = 0;
     for (int i = 0; i < 8; i++) {
       uint8_t idx0 = TALLY_INPUTS[i] - 1;
-      bool onAir = atem->isOnAir(idx0);
-      bool preview = atem->isPreview(idx0);
-      g_tallies[i] = onAir ? 2 : (preview ? 1 : 0);
       uint8_t human = TALLY_INPUTS[i];
-      if (onAir)
+      if (atem->isOnAir(idx0))
         g_progMask |= (1U << (human - 1));
-      if (preview)
+      if (atem->isPreview(idx0))
         g_prevMask |= (1U << (human - 1));
     }
   }
@@ -581,21 +586,38 @@ void loop() {
   }
 
   // ==== OLED: tally grid when ATEM is live, debug screen otherwise ====
+  // The grid (production view) redraws only when the masks/connection change,
+  // plus a slow refresh — a full 128x64 I2C blit is ~23ms and used to run every
+  // 500ms unconditionally, which also delayed checkTxDone() mid-transmit.
   static uint32_t lastDraw = 0;
+  static uint16_t drawnProg = 0xFFFF, drawnPrev = 0xFFFF;
+  static bool drawnConnected = false;
 
   // ⚡ Bolt: Prevent slow, blocking I2C screen updates during high-priority
   // non-blocking UI sequences (like LOCATOR).
   bool uiActive = (locatorStep > 0);
+  bool connected = (atemPhase == ATEM_RUNNING);
 
-  if (!uiActive && (millis() - lastDraw > 500)) {
-    lastDraw = millis();
-    if (atemConnected) {
-      display.clearDisplay();
-      drawStatusBar(ipToStr(WiFi.localIP()), WiFi.status() == WL_CONNECTED,
-                    radio.isConnected(), true);
-      drawTallyGrid(g_tallies);
-      display.display();
-    } else {
+  if (!uiActive) {
+    if (connected) {
+      bool dirty = (g_progMask != drawnProg) || (g_prevMask != drawnPrev) ||
+                   !drawnConnected;
+      if (dirty || millis() - lastDraw > 2000) {
+        lastDraw = millis();
+        drawnProg = g_progMask;
+        drawnPrev = g_prevMask;
+        drawnConnected = true;
+        display.clearDisplay();
+        drawStatusBar(ipToStr(WiFi.localIP()), WiFi.status() == WL_CONNECTED,
+                      radio.isConnected(), true);
+        drawTallyGrid(g_progMask, g_prevMask);
+        display.display();
+      }
+    } else if (millis() - lastDraw > 500) {
+      // Debug screen is a transient bring-up view; its blinker/counters justify
+      // the faster cadence.
+      lastDraw = millis();
+      drawnConnected = false;
       drawLoRaDebug();
     }
   }
