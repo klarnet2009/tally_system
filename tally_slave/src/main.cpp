@@ -52,8 +52,8 @@ void updateLed() {
         }
     }
 
-    // 2. Normal Tally States (matching original exact logic)
-    if (currentTallyState == STATE_PROGRAM || currentTallyState == STATE_PREVIEW) {
+    // 2. Normal Tally States (any non-OFF state lights the LED, incl. STATE_BOTH)
+    if (currentTallyState != STATE_OFF) {
         if (!ledIsOn) {
             digitalWrite(PIN_LED, LED_ON);
             ledIsOn = true;
@@ -121,8 +121,8 @@ void loop() {
                 // Parse packet
                 TallyPacket pkt;
                 if (TallyProtocol::deserialize(buf, len, pkt)) {
-                    // Check if it's for us (redundant but safe)
-                    if (pkt.cameraId == SLAVE_CAM_ID) {
+                    // For us or broadcast (heartbeat etc.)
+                    if (pkt.cameraId == SLAVE_CAM_ID || pkt.cameraId == TALLY_BROADCAST_ID) {
                         Serial.printf("Tally Update: %d (CMD: %d, RSSI: %d)\n", pkt.state, pkt.command, radio.getRSSI());
 
                         if (pkt.command == CMD_PING) {
