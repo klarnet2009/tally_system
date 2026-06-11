@@ -7,16 +7,12 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
-#include <WiFiClient.h>
 #include <Wire.h>
 
 #include "AtemClientAdapter.h"
 #include "E28_SX1280.h"
 #include "TallyProtocol.h"
 #include "config.h"
-
-#include <esp_now.h>
-#include <esp_wifi.h>
 
 // ===== NimBLE Tally кадр =====
 #define TALLY_BLE_COMPANY_ID 0xFFFF
@@ -97,34 +93,6 @@ static void bleSetAdvPayload(uint16_t progMask, uint16_t prevMask) {
   ad.setFlags(0x06);
   ad.setManufacturerData(mfg);
   g_bleAdv->setAdvertisementData(ad);
-}
-
-// ===== (опционально) ESP-NOW дубль =====
-static uint8_t ESPNOW_BROADCAST[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-struct TallyFrame {
-  uint8_t ver;
-  uint16_t seq;
-  uint16_t progBits;
-  uint16_t prevBits;
-  uint8_t reserved;
-  uint8_t crc;
-} __attribute__((packed));
-static uint8_t simple_crc8(const uint8_t *d, size_t n) {
-  uint8_t c = 0;
-  for (size_t i = 0; i < n; i++)
-    c ^= d[i];
-  return c;
-}
-static void sendTallyFrame(uint16_t progBits, uint16_t prevBits) {
-  TallyFrame f{};
-  f.ver = 0x01;
-  f.seq = g_bleFrame.seq;
-  f.progBits = progBits;
-  f.prevBits = prevBits;
-  f.reserved = 0;
-  f.crc = 0;
-  f.crc = simple_crc8((uint8_t *)&f, sizeof(f) - 1);
-  esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&f, sizeof(f));
 }
 
 // ===== OLED / ATEM =====
@@ -424,24 +392,6 @@ void drawLoRaDebug() {
   display.display();
 }
 
-IPAddress findAtemInSubnet() {
-  IPAddress local = WiFi.localIP();
-  IPAddress test;
-  for (int i = 1; i <= 254; i++) {
-    test = IPAddress(local[0], local[1], local[2], i);
-    if (test == local)
-      continue;
-    WiFiClient probe;
-    probe.setTimeout(120);
-    if (probe.connect(test, 9910)) {
-      probe.stop();
-      return test;
-    }
-    delay(5);
-  }
-  return IPAddress(0, 0, 0, 0);
-}
-
 void tryConnectAtem() {
   lastAtemAttempt = millis();
   uint8_t atemFrame = 0;
@@ -521,16 +471,6 @@ void setup() {
     drawCenteredMsg("Wi-Fi: FAILED", "Retrying forever...");
   else
     drawCenteredMsg("Wi-Fi: connected", ipToStr(WiFi.localIP()).c_str());
-
-  // ESP-NOW (опционально)
-  // esp_wifi_set_ps(WIFI_PS_NONE); // Disabled to prevent crash with BT
-  if (esp_now_init() == ESP_OK) {
-    esp_now_peer_info_t peer{};
-    memcpy(peer.peer_addr, ESPNOW_BROADCAST, 6);
-    peer.channel = 0;
-    peer.encrypt = false;
-    esp_now_add_peer(&peer);
-  }
 
   // ==== E28 LoRa (with retry) ====
   bool radioOk = false;

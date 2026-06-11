@@ -2,6 +2,9 @@
 .pio/
 .vscode/
 
+# Local credentials (copy from secrets.h.example)
+tally_hub/src/secrets.h
+
 # Build artifacts
 *.o
 *.elf

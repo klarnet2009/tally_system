@@ -1,11 +1,22 @@
 #pragma once
 
-// ------ Wi-Fi ------
-#define WIFI_SSID   "SF_tech_network"
-#define WIFI_PASS   "f!lmn0td3ad"
-
-// Если знаешь IP ATEM — укажи строкой, иначе оставь пусто "" для авто-поиска
-#define ATEM_IP_STR "192.168.1.146"
+// ------ Wi-Fi / ATEM (креды) ------
+// Реальные значения живут в secrets.h (gitignored).
+// Скопируй secrets.h.example -> secrets.h и заполни.
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
+#ifndef WIFI_SSID
+#warning "tally_hub/src/secrets.h not found - using placeholder credentials"
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#endif
+#ifndef WIFI_PASS
+#define WIFI_PASS "YOUR_WIFI_PASS"
+#endif
+#ifndef ATEM_IP_STR
+// IP ATEM строкой, либо пусто ""
+#define ATEM_IP_STR ""
+#endif
 
 // E28-2G4M27S (SX1280) LoRa - High Power (27dBm)
 // Using SD Card pins + Serial pins (NO USB LOGS!)
