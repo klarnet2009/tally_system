@@ -85,6 +85,15 @@
 // Buffer size
 #define E28_MAX_PACKET_SIZE 255
 
+// Why the last begin() failed — surfaced on the hub OLED / serial logs so a
+// field failure can be triaged without a logic analyzer.
+enum E28InitError : uint8_t {
+  E28_OK = 0,
+  E28_ERR_BUSY_STUCK, // BUSY never went low: no power / BUSY miswired / chip hung
+  E28_ERR_MISO_LOW,   // status reads 0x00: MISO stuck low — module unpowered/shorted
+  E28_ERR_MISO_HIGH   // status reads 0xFF: MISO stuck high — module absent/miswired
+};
+
 class E28Radio {
 public:
   E28Radio();
@@ -148,6 +157,10 @@ public:
   bool checkConnection();  // Re-poll SPI to verify module
   uint8_t getChipStatus(); // Raw SX1280 status byte
 
+  // Diagnostics: why the last begin() failed
+  E28InitError initError() const { return _initError; }
+  const char *initErrorStr() const;
+
 private:
   int8_t _pinNSS;
   int8_t _pinBUSY;
@@ -175,6 +188,7 @@ private:
   uint8_t _dcPeriodBase;
 
   uint16_t _lastPktLen; // setPacketParams cache (0xFFFF = invalid)
+  E28InitError _initError;
 
   int8_t _lastRSSI;
   int8_t _lastSNR;

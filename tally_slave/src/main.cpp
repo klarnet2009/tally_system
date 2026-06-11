@@ -119,7 +119,7 @@ void setup() {
         // Blink LED to confirm init
         for(int i=0; i<3; i++) { digitalWrite(PIN_LED, LED_ON); delay(100); digitalWrite(PIN_LED, LED_OFF); delay(100); }
     } else {
-        Serial.println("FAILED! Check Wiring.");
+        Serial.printf("FAILED: %s\n", radio.initErrorStr());
         // Fast blink error
         while(1) { digitalWrite(PIN_LED, LED_ON); delay(50); digitalWrite(PIN_LED, LED_OFF); delay(50); }
     }
@@ -147,6 +147,8 @@ void tryRadioRecover() {
         radio.startReceive();
         tallyLink.noteAlive();
         Serial.println("[LoRa] Recovered");
+    } else {
+        Serial.printf("[LoRa] Recovery failed: %s\n", radio.initErrorStr());
     }
 }
 

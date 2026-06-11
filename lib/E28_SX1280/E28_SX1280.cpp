@@ -18,6 +18,17 @@ E28Radio::E28Radio() {
   _dcSleepCount = 0;
   _dcPeriodBase = 0x02;
   _lastPktLen = 0xFFFF;
+  _initError = E28_OK;
+}
+
+const char *E28Radio::initErrorStr() const {
+  switch (_initError) {
+  case E28_OK:             return "OK";
+  case E28_ERR_BUSY_STUCK: return "BUSY stuck (power?)";
+  case E28_ERR_MISO_LOW:   return "MISO low (no 3V3?)";
+  case E28_ERR_MISO_HIGH:  return "MISO high (no module?)";
+  }
+  return "?";
 }
 
 bool E28Radio::begin() {
@@ -72,17 +83,40 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
   _txActive = false; // a re-init (e.g. field recovery) abandons any in-flight TX
   _rxMode = RX_NONE;     // chip reset forgets its RX state
   _lastPktLen = 0xFFFF;  // and its packet params
-  // Post-reset BUSY clears in <1ms on a live chip; a 100ms cap keeps a dead
-  // module's begin() (called from recovery loops) from stalling for ~1s
-  if (!waitBusyFor(100))
-    return false;
+  _initError = E28_OK;
 
+  // Post-reset BUSY clears in <1ms on a live chip; a 100ms cap keeps a dead
+  // module's begin() (called from recovery loops) from stalling for ~1s.
   // Early bail before the config sequence: with no module each command below
   // would burn the full 1s BUSY timeout (~6+ s per failed begin())
-  uint8_t probe = getChipStatus();
-  if (!_connected || probe == 0xFF || probe == 0x00) {
-    _connected = false;
-    return false;
+  bool busyOk = waitBusyFor(100);
+  uint8_t probe = busyOk ? getChipStatus() : 0x00;
+
+  if (!busyOk || probe == 0xFF || probe == 0x00) {
+    if (_pinRESET == -1) {
+      // Without a reset line the chip may be wedged in a previous-run mode
+      // where the probe fails (sleep keeps BUSY high until woken). Fire a
+      // blind SetStandby(RC) — deliberately bypassing the BUSY wait — then
+      // re-probe once before declaring the module dead.
+      digitalWrite(_pinNSS, LOW);
+      SPI.transfer(SX1280_CMD_SET_STANDBY);
+      SPI.transfer(0x00); // STDBY_RC
+      digitalWrite(_pinNSS, HIGH);
+      delay(2);
+      _connected = true; // clean slate for the re-probe
+      busyOk = waitBusyFor(100);
+      probe = busyOk ? getChipStatus() : 0x00;
+    }
+    if (!busyOk) {
+      _initError = E28_ERR_BUSY_STUCK;
+      _connected = false;
+      return false;
+    }
+    if (probe == 0xFF || probe == 0x00) {
+      _initError = (probe == 0xFF) ? E28_ERR_MISO_HIGH : E28_ERR_MISO_LOW;
+      _connected = false;
+      return false;
+    }
   }
 
   // Set standby mode
@@ -119,10 +153,12 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
   uint8_t status = getChipStatus();
   // SPI returns 0xFF (all high) or 0x00 if no chip connected
   if (status == 0xFF || status == 0x00) {
+    _initError = (status == 0xFF) ? E28_ERR_MISO_HIGH : E28_ERR_MISO_LOW;
     _connected = false;
     return false;
   }
   _connected = true;
+  _initError = E28_OK;
   return true;
 }
 
@@ -133,10 +169,15 @@ void E28Radio::reset() {
     digitalWrite(_pinRESET, HIGH);
     delay(20);
   } else {
-    // Software reset if no pin
-    delay(50);
-    // Maybe send a reset command? But SPI might be stuck if chip is?
-    // Usually power-on reset is enough.
+    // No reset line (hub wiring): a warm ESP32 reboot (flashing, EN button,
+    // brownout restart) does NOT power-cycle the module, so the SX1280 may
+    // still be in sleep/duty-cycle/TX from the previous run — historically
+    // seen as "module not connected" right after reflashing. An NSS falling
+    // edge wakes the chip from sleep (BUSY goes low when it's ready).
+    digitalWrite(_pinNSS, LOW);
+    delayMicroseconds(100);
+    digitalWrite(_pinNSS, HIGH);
+    delay(5);
   }
 }
 

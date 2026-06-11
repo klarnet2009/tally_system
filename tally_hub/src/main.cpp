@@ -18,6 +18,25 @@ static E28Radio radio;
 static uint32_t g_loraTxCount = 0;   // TX packet counter
 static uint32_t g_loraDropCount = 0; // Packets lost: queue overflow / radio / TX fail
 
+// ===== Debug logging =====
+// The S3 has two consoles: Serial = native USB-Serial-JTAG (GPIO19/20),
+// Serial0 = UART0 via the devkit's USB bridge (GPIO43/44). Neither touches
+// the E28 pins. Log to both so whichever cable is plugged in shows logs.
+static void hublogf(const char *fmt, ...) {
+  char buf[160];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  Serial.print(buf);
+  Serial0.print(buf);
+}
+
+// Locator state (file scope: triggered by the BOOT button and the serial
+// "ping" command)
+static uint32_t locatorStartTime = 0;
+static uint8_t locatorStep = 0;
+
 // Current tally masks broadcast to the slaves; the OLED grid is derived from
 // these too, so there is one source of truth for "what's on air".
 static uint16_t g_progMask = 0;
@@ -427,6 +446,7 @@ static void atemTick() {
       atem->connect();
       atemAttemptStart = millis();
       atemPhase = ATEM_CONNECTING;
+      hublogf("[ATEM] connecting to %s...\n", ipToStr(target).c_str());
     }
     break;
 
@@ -434,8 +454,10 @@ static void atemTick() {
     atem->loop();
     if (atem->connected()) {
       atemPhase = ATEM_RUNNING;
+      hublogf("[ATEM] connected\n");
     } else if (millis() - atemAttemptStart > ATEM_CONNECT_TIMEOUT_MS) {
       atemPhase = ATEM_IDLE; // next try after ATEM_RETRY_MS
+      hublogf("[ATEM] connect timeout, retry in %ds\n", ATEM_RETRY_MS / 1000);
     }
     break;
 
@@ -444,6 +466,7 @@ static void atemTick() {
     if (!atem->connected()) {
       atemPhase = ATEM_IDLE;
       lastAtemAttempt = millis();
+      hublogf("[ATEM] connection lost\n");
     }
     break;
   }
@@ -451,7 +474,11 @@ static void atemTick() {
 #endif // LORA_TEST_MODE
 
 void setup() {
-  // Serial.begin(115200); // Disabled: GPIO 1/3 used by E28
+  // Native USB CDC; no host attached must never block the loop
+  Serial.begin();
+  Serial.setTxTimeoutMs(0);
+  Serial0.begin(115200); // UART bridge port (GPIO43/44)
+
   I2Cbus.begin(OLED_I2C_SDA, OLED_I2C_SCL, 400000);
   display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   display.setTextWrap(false);
@@ -460,6 +487,38 @@ void setup() {
 
   pinMode(0, INPUT_PULLUP); // Boot button for locator
 
+  hublogf("\n=== Tally HUB (ESP32-S3 + E28-2G4M27S) ===\n");
+  hublogf("[CFG] netId=0x%02X freq=%lu preamble=%d refresh=%dms\n",
+          TALLY_NET_ID, (unsigned long)TALLY_RF_FREQ_HZ,
+          TALLY_PREAMBLE_SYMBOLS, TALLY_REFRESH_MS);
+#ifdef LORA_TEST_MODE
+  hublogf("[CFG] LORA_TEST_MODE active — ATEM disabled, cam1 toggle stream\n");
+#endif
+
+  // ==== E28 LoRa FIRST (with retry) ====
+  // Before WiFi: the radio is the hub's core function, and WiFi's TX bursts
+  // on the shared 3V3 rail are the last thing a 27dBm module needs while
+  // it powers up (historically a source of flaky inits).
+  bool radioOk = false;
+  for (int attempt = 1; attempt <= 5; attempt++) {
+    drawCenteredMsg("LoRa init...",
+                    (String("Attempt ") + String(attempt) + "/5").c_str());
+    radioOk = radioInit();
+    if (radioOk)
+      break;
+    // Show WHY on both the OLED and serial, not just "FAILED"
+    hublogf("[E28] attempt %d/5 failed: %s (status=0x%02X BUSY=%d DIO1=%d)\n",
+            attempt, radio.initErrorStr(), radio.getChipStatus(),
+            digitalRead(E28_PIN_BUSY), digitalRead(E28_PIN_DIO1));
+    drawCenteredMsg("LoRa FAILED", radio.initErrorStr());
+    delay(500);
+  }
+  if (radioOk)
+    hublogf("[E28] init OK (status=0x%02X)\n", radio.getChipStatus());
+  else
+    hublogf("[E28] init FAILED after 5 attempts — recovery retries every 10s\n");
+
+  // ==== Wi-Fi ====
   drawCenteredMsg("Wi-Fi: connecting...", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -471,36 +530,74 @@ void setup() {
     drawLoadingScreen("Wi-Fi", WIFI_SSID, wifiFrame++);
     delay(150);
   }
-  if (WiFi.status() != WL_CONNECTED)
+  if (WiFi.status() != WL_CONNECTED) {
+    hublogf("[WiFi] FAILED to join '%s' — retrying in background\n", WIFI_SSID);
     drawCenteredMsg("Wi-Fi: FAILED", "Retrying forever...");
-  else
+  } else {
+    hublogf("[WiFi] connected, IP %s\n", ipToStr(WiFi.localIP()).c_str());
     drawCenteredMsg("Wi-Fi: connected", ipToStr(WiFi.localIP()).c_str());
-
-  // ==== E28 LoRa (with retry) ====
-  bool radioOk = false;
-  for (int attempt = 1; attempt <= 5; attempt++) {
-    drawCenteredMsg("LoRa init...",
-                    (String("Attempt ") + String(attempt) + "/5").c_str());
-    radioOk = radioInit();
-    if (radioOk)
-      break;
-    delay(500);
   }
+
   // Show LoRa debug screen for 3 seconds
   drawLoRaDebug();
   delay(3000);
+}
+
+// ===== Serial console (both ports): status / ping / reinit / help =====
+static void handleSerialCommand(const String &cmd) {
+  if (cmd == "status") {
+    uint8_t qDepth =
+        (g_loraQueueHead + LORA_QUEUE_SIZE - g_loraQueueTail) % LORA_QUEUE_SIZE;
+    hublogf("[STATUS] up=%lus radio=%s(0x%02X) tx=%lu drop=%lu q=%u "
+            "wifi=%s atem=%s prog=0x%04X prev=0x%04X\n",
+            millis() / 1000, radio.isConnected() ? "OK" : "DEAD",
+            radio.getChipStatus(), g_loraTxCount, g_loraDropCount, qDepth,
+            WiFi.status() == WL_CONNECTED ? ipToStr(WiFi.localIP()).c_str()
+                                          : "DOWN",
+            atemPhase == ATEM_RUNNING      ? "RUNNING"
+            : atemPhase == ATEM_CONNECTING ? "CONNECTING"
+                                           : "IDLE",
+            g_progMask, g_prevMask);
+  } else if (cmd == "ping") {
+    if (locatorStep == 0) {
+      hublogf("[CMD] locator ping -> cam 1\n");
+      locatorStep = 1;
+      locatorStartTime = millis();
+    }
+  } else if (cmd == "reinit") {
+    hublogf("[CMD] radio re-init: %s (%s)\n",
+            radioInit() ? "OK" : "FAILED", radio.initErrorStr());
+  } else if (cmd == "help") {
+    hublogf("Commands: status, ping, reinit, help\n");
+  } else if (cmd.length()) {
+    hublogf("Unknown command '%s' — try 'help'\n", cmd.c_str());
+  }
+}
+
+static void pollSerialCommands() {
+  Stream *ports[2] = {&Serial, &Serial0};
+  for (Stream *port : ports) {
+    if (port->available()) {
+      String cmd = port->readStringUntil('\n');
+      cmd.trim();
+      handleSerialCommand(cmd);
+    }
+  }
 }
 
 void loop() {
   processLoraQueue();
 
   // Radio recovery: re-init every 10s while disconnected (begin() bails out
-  // in ~1s when the module is absent, so this stays affordable)
+  // in ~150ms when the module is absent, so this stays affordable)
   if (!radio.isConnected()) {
     static uint32_t lastRadioRetry = 0;
     if (millis() - lastRadioRetry > 10000) {
       lastRadioRetry = millis();
-      radioInit();
+      if (radioInit())
+        hublogf("[E28] recovered (status=0x%02X)\n", radio.getChipStatus());
+      else
+        hublogf("[E28] recovery failed: %s\n", radio.initErrorStr());
     }
   }
 
@@ -556,11 +653,18 @@ void loop() {
     enqueueLora(TallyProtocol::createStateAllPacket(g_progMask, g_prevMask));
   }
 
-  // Locator / Ping (Button 0) — works without ATEM
-  // ⚡ Bolt: Non-blocking locator logic using enqueueLora
-  static uint32_t locatorStartTime = 0;
-  static uint8_t locatorStep = 0;
+  pollSerialCommands();
 
+  // Periodic status heartbeat on serial (10s) — one line tells whether the
+  // radio/queue/WiFi/ATEM are alive without touching the device
+  static uint32_t lastStatusLog = 0;
+  if (millis() - lastStatusLog > 10000) {
+    lastStatusLog = millis();
+    handleSerialCommand("status");
+  }
+
+  // Locator / Ping (Button 0 or serial "ping") — works without ATEM
+  // ⚡ Bolt: Non-blocking locator logic using enqueueLora
   if (digitalRead(0) == LOW && locatorStep == 0) {
     drawCenteredMsg("LOCATOR", "Ping sent -> Cam 1");
     locatorStep = 1;

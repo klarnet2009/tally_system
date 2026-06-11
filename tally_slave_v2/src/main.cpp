@@ -183,6 +183,8 @@ void tryRadioRecover() {
     armReceive();
     tallyLink.noteAlive();
     Serial.println("[LoRa] Recovered");
+  } else {
+    Serial.printf("[LoRa] Recovery failed: %s\n", radio.initErrorStr());
   }
 }
 
@@ -216,7 +218,7 @@ void setup() {
                         PIN_LORA_NRESET, PIN_LORA_RXEN, PIN_LORA_TXEN);
 
   if (!ok) {
-    Serial.println("FAILED");
+    Serial.printf("FAILED: %s\n", radio.initErrorStr());
     beep(400, 500);
     while (1) {
       setColor(COLOR_INIT_FAIL, 100);
