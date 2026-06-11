@@ -95,9 +95,11 @@ static void processLoraQueue() {
 TwoWire I2Cbus = TwoWire(0);
 Adafruit_SSD1306 display(128, 64, &I2Cbus, -1);
 
+#ifndef LORA_TEST_MODE
 static IAtemClient *atem = nullptr;
 static uint32_t lastPoll = 0;
 static uint32_t lastAtemAttempt = 0;
+#endif
 
 String ipToStr(IPAddress ip) {
   char b[20];
@@ -394,6 +396,7 @@ void drawLoRaDebug() {
   display.display();
 }
 
+#ifndef LORA_TEST_MODE
 // ===== ATEM connection: non-blocking state machine =====
 // Never blocks the loop — the radio queue, locator and OLED keep running
 // while the connection is (re)established in the background.
@@ -445,6 +448,7 @@ static void atemTick() {
     break;
   }
 }
+#endif // LORA_TEST_MODE
 
 void setup() {
   // Serial.begin(115200); // Disabled: GPIO 1/3 used by E28
@@ -621,6 +625,10 @@ void loop() {
       drawLoRaDebug();
     }
   }
+
+  // Second queue pass: with one pass per ~10ms loop, TxDone detection (and
+  // PA-off) lagged the ~15ms airtime by up to a full tick; this halves it
+  processLoraQueue();
 
   delay(10);
 }
