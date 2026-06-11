@@ -122,17 +122,24 @@ public:
   void startReceive();
   // Duty-cycled RX: radio autonomously alternates RX/sleep, DIO1 fires on
   // RxDone. periodBase 0x02 = 1ms units, so counts are milliseconds.
-  // Caller MUST re-issue after every DIO1 event (chip exits the cycle on any
+  // Caller MUST re-arm after every DIO1 event (chip exits the cycle on any
   // RxDone, even CRC errors) and avoid SPI polling between events (any NSS
   // edge during the sleep phase silently kills the cycle).
   void startReceiveDutyCycle(uint16_t rxCount, uint16_t sleepCount,
                              uint8_t periodBase = 0x02);
+  // Re-arm using whichever RX mode was last started, so callers don't need
+  // their own mode bookkeeping:
+  //  - rearmAfterIrq(): after a DIO1 event. Cheap IRQ-clear for continuous
+  //    RX; full re-issue for duty cycle (mandatory there).
+  //  - restartReceive(): safety net / recovery. Full re-issue of the last
+  //    mode, restoring RX no matter what state the chip fell into.
+  void rearmAfterIrq();
+  void restartReceive();
   void clearRxIrq(); // Lightweight: just clear IRQ, stay in continuous RX
   bool available();
   uint8_t receive(uint8_t *buffer, uint8_t maxLen);
   int8_t getRSSI();
   int8_t getSNR();
-  int8_t dio1Pin() const { return _pinDIO1; }
 
   // Power management
   void sleep();
@@ -160,11 +167,21 @@ private:
   bool _txSuccess;        // result of the last completed async TX
   uint32_t _txStartMs;
 
+  // Last-started RX mode, so rearmAfterIrq()/restartReceive() can re-issue it
+  enum RxMode : uint8_t { RX_NONE, RX_CONTINUOUS, RX_DUTY_CYCLE };
+  RxMode _rxMode;
+  uint16_t _dcRxCount;
+  uint16_t _dcSleepCount;
+  uint8_t _dcPeriodBase;
+
+  uint16_t _lastPktLen; // setPacketParams cache (0xFFFF = invalid)
+
   int8_t _lastRSSI;
   int8_t _lastSNR;
 
   void reset();
   void waitBusy();
+  bool waitBusyFor(uint32_t timeoutMs); // bounded variant for probe paths
   void writeCommand(uint8_t cmd, uint8_t *data, uint8_t len);
   void readCommand(uint8_t cmd, uint8_t *data, uint8_t len);
   void setModulationParams();

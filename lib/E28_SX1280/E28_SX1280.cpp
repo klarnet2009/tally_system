@@ -13,6 +13,11 @@ E28Radio::E28Radio() {
   _txActive = false;
   _txSuccess = false;
   _txStartMs = 0;
+  _rxMode = RX_NONE;
+  _dcRxCount = 0;
+  _dcSleepCount = 0;
+  _dcPeriodBase = 0x02;
+  _lastPktLen = 0xFFFF;
 }
 
 bool E28Radio::begin() {
@@ -63,9 +68,14 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
 
   // Wait for chip to be ready
   delay(10);
-  _connected = true; // assume present; waitBusy() clears this on stuck BUSY
+  _connected = true; // assume present; bounded wait clears this on stuck BUSY
   _txActive = false; // a re-init (e.g. field recovery) abandons any in-flight TX
-  waitBusy();
+  _rxMode = RX_NONE;     // chip reset forgets its RX state
+  _lastPktLen = 0xFFFF;  // and its packet params
+  // Post-reset BUSY clears in <1ms on a live chip; a 100ms cap keeps a dead
+  // module's begin() (called from recovery loops) from stalling for ~1s
+  if (!waitBusyFor(100))
+    return false;
 
   // Early bail before the config sequence: with no module each command below
   // would burn the full 1s BUSY timeout (~6+ s per failed begin())
@@ -143,6 +153,21 @@ void E28Radio::waitBusy() {
     }
     yield();
   }
+}
+
+bool E28Radio::waitBusyFor(uint32_t timeoutMs) {
+  if (digitalRead(_pinBUSY) == LOW)
+    return true;
+
+  uint32_t start = millis();
+  while (digitalRead(_pinBUSY) == HIGH) {
+    if (millis() - start > timeoutMs) {
+      _connected = false; // BUSY stuck = no module
+      return false;
+    }
+    yield();
+  }
+  return true;
 }
 
 void E28Radio::writeCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
@@ -268,9 +293,16 @@ void E28Radio::setPreambleLength(uint16_t symbols) {
   if (mant > 15)
     mant = 15;
   _preambleByte = (uint8_t)((exp << 4) | mant);
+  _lastPktLen = 0xFFFF; // packet params embed the preamble — force re-send
 }
 
 void E28Radio::setPacketParams(uint8_t payloadLen) {
+  // Skip the 7-byte SPI command when nothing changed (every TX packet has
+  // the same length, so this saves a command + BUSY round-trip per packet)
+  if (_lastPktLen == payloadLen)
+    return;
+  _lastPktLen = payloadLen;
+
   uint8_t pktParams[7] = {
       _preambleByte,   // Preamble length (default 0x0C = 12 symbols)
       0x00,            // Header type: explicit
@@ -481,6 +513,8 @@ void E28Radio::startReceive() {
   // Start continuous RX
   uint8_t rxParams[3] = {0xFF, 0xFF, 0xFF}; // Continuous RX
   writeCommand(SX1280_CMD_SET_RX, rxParams, 3);
+
+  _rxMode = RX_CONTINUOUS;
 }
 
 void E28Radio::startReceiveDutyCycle(uint16_t rxCount, uint16_t sleepCount,
@@ -503,6 +537,38 @@ void E28Radio::startReceiveDutyCycle(uint16_t rxCount, uint16_t sleepCount,
                        (uint8_t)(rxCount & 0xFF), (uint8_t)(sleepCount >> 8),
                        (uint8_t)(sleepCount & 0xFF)};
   writeCommand(SX1280_CMD_SET_RX_DUTY_CYCLE, params, 5);
+
+  _rxMode = RX_DUTY_CYCLE;
+  _dcRxCount = rxCount;
+  _dcSleepCount = sleepCount;
+  _dcPeriodBase = periodBase;
+}
+
+void E28Radio::rearmAfterIrq() {
+  switch (_rxMode) {
+  case RX_DUTY_CYCLE:
+    // Mandatory full re-issue: any RxDone (even a CRC error) ends the cycle
+    startReceiveDutyCycle(_dcRxCount, _dcSleepCount, _dcPeriodBase);
+    break;
+  case RX_CONTINUOUS:
+    clearRxIrq(); // cheap: IRQ clear + SET_RX, no standby
+    break;
+  case RX_NONE:
+    break;
+  }
+}
+
+void E28Radio::restartReceive() {
+  switch (_rxMode) {
+  case RX_DUTY_CYCLE:
+    startReceiveDutyCycle(_dcRxCount, _dcSleepCount, _dcPeriodBase);
+    break;
+  case RX_CONTINUOUS:
+    startReceive();
+    break;
+  case RX_NONE:
+    break;
+  }
 }
 
 void E28Radio::clearRxIrq() {
