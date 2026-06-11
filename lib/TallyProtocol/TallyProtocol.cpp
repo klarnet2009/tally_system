@@ -54,15 +54,10 @@ bool TallyProtocol::deserialize(const uint8_t* buffer, uint8_t len, TallyPacket&
         return false;
     }
 
-    // Fast-path rejections before memcpy + CRC: noise, foreign networks,
-    // unknown commands
+    // Cheapest noise reject before the memcpy; everything else (netId,
+    // command whitelist, CRC) is validate()'s job — one authority, so a new
+    // command can't be whitelisted in one place and forgotten in the other.
     if (buffer[0] != TALLY_START_BYTE) {
-        return false;
-    }
-    if (buffer[2] != TALLY_NET_ID) {
-        return false;
-    }
-    if (buffer[1] != CMD_PING && buffer[1] != CMD_STATE_ALL) {
         return false;
     }
 
