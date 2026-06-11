@@ -34,7 +34,8 @@ static uint16_t g_seq = 0;
 
 static E28Radio radio;
 static uint8_t g_lastTallies[8] = {0};
-static uint32_t g_loraTxCount = 0; // TX packet counter
+static uint32_t g_loraTxCount = 0;   // TX packet counter
+static uint32_t g_loraDropCount = 0; // Packets lost: queue overflow / radio down
 
 // ⚡ Bolt: Non-blocking transmission queue to prevent delay() stalls in main loop
 #define LORA_QUEUE_SIZE 16
@@ -47,6 +48,8 @@ static void enqueueLora(const TallyPacket &pkt) {
   if (nextHead != g_loraQueueTail) { // Queue not full
     g_loraQueue[g_loraQueueHead] = pkt;
     g_loraQueueHead = nextHead;
+  } else {
+    g_loraDropCount++;
   }
 }
 
@@ -54,6 +57,12 @@ static void processLoraQueue() {
   static uint32_t lastTxTime = 0;
 
   if (g_loraQueueHead != g_loraQueueTail) {
+    // Radio down: drain the packet as a drop instead of stalling on SPI
+    if (!radio.isConnected()) {
+      g_loraDropCount++;
+      g_loraQueueTail = (g_loraQueueTail + 1) % LORA_QUEUE_SIZE;
+      return;
+    }
     // ⚡ Bolt: Enforce minimum 2ms gap between packets non-blockingly
     if (millis() - lastTxTime >= 2) {
       uint8_t buf[TALLY_PACKET_SIZE];
@@ -367,10 +376,12 @@ void drawLoRaDebug() {
   display.print("SNR:");
   display.print(radio.getSNR());
 
-  // Row 2: TX count
+  // Row 2: TX / drop counters
   display.setCursor(1, 28);
-  display.print("TX pkts: ");
+  display.print("TX:");
   display.print(g_loraTxCount);
+  display.print(" Drop:");
+  display.print(g_loraDropCount);
 
   // Row 3: SPI Diagnosis
   display.setCursor(1, 38);
@@ -491,6 +502,18 @@ void setup() {
 
 void loop() {
   processLoraQueue();
+
+  // Radio recovery: re-init every 10s while disconnected (begin() bails out
+  // in ~1s when the module is absent, so this stays affordable)
+  if (!radio.isConnected()) {
+    static uint32_t lastRadioRetry = 0;
+    if (millis() - lastRadioRetry > 10000) {
+      lastRadioRetry = millis();
+      radio.begin(E28_PIN_SCK, E28_PIN_MISO, E28_PIN_MOSI, E28_PIN_NSS,
+                  E28_PIN_BUSY, E28_PIN_DIO1, E28_PIN_RESET, E28_PIN_RXEN,
+                  E28_PIN_TXEN);
+    }
+  }
 
   // WiFi reconnect (non-blocking)
   if (WiFi.status() != WL_CONNECTED) {
