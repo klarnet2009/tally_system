@@ -8,6 +8,7 @@
  */
 
 #include "E28_SX1280.h"
+#include "TallyRadio.h"
 #include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
 
@@ -53,6 +54,7 @@ void setup() {
                         PIN_LORA_NRESET, PIN_LORA_RXEN, PIN_LORA_TXEN);
 
   if (ok) {
+    tallyApplyRadioProfile(radio); // same air interface as production
     Serial.printf("OK (SPI:0x%02X)\n", radio.getChipStatus());
   } else {
     Serial.printf("FAILED (SPI:0x%02X)\n", radio.getChipStatus());

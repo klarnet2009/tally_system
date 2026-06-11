@@ -12,6 +12,7 @@
 #include <Arduino.h>
 #include <E28_SX1280.h>
 #include <TallyProtocol.h>
+#include <TallyRadio.h>
 
 // ===== CONFIGURATION =====
 #ifndef SLAVE_CAM_ID
@@ -140,7 +141,13 @@ void updateLocator() {
   if (elapsed >= 600) { // 5 cycles x 120ms
     locatorActive = false;
     noTone(PIN_BUZZER);
-    applyTallyColor();
+    // Don't paint the (possibly stale) tally colour over a dead link — that
+    // could show solid RED ("you're live") on data minutes old. Hand straight
+    // back to the orange signal-lost indication.
+    if (signalLost)
+      setColor(COLOR_LOST, 60);
+    else
+      applyTallyColor();
     return;
   }
 
@@ -191,9 +198,7 @@ void setup() {
     flashColor(COLOR_INIT_OK, 3, 150, 100);
     beep(1000, 100);
 
-    // Shared RF profile (begin() leaves the chip on its 2400 MHz default)
-    radio.setFrequency(TALLY_RF_FREQ_HZ);
-    radio.setPreambleLength(TALLY_PREAMBLE_SYMBOLS);
+    tallyApplyRadioProfile(radio);
 
     attachInterrupt(digitalPinToInterrupt(PIN_LORA_DIO1), onDio1, RISING);
     rearmReceive(true);
@@ -211,11 +216,33 @@ void setup() {
   }
 }
 
+// Re-init the radio if a runtime fault (stuck BUSY) latched it disconnected.
+// Without this a single glitch would leave the receiver permanently deaf,
+// since every RX call is a guarded no-op while _connected is false.
+void tryRadioRecover() {
+  static uint32_t lastTry = 0;
+  if (radio.isConnected())
+    return;
+  if (millis() - lastTry < 10000)
+    return;
+  lastTry = millis();
+  Serial.println("[LoRa] Recovering...");
+  if (radio.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS,
+                  PIN_LORA_BUSY, PIN_LORA_DIO1, PIN_LORA_NRESET, PIN_LORA_RXEN,
+                  PIN_LORA_TXEN)) {
+    tallyApplyRadioProfile(radio);
+    rearmReceive(true);
+    lastRxTime = millis();
+    Serial.println("[LoRa] Recovered");
+  }
+}
+
 // ===== LOOP =====
 void loop() {
   if (!loraConnected)
     return;
 
+  tryRadioRecover();
   updateLocator();
 
   // === RX: interrupt-driven (no SPI polling — under POWER_SAVE any NSS
@@ -297,7 +324,8 @@ void loop() {
   // Restores RX no matter what state the chip fell into (duty cycle ended,
   // missed interrupt, ...). Cheap and idempotent.
   static uint32_t lastRearm = 0;
-  if (millis() - lastRxTime > 1500 && millis() - lastRearm > 1500) {
+  if (millis() - lastRxTime > TALLY_RX_REARM_MS &&
+      millis() - lastRearm > TALLY_RX_REARM_MS) {
     lastRearm = millis();
     rearmReceive(true);
   }
@@ -317,15 +345,20 @@ void loop() {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
 
+    // red/green/off drive currentState (not just the LED) so the next
+    // heartbeat doesn't leave a stale test colour stuck on the pixel
     if (cmd == "test") {
       Serial.println("[TEST] Locator alert...");
       startLocator();
     } else if (cmd == "red") {
-      setColor(COLOR_PROGRAM, 120);
+      currentState = STATE_PROGRAM;
+      applyTallyColor();
     } else if (cmd == "green") {
-      setColor(COLOR_PREVIEW, 80);
+      currentState = STATE_PREVIEW;
+      applyTallyColor();
     } else if (cmd == "off") {
-      setColor(COLOR_OFF);
+      currentState = STATE_OFF;
+      applyTallyColor();
     } else if (cmd == "beep") {
       beep(1000, 200);
     } else if (cmd == "help") {
