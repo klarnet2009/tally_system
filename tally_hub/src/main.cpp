@@ -1,7 +1,6 @@
 #include <ATEMbase.h>
 #include <ATEMmin.h>
 #include <Arduino.h>
-#include <NimBLEDevice.h>
 #include <SkaarhojPgmspace.h>
 
 #include <Adafruit_GFX.h>
@@ -13,24 +12,6 @@
 #include "E28_SX1280.h"
 #include "TallyProtocol.h"
 #include "config.h"
-
-// ===== NimBLE Tally кадр =====
-#define TALLY_BLE_COMPANY_ID 0xFFFF
-#define TALLY_ADV_INTERVAL_MS 100
-
-struct __attribute__((packed)) TallyBLE {
-  uint8_t ver;
-  uint16_t seq;
-  uint16_t progBits;
-  uint16_t prevBits;
-  uint8_t flags;
-  uint8_t crc;
-};
-
-static NimBLEAdvertising *g_bleAdv = nullptr;
-static TallyBLE g_bleFrame{};
-static uint32_t g_lastBleAdv = 0;
-static uint16_t g_seq = 0;
 
 static E28Radio radio;
 static uint8_t g_lastTallies[8] = {0};
@@ -73,35 +54,6 @@ static void processLoraQueue() {
       g_loraQueueTail = (g_loraQueueTail + 1) % LORA_QUEUE_SIZE;
     }
   }
-}
-
-static uint8_t crc8(const uint8_t *p, size_t n) {
-  uint8_t c = 0;
-  for (size_t i = 0; i < n; i++)
-    c ^= p[i];
-  return c;
-}
-
-static void bleSetAdvPayload(uint16_t progMask, uint16_t prevMask) {
-  g_bleFrame.ver = 0x01;
-  g_bleFrame.seq = ++g_seq;
-  g_bleFrame.progBits = progMask;
-  g_bleFrame.prevBits = prevMask;
-  g_bleFrame.flags = 0;
-  g_bleFrame.crc = 0;
-  g_bleFrame.crc =
-      crc8(reinterpret_cast<uint8_t *>(&g_bleFrame), sizeof(g_bleFrame) - 1);
-
-  std::string mfg;
-  mfg.reserve(2 + sizeof(g_bleFrame));
-  mfg.push_back((uint8_t)(TALLY_BLE_COMPANY_ID & 0xFF));
-  mfg.push_back((uint8_t)((TALLY_BLE_COMPANY_ID >> 8) & 0xFF));
-  mfg.append(reinterpret_cast<const char *>(&g_bleFrame), sizeof(g_bleFrame));
-
-  NimBLEAdvertisementData ad;
-  ad.setFlags(0x06);
-  ad.setManufacturerData(mfg);
-  g_bleAdv->setAdvertisementData(ad);
 }
 
 // ===== OLED / ATEM =====
@@ -464,13 +416,6 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  // ==== NimBLE init ====
-  NimBLEDevice::init("TallyHUB");
-  g_bleAdv = NimBLEDevice::getAdvertising();
-  bleSetAdvPayload(0, 0);
-  g_bleAdv->start();
-  g_lastBleAdv = millis();
-
   // ждём Wi‑Fi с анимацией
   uint8_t wifiFrame = 0;
   uint32_t t0 = millis();
@@ -566,17 +511,6 @@ void loop() {
         lastProgMask = progMask;
         lastPrevMask = prevMask;
         lastDisplayUpdate = millis();
-
-        // ==== NimBLE реклама ====
-        // Обновляем payload только если изменились данные (или редко для
-        // надежности)
-        if (tallyChanged ||
-            (millis() - g_lastBleAdv >= TALLY_ADV_INTERVAL_MS * 5)) {
-          g_bleAdv->stop();
-          bleSetAdvPayload(progMask, prevMask);
-          g_bleAdv->start();
-          g_lastBleAdv = millis();
-        }
 
         // ==== LoRa E28 Send ====
         // Iterate cameras and send update if changed OR if it's a periodic
