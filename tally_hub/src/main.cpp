@@ -352,20 +352,19 @@ void drawLoRaDebug() {
     display.print("0");
   display.print(st, HEX);
 
-  // Decode mode
-  uint8_t mode = (st >> 2) & 0x07;
+  // Decode chip mode — SX1280 status byte: mode = bits [7:5]
+  // (0x2=STDBY_RC 0x3=STDBY_XOSC 0x4=FS 0x5=RX 0x6=TX; 0/1/7 invalid)
+  uint8_t mode = (st >> 5) & 0x07;
   const char *m = "??";
-  if (mode == 0)
-    m = "SLP";
-  else if (mode == 1)
+  if (mode == 2)
     m = "STB";
-  else if (mode == 2)
-    m = "XOS";
   else if (mode == 3)
-    m = "FS ";
+    m = "XOS";
   else if (mode == 4)
-    m = "RX ";
+    m = "FS ";
   else if (mode == 5)
+    m = "RX ";
+  else if (mode == 6)
     m = "TX ";
   display.print(" ");
   display.print(m);

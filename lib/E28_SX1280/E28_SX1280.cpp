@@ -190,6 +190,7 @@ void E28Radio::waitBusy() {
   while (digitalRead(_pinBUSY) == HIGH) {
     if (millis() - start > 1000) {
       _connected = false; // BUSY stuck = no module
+      _initError = E28_ERR_BUSY_STUCK; // keep diagnostics truthful at runtime
       break;
     }
     yield();
@@ -204,6 +205,7 @@ bool E28Radio::waitBusyFor(uint32_t timeoutMs) {
   while (digitalRead(_pinBUSY) == HIGH) {
     if (millis() - start > timeoutMs) {
       _connected = false; // BUSY stuck = no module
+      _initError = E28_ERR_BUSY_STUCK;
       return false;
     }
     yield();
