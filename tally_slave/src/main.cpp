@@ -163,15 +163,22 @@ void loop() {
     // gating) because its DIO1 is unreliable on some boards, and continuous
     // RX (unlike v2's duty cycle) makes the periodic SPI read harmless.
     if (radio.available()) {
-        // Restrict RX length to TALLY_PACKET_SIZE so receive() takes the <=8-byte
-        // fast path instead of a 260-byte block transfer on malformed packets.
-        uint8_t buf[TALLY_PACKET_SIZE];
-        uint8_t len = radio.receive(buf, TALLY_PACKET_SIZE);
+        // Bounded drain: re-check available() before re-arming so a packet
+        // that completed mid-processing isn't wiped by the IRQ clear below
+        for (int drain = 0; drain < 4; drain++) {
+            // Restrict RX length to TALLY_PACKET_SIZE so receive() takes the
+            // <=8-byte fast path instead of a 260-byte block transfer.
+            uint8_t buf[TALLY_PACKET_SIZE];
+            uint8_t len = radio.receive(buf, TALLY_PACKET_SIZE);
 
-        if (len > 0) {
-            // Invalid packets (noise/foreign netId/CRC) are skipped silently —
-            // a neighbouring LoRa system must not spam the serial console
-            tallyLink.onPacket(buf, len);
+            if (len > 0) {
+                // Invalid packets (noise/foreign netId/CRC) skipped silently —
+                // a neighbouring LoRa system must not spam the serial console
+                tallyLink.onPacket(buf, len);
+            }
+
+            if (!radio.available())
+                break;
         }
 
         // ⚡ Bolt: Fast RX re-arm to avoid standby/SPI overhead and prevent dropped packets

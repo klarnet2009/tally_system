@@ -251,7 +251,12 @@ void loop() {
   if (g_dio1Flag || digitalRead(PIN_LORA_DIO1) == HIGH) {
     g_dio1Flag = false;
 
-    if (radio.available()) {
+    // Bounded drain: a second packet can complete while we process the first
+    // (continuous RX keeps receiving); re-checking available() before the
+    // re-arm closes the window where its RxDone would be wiped by the IRQ
+    // clear below and the payload silently abandoned in the FIFO. The cap
+    // keeps a flooding neighbour from starving the rest of loop().
+    for (int drain = 0; drain < 4 && radio.available(); drain++) {
       uint8_t buf[TALLY_PACKET_SIZE];
       uint8_t len = radio.receive(buf, TALLY_PACKET_SIZE);
 

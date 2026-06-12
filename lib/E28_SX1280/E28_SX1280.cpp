@@ -542,6 +542,11 @@ void E28Radio::startReceive() {
   if (!_connected)
     return;
 
+  // Arming RX abandons any in-flight async TX (standby below forces the PA
+  // off); without this a TX interrupted by an RX arm would leave _txActive
+  // wedged true and block startSend() forever
+  _txActive = false;
+
   standby();
   setPacketParams(E28_MAX_PACKET_SIZE);
   clearIrqStatus();
@@ -564,6 +569,8 @@ void E28Radio::startReceiveDutyCycle(uint16_t rxCount, uint16_t sleepCount,
                                      uint8_t periodBase) {
   if (!_connected)
     return;
+
+  _txActive = false; // same contract as startReceive(): RX arm aborts TX
 
   standby();
   setPacketParams(E28_MAX_PACKET_SIZE);
@@ -761,12 +768,18 @@ uint8_t E28Radio::getChipStatus() {
     yield();
 
   digitalWrite(_pinNSS, LOW);
-  // ⚡ Bolt: Coalesce get status to avoid 2 separate single byte transfers
+  // SX1280 drives its status onto MISO during every byte of the transaction,
+  // including the opcode byte. Sample both and prefer a valid one: if the
+  // first byte is marginal (MISO settling right after NSS falls), the NOP
+  // byte still carries good status — avoids a false "module not connected"
+  // verdict on a healthy chip. A truly absent module fails both (0x00/0xFF).
   uint8_t txBuf[2] = {SX1280_CMD_GET_STATUS, 0x00};
   uint8_t rxBuf[2] = {0, 0};
   SPI.transferBytes(txBuf, rxBuf, 2);
   digitalWrite(_pinNSS, HIGH);
-  return rxBuf[0];
+
+  bool firstValid = (rxBuf[0] != 0x00 && rxBuf[0] != 0xFF);
+  return firstValid ? rxBuf[0] : rxBuf[1];
 }
 
 bool E28Radio::checkConnection() {
