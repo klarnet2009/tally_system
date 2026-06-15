@@ -47,6 +47,8 @@
 #define SX1280_CMD_SET_PACKET_PARAMS 0x8C
 #define SX1280_CMD_SET_BUFFER_BASE_ADDR 0x8F
 #define SX1280_CMD_GET_RX_BUFFER_STATUS 0x17
+#define SX1280_CMD_GET_PACKET_STATUS 0x1D
+#define SX1280_CMD_SET_RX_DUTY_CYCLE 0x94
 #define SX1280_CMD_CLR_IRQ_STATUS 0x97
 #define SX1280_CMD_SET_DIO_IRQ_PARAMS 0x8D
 #define SX1280_CMD_GET_IRQ_STATUS 0x15
@@ -83,6 +85,15 @@
 // Buffer size
 #define E28_MAX_PACKET_SIZE 255
 
+// Why the last begin() failed — surfaced on the hub OLED / serial logs so a
+// field failure can be triaged without a logic analyzer.
+enum E28InitError : uint8_t {
+  E28_OK = 0,
+  E28_ERR_BUSY_STUCK, // BUSY never went low: no power / BUSY miswired / chip hung
+  E28_ERR_MISO_LOW,   // status reads 0x00: MISO stuck low — module unpowered/shorted
+  E28_ERR_MISO_HIGH   // status reads 0xFF: MISO stuck high — module absent/miswired
+};
+
 class E28Radio {
 public:
   E28Radio();
@@ -101,14 +112,38 @@ public:
   void setSpreadingFactor(uint8_t sf);   // SF5 to SF12
   void setBandwidth(uint8_t bw);         // Use LORA_BW_* constants
   void setCodingRate(uint8_t cr);        // Use LORA_CR_* constants
+  void setPreambleLength(uint16_t symbols);
 
-  // Transmission
+  // Transmission (blocking)
   bool send(uint8_t *data, uint8_t len);
-  bool sendAsync(uint8_t *data, uint8_t len);
   bool isTxDone();
+
+  // Transmission (non-blocking): startSend() kicks the TX and returns;
+  // poll checkTxDone() — it tears down (IRQ clear, PA off, standby) when done.
+  // After checkTxDone() returns true, txSucceeded() tells real TxDone (true)
+  // apart from the 100ms timeout/failure path (false).
+  bool startSend(uint8_t *data, uint8_t len);
+  bool checkTxDone();
+  bool txActive() { return _txActive; }
+  bool txSucceeded() const { return _txSuccess; }
 
   // Reception
   void startReceive();
+  // Duty-cycled RX: radio autonomously alternates RX/sleep, DIO1 fires on
+  // RxDone. periodBase 0x02 = 1ms units, so counts are milliseconds.
+  // Caller MUST re-arm after every DIO1 event (chip exits the cycle on any
+  // RxDone, even CRC errors) and avoid SPI polling between events (any NSS
+  // edge during the sleep phase silently kills the cycle).
+  void startReceiveDutyCycle(uint16_t rxCount, uint16_t sleepCount,
+                             uint8_t periodBase = 0x02);
+  // Re-arm using whichever RX mode was last started, so callers don't need
+  // their own mode bookkeeping:
+  //  - rearmAfterIrq(): after a DIO1 event. Cheap IRQ-clear for continuous
+  //    RX; full re-issue for duty cycle (mandatory there).
+  //  - restartReceive(): safety net / recovery. Full re-issue of the last
+  //    mode, restoring RX no matter what state the chip fell into.
+  void rearmAfterIrq();
+  void restartReceive();
   void clearRxIrq(); // Lightweight: just clear IRQ, stay in continuous RX
   bool available();
   uint8_t receive(uint8_t *buffer, uint8_t maxLen);
@@ -122,6 +157,10 @@ public:
   bool checkConnection();  // Re-poll SPI to verify module
   uint8_t getChipStatus(); // Raw SX1280 status byte
 
+  // Diagnostics: why the last begin() failed
+  E28InitError initError() const { return _initError; }
+  const char *initErrorStr() const;
+
 private:
   int8_t _pinNSS;
   int8_t _pinBUSY;
@@ -133,14 +172,30 @@ private:
   uint8_t _sf;
   uint8_t _bw;
   uint8_t _cr;
+  uint8_t _preambleByte;  // SX1280 encoding: (exponent << 4) | mantissa
+  uint32_t _frequency;    // Hz; re-applied by begin() so it survives re-init
   int8_t _power;
   bool _connected;
+  bool _txActive;
+  bool _txSuccess;        // result of the last completed async TX
+  uint32_t _txStartMs;
+
+  // Last-started RX mode, so rearmAfterIrq()/restartReceive() can re-issue it
+  enum RxMode : uint8_t { RX_NONE, RX_CONTINUOUS, RX_DUTY_CYCLE };
+  RxMode _rxMode;
+  uint16_t _dcRxCount;
+  uint16_t _dcSleepCount;
+  uint8_t _dcPeriodBase;
+
+  uint16_t _lastPktLen; // setPacketParams cache (0xFFFF = invalid)
+  E28InitError _initError;
 
   int8_t _lastRSSI;
   int8_t _lastSNR;
 
   void reset();
   void waitBusy();
+  bool waitBusyFor(uint32_t timeoutMs); // bounded variant for probe paths
   void writeCommand(uint8_t cmd, uint8_t *data, uint8_t len);
   void readCommand(uint8_t cmd, uint8_t *data, uint8_t len);
   void setModulationParams();

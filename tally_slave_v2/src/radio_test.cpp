@@ -8,25 +8,13 @@
  */
 
 #include "E28_SX1280.h"
+#include "TallyRadio.h"
 #include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
 
-// E28 pins for ESP32-C3
-#define PIN_LORA_SCK 3
-#define PIN_LORA_MOSI 4
-#define PIN_LORA_MISO 5
-#define PIN_LORA_NRESET 6
-#define PIN_LORA_NSS 20
-#define PIN_LORA_BUSY 10
-#define PIN_LORA_DIO1 1
-#define PIN_LORA_RXEN -1
-#define PIN_LORA_TXEN -1
+#include "pins.h" // shared wiring (LoRa, NeoPixel, buzzer)
 
-// NeoPixel
-#define PIN_NEOPIXEL 7
-#define NUM_PIXELS 1
-
-Adafruit_NeoPixel led(NUM_PIXELS, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel led(NUM_LEDS, PIN_LED, NEO_GRB + NEO_KHZ800);
 E28Radio radio;
 
 uint32_t rxCount = 0;
@@ -53,6 +41,7 @@ void setup() {
                         PIN_LORA_NRESET, PIN_LORA_RXEN, PIN_LORA_TXEN);
 
   if (ok) {
+    tallyApplyRadioProfile(radio); // same air interface as production
     Serial.printf("OK (SPI:0x%02X)\n", radio.getChipStatus());
   } else {
     Serial.printf("FAILED (SPI:0x%02X)\n", radio.getChipStatus());

@@ -8,6 +8,7 @@
  */
 
 #include "E28_SX1280.h"
+#include "TallyRadio.h"
 #include "config.h"
 #include <Adafruit_SSD1306.h>
 #include <Arduino.h>
@@ -57,6 +58,8 @@ void setup() {
   bool ok = radio.begin(E28_PIN_SCK, E28_PIN_MISO, E28_PIN_MOSI, E28_PIN_NSS,
                         E28_PIN_BUSY, E28_PIN_DIO1, E28_PIN_RESET, E28_PIN_RXEN,
                         E28_PIN_TXEN);
+  if (ok)
+    tallyApplyRadioProfile(radio); // same air interface as production
 
   display.clearDisplay();
   display.setTextSize(1);

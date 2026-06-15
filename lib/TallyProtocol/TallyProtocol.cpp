@@ -3,15 +3,15 @@
 TallyProtocol::TallyProtocol() {
 }
 
-TallyPacket TallyProtocol::createSetStatePacket(uint8_t cameraId, TallyState state, uint8_t brightness) {
+TallyPacket TallyProtocol::createStateAllPacket(uint16_t progMask, uint16_t prevMask) {
     TallyPacket packet;
     packet.start = TALLY_START_BYTE;
-    packet.command = CMD_SET_STATE;
-    packet.cameraId = cameraId;
-    packet.state = state;
-    packet.brightness = brightness;
-    packet.reserved[0] = 0;
-    packet.reserved[1] = 0;
+    packet.command = CMD_STATE_ALL;
+    packet.netId = TALLY_NET_ID;
+    packet.payload[0] = (uint8_t)(progMask & 0xFF);
+    packet.payload[1] = (uint8_t)(progMask >> 8);
+    packet.payload[2] = (uint8_t)(prevMask & 0xFF);
+    packet.payload[3] = (uint8_t)(prevMask >> 8);
     packet.crc = calculateCRC(packet);
     return packet;
 }
@@ -20,43 +20,32 @@ TallyPacket TallyProtocol::createPingPacket(uint8_t cameraId) {
     TallyPacket packet;
     packet.start = TALLY_START_BYTE;
     packet.command = CMD_PING;
-    packet.cameraId = cameraId;
-    packet.state = STATE_OFF;
-    packet.brightness = 0;
-    packet.reserved[0] = 0;
-    packet.reserved[1] = 0;
+    packet.netId = TALLY_NET_ID;
+    packet.payload[0] = cameraId;
+    packet.payload[1] = 0;
+    packet.payload[2] = 0;
+    packet.payload[3] = 0;
     packet.crc = calculateCRC(packet);
     return packet;
 }
 
-TallyPacket TallyProtocol::createHeartbeatPacket() {
-    TallyPacket packet;
-    packet.start = TALLY_START_BYTE;
-    packet.command = CMD_HEARTBEAT;
-    packet.cameraId = TALLY_BROADCAST_ID;
-    packet.state = STATE_OFF;
-    packet.brightness = 0;
-    packet.reserved[0] = 0;
-    packet.reserved[1] = 0;
-    packet.crc = calculateCRC(packet);
-    return packet;
-}
+TallyState TallyProtocol::stateForCamera(const TallyPacket& packet, uint8_t cameraId) {
+    if (cameraId < 1 || cameraId > 16) {
+        return STATE_OFF;
+    }
+    uint16_t progMask = (uint16_t)packet.payload[0] | ((uint16_t)packet.payload[1] << 8);
+    uint16_t prevMask = (uint16_t)packet.payload[2] | ((uint16_t)packet.payload[3] << 8);
+    uint16_t bit = 1U << (cameraId - 1);
 
-TallyPacket TallyProtocol::createAckPacket(uint8_t cameraId) {
-    TallyPacket packet;
-    packet.start = TALLY_START_BYTE;
-    packet.command = CMD_ACK;
-    packet.cameraId = cameraId;
-    packet.state = STATE_OFF;
-    packet.brightness = 0;
-    packet.reserved[0] = 0;
-    packet.reserved[1] = 0;
-    packet.crc = calculateCRC(packet);
-    return packet;
+    bool onAir = (progMask & bit) != 0;
+    bool preview = (prevMask & bit) != 0;
+    if (onAir && preview) return STATE_BOTH;
+    if (onAir) return STATE_PROGRAM;
+    if (preview) return STATE_PREVIEW;
+    return STATE_OFF;
 }
 
 void TallyProtocol::serialize(const TallyPacket& packet, uint8_t* buffer) {
-    // ⚡ Bolt: Rely on compiler intrinsics for fixed-size memory copies instead of manual loops
     memcpy(buffer, &packet, TALLY_PACKET_SIZE);
 }
 
@@ -64,97 +53,42 @@ bool TallyProtocol::deserialize(const uint8_t* buffer, uint8_t len, TallyPacket&
     if (len < TALLY_PACKET_SIZE) {
         return false;
     }
-    
-    // ⚡ Bolt: Fast-path early return to skip memcpy and CRC overhead for noisy/invalid packets
+
+    // Cheapest noise reject before the memcpy; everything else (netId,
+    // command whitelist, CRC) is validate()'s job — one authority, so a new
+    // command can't be whitelisted in one place and forgotten in the other.
     if (buffer[0] != TALLY_START_BYTE) {
         return false;
     }
 
-    // ⚡ Bolt: Fast-path command validation before expensive memcpy and CRC calculation
-    if (buffer[1] < CMD_SET_STATE || buffer[1] > CMD_HEARTBEAT) {
-        return false;
-    }
-
-    // ⚡ Bolt: Rely on compiler intrinsics for fixed-size memory copies instead of manual loops
     memcpy(&packet, buffer, TALLY_PACKET_SIZE);
 
     return validate(packet);
 }
 
 bool TallyProtocol::validate(const TallyPacket& packet) {
-    // Check start byte
     if (packet.start != TALLY_START_BYTE) {
         return false;
     }
-    
-    // ⚡ Bolt: Fast-path command validation before expensive CRC calculation
-    // Validate command
-    if (packet.command < CMD_SET_STATE || packet.command > CMD_HEARTBEAT) {
+    if (packet.netId != TALLY_NET_ID) {
         return false;
     }
-    
-    // Check CRC
+    // Command whitelist (a range check would silently break when command
+    // values become non-contiguous)
+    if (packet.command != CMD_PING && packet.command != CMD_STATE_ALL) {
+        return false;
+    }
     if (packet.crc != calculateCRC(packet)) {
         return false;
     }
-    
     return true;
 }
 
 uint8_t TallyProtocol::calculateCRC(const TallyPacket& packet) {
+    // serialize()/deserialize() memcpy the struct as the wire format, so its
+    // size must equal TALLY_PACKET_SIZE; the unrolled CRC below assumes 8 bytes.
+    static_assert(sizeof(TallyPacket) == TALLY_PACKET_SIZE, "TallyPacket layout != wire size");
     static_assert(TALLY_PACKET_SIZE == 8, "Packet size changed, update CRC unrolling");
     const uint8_t* data = (const uint8_t*)&packet;
-    
-    // ⚡ Bolt: Manually unroll the XOR loop for 7 bytes to eliminate branching and loop overhead
     return data[0] ^ data[1] ^ data[2] ^ data[3] ^ data[4] ^ data[5] ^ data[6];
-}
-
-bool TallyProtocol::parseSerialCommand(const char* cmd, uint8_t& cameraId, TallyState& state) {
-    // Expected format: T<id><state>
-    // T1P = Camera 1 Preview
-    // T1R = Camera 1 Program (Red)
-    // T1O = Camera 1 Off
-    // T2P = Camera 2 Preview
-    // etc.
-    
-    // ⚡ Bolt: Fast-path O(1) length check avoids O(N) strlen traversal on potentially long inputs
-    if (cmd == nullptr || cmd[0] == '\0' || cmd[1] == '\0' || cmd[2] == '\0') {
-        return false;
-    }
-    
-    // Check for 'T' prefix
-    if (cmd[0] != 'T' && cmd[0] != 't') {
-        return false;
-    }
-    
-    // Parse camera ID (supports 1-9 for simple case)
-    if (cmd[1] < '1' || cmd[1] > '9') {
-        return false;
-    }
-    cameraId = cmd[1] - '0';
-    
-    // Parse state
-    char stateChar = cmd[2];
-    switch (stateChar) {
-        case 'P':
-        case 'p':
-            state = STATE_PREVIEW;
-            break;
-        case 'R':
-        case 'r':
-            state = STATE_PROGRAM;
-            break;
-        case 'O':
-        case 'o':
-            state = STATE_OFF;
-            break;
-        case 'B':
-        case 'b':
-            state = STATE_BOTH;
-            break;
-        default:
-            return false;
-    }
-    
-    return true;
 }

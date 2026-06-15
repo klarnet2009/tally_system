@@ -4,10 +4,31 @@ E28Radio::E28Radio() {
   _sf = LORA_SF7;
   _bw = LORA_BW_0400;
   _cr = LORA_CR_4_5;
+  _preambleByte = 0x0C; // 12 symbols
+  _frequency = 2400000000UL; // SX1280 default; callers override via setFrequency
   _power = 1; // Low power mode: ~14dBm with PA (safe for USB power)
   _lastRSSI = 0;
   _lastSNR = 0;
   _connected = false;
+  _txActive = false;
+  _txSuccess = false;
+  _txStartMs = 0;
+  _rxMode = RX_NONE;
+  _dcRxCount = 0;
+  _dcSleepCount = 0;
+  _dcPeriodBase = 0x02;
+  _lastPktLen = 0xFFFF;
+  _initError = E28_OK;
+}
+
+const char *E28Radio::initErrorStr() const {
+  switch (_initError) {
+  case E28_OK:             return "OK";
+  case E28_ERR_BUSY_STUCK: return "BUSY stuck (power?)";
+  case E28_ERR_MISO_LOW:   return "MISO low (no 3V3?)";
+  case E28_ERR_MISO_HIGH:  return "MISO high (no module?)";
+  }
+  return "?";
 }
 
 bool E28Radio::begin() {
@@ -58,7 +79,45 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
 
   // Wait for chip to be ready
   delay(10);
-  waitBusy();
+  _connected = true; // assume present; bounded wait clears this on stuck BUSY
+  _txActive = false; // a re-init (e.g. field recovery) abandons any in-flight TX
+  _rxMode = RX_NONE;     // chip reset forgets its RX state
+  _lastPktLen = 0xFFFF;  // and its packet params
+  _initError = E28_OK;
+
+  // Post-reset BUSY clears in <1ms on a live chip; a 100ms cap keeps a dead
+  // module's begin() (called from recovery loops) from stalling for ~1s.
+  // Early bail before the config sequence: with no module each command below
+  // would burn the full 1s BUSY timeout (~6+ s per failed begin())
+  bool busyOk = waitBusyFor(100);
+  uint8_t probe = busyOk ? getChipStatus() : 0x00;
+
+  if (!busyOk || probe == 0xFF || probe == 0x00) {
+    if (_pinRESET == -1) {
+      // Without a reset line the chip may be wedged in a previous-run mode
+      // where the probe fails (sleep keeps BUSY high until woken). Fire a
+      // blind SetStandby(RC) — deliberately bypassing the BUSY wait — then
+      // re-probe once before declaring the module dead.
+      digitalWrite(_pinNSS, LOW);
+      SPI.transfer(SX1280_CMD_SET_STANDBY);
+      SPI.transfer(0x00); // STDBY_RC
+      digitalWrite(_pinNSS, HIGH);
+      delay(2);
+      _connected = true; // clean slate for the re-probe
+      busyOk = waitBusyFor(100);
+      probe = busyOk ? getChipStatus() : 0x00;
+    }
+    if (!busyOk) {
+      _initError = E28_ERR_BUSY_STUCK;
+      _connected = false;
+      return false;
+    }
+    if (probe == 0xFF || probe == 0x00) {
+      _initError = (probe == 0xFF) ? E28_ERR_MISO_HIGH : E28_ERR_MISO_LOW;
+      _connected = false;
+      return false;
+    }
+  }
 
   // Set standby mode
   standby();
@@ -67,8 +126,9 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
   uint8_t packetType = SX1280_PACKET_TYPE_LORA;
   writeCommand(SX1280_CMD_SET_PACKET_TYPE, &packetType, 1);
 
-  // Set default frequency (2.4 GHz)
-  setFrequency(2400000000);
+  // Apply the stored frequency (defaults to 2.4 GHz; setFrequency() persists
+  // the caller's choice so it survives a re-init)
+  setFrequency(_frequency);
 
   // Set default TX power
   setTxPower(_power);
@@ -93,10 +153,12 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
   uint8_t status = getChipStatus();
   // SPI returns 0xFF (all high) or 0x00 if no chip connected
   if (status == 0xFF || status == 0x00) {
+    _initError = (status == 0xFF) ? E28_ERR_MISO_HIGH : E28_ERR_MISO_LOW;
     _connected = false;
     return false;
   }
   _connected = true;
+  _initError = E28_OK;
   return true;
 }
 
@@ -107,10 +169,15 @@ void E28Radio::reset() {
     digitalWrite(_pinRESET, HIGH);
     delay(20);
   } else {
-    // Software reset if no pin
-    delay(50);
-    // Maybe send a reset command? But SPI might be stuck if chip is?
-    // Usually power-on reset is enough.
+    // No reset line (hub wiring): a warm ESP32 reboot (flashing, EN button,
+    // brownout restart) does NOT power-cycle the module, so the SX1280 may
+    // still be in sleep/duty-cycle/TX from the previous run — historically
+    // seen as "module not connected" right after reflashing. An NSS falling
+    // edge wakes the chip from sleep (BUSY goes low when it's ready).
+    digitalWrite(_pinNSS, LOW);
+    delayMicroseconds(100);
+    digitalWrite(_pinNSS, HIGH);
+    delay(5);
   }
 }
 
@@ -118,14 +185,32 @@ void E28Radio::waitBusy() {
   // ⚡ Bolt: Fast-path early return to avoid millis() overhead in tight polling loops
   if (digitalRead(_pinBUSY) == LOW) return;
 
-  uint32_t timeout = millis() + 1000;
+  // Elapsed-time pattern: immune to millis() rollover (~49.7 days)
+  uint32_t start = millis();
   while (digitalRead(_pinBUSY) == HIGH) {
-    if (millis() > timeout) {
+    if (millis() - start > 1000) {
       _connected = false; // BUSY stuck = no module
+      _initError = E28_ERR_BUSY_STUCK; // keep diagnostics truthful at runtime
       break;
     }
     yield();
   }
+}
+
+bool E28Radio::waitBusyFor(uint32_t timeoutMs) {
+  if (digitalRead(_pinBUSY) == LOW)
+    return true;
+
+  uint32_t start = millis();
+  while (digitalRead(_pinBUSY) == HIGH) {
+    if (millis() - start > timeoutMs) {
+      _connected = false; // BUSY stuck = no module
+      _initError = E28_ERR_BUSY_STUCK;
+      return false;
+    }
+    yield();
+  }
+  return true;
 }
 
 void E28Radio::writeCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
@@ -190,9 +275,11 @@ void E28Radio::readCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
 }
 
 void E28Radio::setFrequency(uint32_t frequency) {
+  _frequency = frequency; // remember so begin()/re-init re-applies it
   // Frequency = (rfFreq * Fxtal) / 2^18
   // Fxtal = 52 MHz for SX1280
-  uint32_t rfFreq = (uint32_t)((float)frequency / (52000000.0 / 262144.0));
+  // 64-bit integer math: float loses precision at 2.4e9 (24-bit mantissa)
+  uint32_t rfFreq = (uint32_t)((uint64_t)frequency * 262144ULL / 52000000ULL);
 
   uint8_t freqParams[3] = {(uint8_t)((rfFreq >> 16) & 0xFF),
                            (uint8_t)((rfFreq >> 8) & 0xFF),
@@ -236,9 +323,31 @@ void E28Radio::setModulationParams() {
   writeCommand(SX1280_CMD_SET_MODULATION_PARAMS, modParams, 3);
 }
 
+void E28Radio::setPreambleLength(uint16_t symbols) {
+  // SX1280 LoRa preamble byte: (exponent << 4) | mantissa,
+  // length = mantissa * 2^exponent. Round up so the preamble is never
+  // shorter than requested (matters for duty-cycle RX detection windows).
+  uint8_t exp = 0;
+  uint16_t mant = symbols;
+  while (mant > 15 && exp < 15) {
+    mant = (mant + 1) / 2;
+    exp++;
+  }
+  if (mant > 15)
+    mant = 15;
+  _preambleByte = (uint8_t)((exp << 4) | mant);
+  _lastPktLen = 0xFFFF; // packet params embed the preamble — force re-send
+}
+
 void E28Radio::setPacketParams(uint8_t payloadLen) {
+  // Skip the 7-byte SPI command when nothing changed (every TX packet has
+  // the same length, so this saves a command + BUSY round-trip per packet)
+  if (_lastPktLen == payloadLen)
+    return;
+  _lastPktLen = payloadLen;
+
   uint8_t pktParams[7] = {
-      0x0C,            // Preamble length (12 symbols)
+      _preambleByte,   // Preamble length (default 0x0C = 12 symbols)
       0x00,            // Header type: explicit
       payloadLen,      // Payload length
       0x01,            // CRC on
@@ -270,6 +379,9 @@ uint16_t E28Radio::getIrqStatus() {
 }
 
 bool E28Radio::send(uint8_t *data, uint8_t len) {
+  if (!_connected)
+    return false;
+
   // Go to standby first (disables EN pins)
   standby();
 
@@ -321,10 +433,10 @@ bool E28Radio::send(uint8_t *data, uint8_t len) {
   uint8_t txParams[3] = {0x00, 0x00, 0x00};
   writeCommand(SX1280_CMD_SET_TX, txParams, 3);
 
-  // Wait for TX done
-  uint32_t timeout = millis() + 100;   // 100ms TxDone timeout (packet is <5ms)
+  // Wait for TX done (elapsed-time pattern: immune to millis() rollover)
+  uint32_t txStart = millis(); // 100ms TxDone timeout (packet is <5ms)
   while (!isTxDone()) { // TxDone bit
-    if (millis() > timeout) {
+    if (millis() - txStart > 100) {
       if (_pinTXEN != -1)
         digitalWrite(_pinTXEN, LOW);
       standby();
@@ -341,7 +453,10 @@ bool E28Radio::send(uint8_t *data, uint8_t len) {
   return true;
 }
 
-bool E28Radio::sendAsync(uint8_t *data, uint8_t len) {
+bool E28Radio::startSend(uint8_t *data, uint8_t len) {
+  if (!_connected || _txActive)
+    return false;
+
   standby();
   setPacketParams(len);
 
@@ -388,21 +503,30 @@ bool E28Radio::sendAsync(uint8_t *data, uint8_t len) {
   uint8_t txParams[3] = {0x00, 0x00, 0x00};
   writeCommand(SX1280_CMD_SET_TX, txParams, 3);
 
-  // Wait for TX done with timeout
-  uint32_t t0 = millis();
-  while (!isTxDone()) { // TxDone bit
-    if (millis() - t0 > 500) {
-      if (_pinTXEN != -1)
-        digitalWrite(_pinTXEN, LOW);
-      standby();
-      return false;
-    }
-    yield();
-  }
+  _txActive = true;
+  _txStartMs = millis();
+  return true;
+}
+
+bool E28Radio::checkTxDone() {
+  if (!_txActive)
+    return true;
+
+  // 100ms cap mirrors the blocking send(); a tally packet is on air <15ms
+  bool done = isTxDone();
+  if (!done && millis() - _txStartMs <= 100)
+    return false;
+
+  // done == true: real TxDone; done == false: 100ms timeout (TX failed).
+  // Callers count drops on !txSucceeded() so a stuck PA/antenna fault shows up.
+  _txSuccess = done;
+
+  // Teardown (same order as blocking send): IRQ clear, PA off, standby
   clearIrqStatus();
   if (_pinTXEN != -1)
     digitalWrite(_pinTXEN, LOW);
   standby();
+  _txActive = false;
   return true;
 }
 
@@ -415,6 +539,14 @@ bool E28Radio::isTxDone() {
 }
 
 void E28Radio::startReceive() {
+  if (!_connected)
+    return;
+
+  // Arming RX abandons any in-flight async TX (standby below forces the PA
+  // off); without this a TX interrupted by an RX arm would leave _txActive
+  // wedged true and block startSend() forever
+  _txActive = false;
+
   standby();
   setPacketParams(E28_MAX_PACKET_SIZE);
   clearIrqStatus();
@@ -429,9 +561,70 @@ void E28Radio::startReceive() {
   // Start continuous RX
   uint8_t rxParams[3] = {0xFF, 0xFF, 0xFF}; // Continuous RX
   writeCommand(SX1280_CMD_SET_RX, rxParams, 3);
+
+  _rxMode = RX_CONTINUOUS;
+}
+
+void E28Radio::startReceiveDutyCycle(uint16_t rxCount, uint16_t sleepCount,
+                                     uint8_t periodBase) {
+  if (!_connected)
+    return;
+
+  _txActive = false; // same contract as startReceive(): RX arm aborts TX
+
+  standby();
+  setPacketParams(E28_MAX_PACKET_SIZE);
+  clearIrqStatus();
+
+  // Enable LNA
+  if (_pinTXEN != -1)
+    digitalWrite(_pinTXEN, LOW);
+  if (_pinRXEN != -1)
+    digitalWrite(_pinRXEN, HIGH);
+  delayMicroseconds(50);
+
+  uint8_t params[5] = {periodBase, (uint8_t)(rxCount >> 8),
+                       (uint8_t)(rxCount & 0xFF), (uint8_t)(sleepCount >> 8),
+                       (uint8_t)(sleepCount & 0xFF)};
+  writeCommand(SX1280_CMD_SET_RX_DUTY_CYCLE, params, 5);
+
+  _rxMode = RX_DUTY_CYCLE;
+  _dcRxCount = rxCount;
+  _dcSleepCount = sleepCount;
+  _dcPeriodBase = periodBase;
+}
+
+void E28Radio::rearmAfterIrq() {
+  switch (_rxMode) {
+  case RX_DUTY_CYCLE:
+    // Mandatory full re-issue: any RxDone (even a CRC error) ends the cycle
+    startReceiveDutyCycle(_dcRxCount, _dcSleepCount, _dcPeriodBase);
+    break;
+  case RX_CONTINUOUS:
+    clearRxIrq(); // cheap: IRQ clear + SET_RX, no standby
+    break;
+  case RX_NONE:
+    break;
+  }
+}
+
+void E28Radio::restartReceive() {
+  switch (_rxMode) {
+  case RX_DUTY_CYCLE:
+    startReceiveDutyCycle(_dcRxCount, _dcSleepCount, _dcPeriodBase);
+    break;
+  case RX_CONTINUOUS:
+    startReceive();
+    break;
+  case RX_NONE:
+    break;
+  }
 }
 
 void E28Radio::clearRxIrq() {
+  if (!_connected)
+    return;
+
   // Fast RX re-arm: clear IRQ + restart continuous RX (no standby needed)
   clearIrqStatus();
   // Ensure LNA is enabled
@@ -445,6 +638,9 @@ void E28Radio::clearRxIrq() {
 }
 
 bool E28Radio::available() {
+  if (!_connected)
+    return false;
+
   // Read IRQ register directly (no DIO1 pin check — unreliable on some boards)
   uint16_t irq = getIrqStatus();
   // Check for CRC error first — discard bad packet silently
@@ -456,6 +652,9 @@ bool E28Radio::available() {
 }
 
 uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
+  if (!_connected)
+    return 0;
+
   // Wait for SX1280 to finish internal processing
   waitBusy();
 
@@ -514,6 +713,12 @@ uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
   }
   digitalWrite(_pinNSS, HIGH);
 
+  // Read packet RSSI/SNR (LoRa packet status: byte0 = rssiSync, byte1 = snr)
+  uint8_t pktStatus[5] = {0};
+  readCommand(SX1280_CMD_GET_PACKET_STATUS, pktStatus, 5);
+  _lastRSSI = -(int8_t)(pktStatus[0] / 2); // RSSI = -rssiSync/2 dBm
+  _lastSNR = (int8_t)pktStatus[1] / 4;     // SNR = snr/4 dB (two's complement)
+
   // Clear IRQ
   clearIrqStatus();
 
@@ -555,13 +760,26 @@ void E28Radio::standby() {
 }
 
 uint8_t E28Radio::getChipStatus() {
+  // Bounded BUSY wait (10ms cap). Deliberately not waitBusy(): this is the
+  // recovery probe — it must not stall 1s per call or flip _connected when
+  // the module is absent
+  uint32_t start = millis();
+  while (digitalRead(_pinBUSY) == HIGH && millis() - start <= 10)
+    yield();
+
   digitalWrite(_pinNSS, LOW);
-  // ⚡ Bolt: Coalesce get status to avoid 2 separate single byte transfers
+  // SX1280 drives its status onto MISO during every byte of the transaction,
+  // including the opcode byte. Sample both and prefer a valid one: if the
+  // first byte is marginal (MISO settling right after NSS falls), the NOP
+  // byte still carries good status — avoids a false "module not connected"
+  // verdict on a healthy chip. A truly absent module fails both (0x00/0xFF).
   uint8_t txBuf[2] = {SX1280_CMD_GET_STATUS, 0x00};
   uint8_t rxBuf[2] = {0, 0};
   SPI.transferBytes(txBuf, rxBuf, 2);
   digitalWrite(_pinNSS, HIGH);
-  return rxBuf[0];
+
+  bool firstValid = (rxBuf[0] != 0x00 && rxBuf[0] != 0xFF);
+  return firstValid ? rxBuf[0] : rxBuf[1];
 }
 
 bool E28Radio::checkConnection() {

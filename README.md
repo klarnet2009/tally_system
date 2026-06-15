@@ -5,9 +5,8 @@ This project implements a wireless Tally Light system using ESP32 microcontrolle
 ## Project Structure
 
 - **tally_hub/**: Firmware for the Master Controller (ESP32-S3 + E28-2G4M27S + OLED).
-  - Includes local `lib/` folder with drivers.
 - **tally_slave/**: Firmware for Receiver Units (ESP32-C3 SuperMini + E28-2G4M12SX).
-  - Includes local `lib/` folder with drivers.
+- **lib/**: Shared drivers (E28_SX1280, TallyProtocol) used by all projects via `lib_extra_dirs`.
 - **documentation/**: Wiring diagrams and pinouts.
 
 ## Hardware Setup
@@ -28,8 +27,12 @@ This project implements a wireless Tally Light system using ESP32 microcontrolle
 
 Each folder (`tally_hub`, `tally_slave`) is a standalone PlatformIO project.
 
-1. Open the desired folder in VS Code / PlatformIO.
-2. Build and Upload.
+1. Copy `tally_hub/src/secrets.h.example` to `tally_hub/src/secrets.h` and fill in
+   your Wi-Fi credentials and ATEM IP. The file is gitignored.
+   (Note: credentials committed before this scheme was introduced remain in git
+   history — rotate the Wi-Fi password if the repo is shared.)
+2. Open the desired folder in VS Code / PlatformIO.
+3. Build and Upload.
    - **Hub**: Needs Boot/Reset for upload on some boards.
    - **Slave (C3)**: Needs Boot button held during Reset to enter download mode.
 
