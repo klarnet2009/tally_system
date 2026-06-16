@@ -665,7 +665,16 @@ void loop() {
     lastSentProg = g_progMask;
     lastSentPrev = g_prevMask;
     lastStateSend = millis();
-    TallyPacket pkt = TallyProtocol::createStateAllPacket(g_progMask, g_prevMask);
+    // sourceLive: in production, true only while ATEM is actually connected
+    // (frozen masks after an ATEM drop are flagged stale so slaves can warn);
+    // in test mode the generated stream is always "live".
+#ifdef LORA_TEST_MODE
+    bool sourceLive = true;
+#else
+    bool sourceLive = (atemPhase == ATEM_RUNNING);
+#endif
+    TallyPacket pkt =
+        TallyProtocol::createStateAllPacket(g_progMask, g_prevMask, sourceLive);
     // Burst-on-change: a tally transition ("camera goes ON AIR") is otherwise a
     // single fire-and-forget packet; one RF collision would show the wrong
     // light until the next heartbeat (up to TALLY_REFRESH_MS). Sending the

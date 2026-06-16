@@ -7,6 +7,7 @@ void TallyLink::begin(uint8_t cameraId, StateCallback onState,
     _onLocator = onLocator;
     _onLink = onLink;
     _lastRxMs = millis();
+    _lastSourceLiveMs = millis();
 }
 
 bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
@@ -15,25 +16,30 @@ bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
         return false;
     }
 
-    // Any valid packet from our hub proves the link is alive
+    // Any valid packet from our hub proves the radio link is alive
     _lastRxMs = millis();
     if (_signalLost) {
         _signalLost = false;
         if (_onLink) _onLink(false);
     }
 
-    if (pkt.command == CMD_PING) {
-        if (pkt.payload[0] == _cameraId ||
-            pkt.payload[0] == TALLY_BROADCAST_ID) {
+    uint8_t code = TallyProtocol::cmdCode(pkt);
+    if (code == CMD_PING) {
+        if (pkt.aux == _cameraId || pkt.aux == TALLY_BROADCAST_ID) {
             if (_onLocator) _onLocator();
         }
-    } else if (pkt.command == CMD_STATE_ALL) {
+    } else if (code == CMD_STATE_ALL) {
+        // Track the hub's tally-source freshness (set in tick()'s grace timer)
+        if (TallyProtocol::sourceLive(pkt))
+            _lastSourceLiveMs = millis();
+
         TallyState ts = TallyProtocol::stateForCamera(pkt, _cameraId);
         if (ts != _state) {
             _state = ts;
             if (_onState) _onState(ts);
         }
     }
+    // CMD_TELEMETRY is a slave->hub frame; a slave ignores it.
     return true;
 }
 
@@ -42,6 +48,10 @@ void TallyLink::tick() {
         _signalLost = true;
         if (_onLink) _onLink(true);
     }
+    // Source-stale: the hub kept sending (link alive) but flagged its tally
+    // source frozen for longer than the grace window. Riding out brief ATEM
+    // reconnects, this avoids flicker while still catching a real freeze.
+    _sourceStale = (millis() - _lastSourceLiveMs > TALLY_SOURCE_GRACE_MS);
 }
 
 void TallyLink::noteAlive() {

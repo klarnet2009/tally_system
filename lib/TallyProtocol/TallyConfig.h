@@ -18,6 +18,12 @@
 // TALLY_REFRESH_MS must not silently desync the receivers' timers.
 #define TALLY_SIGNAL_LOST_MS (6 * TALLY_REFRESH_MS) // Alarm after 6 missed beats
 #define TALLY_RX_REARM_MS (3 * TALLY_REFRESH_MS)    // RX safety-net re-arm
+// Grace before a slave shows the "source stale" (ATEM frozen) indication, so a
+// brief switcher reconnect doesn't flicker the light.
+#define TALLY_SOURCE_GRACE_MS 2000
+// Slave -> hub telemetry interval (jittered per device to avoid lockstep
+// collisions on the shared channel).
+#define TALLY_TELEMETRY_MS 2000
 
 // TX preamble 40 symbols (~12.6 ms at SF7/BW406): guarantees a full RX window
 // of a duty-cycled receiver (3 ms on / 6 ms off) lands inside the preamble
