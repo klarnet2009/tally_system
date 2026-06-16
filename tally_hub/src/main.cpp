@@ -7,6 +7,7 @@
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <esp_system.h> // esp_reset_reason()
 
 #include "AtemClientAdapter.h"
 #include "E28_SX1280.h"
@@ -23,7 +24,7 @@ static uint32_t g_loraDropCount = 0; // Packets lost: queue overflow / radio / T
 // Serial0 = UART0 via the devkit's USB bridge (GPIO43/44). Neither touches
 // the E28 pins. Log to both so whichever cable is plugged in shows logs.
 static void hublogf(const char *fmt, ...) {
-  char buf[160];
+  char buf[256]; // worst-case [STATUS] line is ~127 chars; headroom for growth
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -317,11 +318,15 @@ void drawTallyGrid(uint16_t progMask, uint16_t prevMask) {
   for (int r = 0; r < rows; r++) {
     for (int c = 0; c < cols; c++) {
       int idx = r * cols + c;
-      uint16_t bit = 1U << (TALLY_INPUTS[idx] - 1);
-      uint8_t status = (progMask & bit) ? 2 : ((prevMask & bit) ? 1 : 0);
+      uint8_t human = TALLY_INPUTS[idx];
+      uint8_t status = 0;
+      if (human >= 1 && human <= 16) { // guard the bit shift against bad config
+        uint16_t bit = 1U << (human - 1);
+        status = (progMask & bit) ? 2 : ((prevMask & bit) ? 1 : 0);
+      }
       int x = c * cellW;
       int y = yOff + r * cellH;
-      drawCell(x, y, cellW, cellH, TALLY_INPUTS[idx], status);
+      drawCell(x, y, cellW, cellH, human, status);
     }
   }
 }
@@ -487,9 +492,13 @@ void setup() {
   pinMode(0, INPUT_PULLUP); // Boot button for locator
 
   hublogf("\n=== Tally HUB (ESP32-S3 + E28-2G4M27S) ===\n");
-  hublogf("[CFG] netId=0x%02X freq=%lu preamble=%d refresh=%dms\n",
+  // Reset reason turns "module not connected after a warm reboot" from a
+  // guess into a fact: ESP_RST_BROWNOUT after a TX storm = the PA/WiFi rail
+  // is sagging (decouple it), vs ESP_RST_SW/POWERON = ordinary boot.
+  hublogf("[BOOT] reset_reason=%d\n", (int)esp_reset_reason());
+  hublogf("[CFG] netId=0x%02X freq=%lu preamble=%d power=%d refresh=%dms\n",
           TALLY_NET_ID, (unsigned long)TALLY_RF_FREQ_HZ,
-          TALLY_PREAMBLE_SYMBOLS, TALLY_REFRESH_MS);
+          TALLY_PREAMBLE_SYMBOLS, TALLY_TX_POWER, TALLY_REFRESH_MS);
 #ifdef LORA_TEST_MODE
   hublogf("[CFG] LORA_TEST_MODE active — ATEM disabled, cam1 toggle stream\n");
 #endif
@@ -547,12 +556,17 @@ static void handleSerialCommand(const String &cmd) {
   if (cmd == "status") {
     uint8_t qDepth =
         (g_loraQueueHead + LORA_QUEUE_SIZE - g_loraQueueTail) % LORA_QUEUE_SIZE;
+    char ipbuf[20];
+    if (WiFi.status() == WL_CONNECTED)
+      snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", WiFi.localIP()[0],
+               WiFi.localIP()[1], WiFi.localIP()[2], WiFi.localIP()[3]);
+    else
+      strcpy(ipbuf, "DOWN");
     hublogf("[STATUS] up=%lus radio=%s(0x%02X) tx=%lu drop=%lu q=%u "
             "wifi=%s atem=%s prog=0x%04X prev=0x%04X\n",
-            millis() / 1000, radio.isConnected() ? "OK" : "DEAD",
-            radio.getChipStatus(), g_loraTxCount, g_loraDropCount, qDepth,
-            WiFi.status() == WL_CONNECTED ? ipToStr(WiFi.localIP()).c_str()
-                                          : "DOWN",
+            (unsigned long)(millis() / 1000), radio.isConnected() ? "OK" : "DEAD",
+            radio.getChipStatus(), (unsigned long)g_loraTxCount,
+            (unsigned long)g_loraDropCount, qDepth, ipbuf,
             atemPhase == ATEM_RUNNING      ? "RUNNING"
             : atemPhase == ATEM_CONNECTING ? "CONNECTING"
                                            : "IDLE",
@@ -628,12 +642,14 @@ void loop() {
     g_progMask = 0;
     g_prevMask = 0;
     for (int i = 0; i < 8; i++) {
-      uint8_t idx0 = TALLY_INPUTS[i] - 1;
       uint8_t human = TALLY_INPUTS[i];
+      if (human < 1 || human > 16)
+        continue; // out-of-range entry would make the bit shift below UB
+      uint8_t idx0 = human - 1;
       if (atem->isOnAir(idx0))
-        g_progMask |= (1U << (human - 1));
+        g_progMask |= (1U << idx0);
       if (atem->isPreview(idx0))
-        g_prevMask |= (1U << (human - 1));
+        g_prevMask |= (1U << idx0);
     }
   }
 #endif
@@ -649,7 +665,18 @@ void loop() {
     lastSentProg = g_progMask;
     lastSentPrev = g_prevMask;
     lastStateSend = millis();
-    enqueueLora(TallyProtocol::createStateAllPacket(g_progMask, g_prevMask));
+    TallyPacket pkt = TallyProtocol::createStateAllPacket(g_progMask, g_prevMask);
+    // Burst-on-change: a tally transition ("camera goes ON AIR") is otherwise a
+    // single fire-and-forget packet; one RF collision would show the wrong
+    // light until the next heartbeat (up to TALLY_REFRESH_MS). Sending the
+    // change 3x (queued, ~2ms apart) drops the residual loss from p to ~p^3 and
+    // cuts worst-case wrong-light latency from ~500ms to tens of ms. Heartbeats
+    // (no change) send once — slaves act on STATE_ALL idempotently.
+    enqueueLora(pkt);
+    if (masksChanged) {
+      enqueueLora(pkt);
+      enqueueLora(pkt);
+    }
   }
 
   pollSerialCommands();
@@ -701,8 +728,10 @@ void loop() {
   static bool drawnConnected = false;
 
   // ⚡ Bolt: Prevent slow, blocking I2C screen updates during high-priority
-  // non-blocking UI sequences (like LOCATOR).
-  bool uiActive = (locatorStep > 0);
+  // non-blocking UI sequences (like LOCATOR). Also skip the blit while a TX is
+  // in flight: a ~23ms full-frame I2C blit would otherwise defer checkTxDone()
+  // (PA-off) and the next packet by that much. The redraw runs next pass.
+  bool uiActive = (locatorStep > 0) || radio.txActive();
   bool connected = (atemPhase == ATEM_RUNNING);
 
   if (!uiActive) {
