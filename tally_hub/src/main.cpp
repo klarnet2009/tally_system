@@ -54,10 +54,20 @@ static bool radioInit() {
   bool ok = radio.begin(E28_PIN_SCK, E28_PIN_MISO, E28_PIN_MOSI, E28_PIN_NSS,
                         E28_PIN_BUSY, E28_PIN_DIO1, E28_PIN_RESET, E28_PIN_RXEN,
                         E28_PIN_TXEN);
-  if (ok)
+  if (ok) {
     tallyApplyRadioProfile(radio);
+    radio.startReceive(); // listen for slave telemetry between TX bursts
+  }
   return ok;
 }
+
+// ===== Per-camera reachability (from slave CMD_TELEMETRY) =====
+// The hub is otherwise blind to whether a slave is actually lit; this closes
+// the loop. Indexed by camera ID 1..16.
+static uint32_t g_camLastSeen[17] = {0};
+static int8_t g_camRssi[17] = {0};
+static bool g_camReachable[17] = {false};
+#define CAM_REACHABLE_MS (3 * TALLY_TELEMETRY_MS) // missed ~3 telemetry beats
 
 // ⚡ Bolt: Non-blocking transmission queue to prevent delay() stalls in main loop
 #define LORA_QUEUE_SIZE 16
@@ -89,6 +99,9 @@ static void processLoraQueue() {
       else
         g_loraDropCount++;
       lastTxDoneTime = millis();
+      // Back to listening when the queue is drained (TX pulls us out of RX)
+      if (g_loraQueueHead == g_loraQueueTail)
+        radio.startReceive();
     }
     return;
   }
@@ -107,6 +120,45 @@ static void processLoraQueue() {
       if (radio.startSend(buf, TALLY_PACKET_SIZE)) {
         g_loraQueueTail = (g_loraQueueTail + 1) % LORA_QUEUE_SIZE;
       }
+    }
+  }
+}
+
+// Receive slave telemetry during idle (non-TX) windows and update the
+// reachability table. Cheap: one available() check per loop, a receive only
+// when a frame is waiting.
+static void serviceTelemetry() {
+  if (radio.txActive() || !radio.isConnected())
+    return;
+  if (!radio.available())
+    return;
+  uint8_t buf[TALLY_PACKET_SIZE];
+  uint8_t len = radio.receive(buf, TALLY_PACKET_SIZE);
+  radio.startReceive(); // re-arm for the next frame
+  if (len == 0)
+    return;
+  TallyPacket pkt;
+  if (!TallyProtocol::deserialize(buf, len, pkt))
+    return;
+  if (TallyProtocol::cmdCode(pkt) == CMD_TELEMETRY) {
+    uint8_t id = pkt.aux;
+    if (id >= 1 && id <= 16) {
+      g_camLastSeen[id] = millis();
+      g_camRssi[id] = TallyProtocol::telemetryRssi(pkt);
+    }
+  }
+}
+
+// Mark cameras online/offline and log only the transitions (not every beat),
+// so a dead/returning slave is visible without log spam.
+static void sweepReachability() {
+  for (uint8_t id = 1; id <= 16; id++) {
+    bool reach = g_camLastSeen[id] != 0 &&
+                 (millis() - g_camLastSeen[id] < CAM_REACHABLE_MS);
+    if (reach != g_camReachable[id]) {
+      g_camReachable[id] = reach;
+      hublogf("[TLM] cam %u %s (rssi=%d)\n", id, reach ? "ONLINE" : "OFFLINE",
+              g_camRssi[id]);
     }
   }
 }
@@ -562,15 +614,19 @@ static void handleSerialCommand(const String &cmd) {
                WiFi.localIP()[1], WiFi.localIP()[2], WiFi.localIP()[3]);
     else
       strcpy(ipbuf, "DOWN");
+    uint16_t reachMask = 0;
+    for (uint8_t id = 1; id <= 16; id++)
+      if (g_camReachable[id])
+        reachMask |= (1U << (id - 1));
     hublogf("[STATUS] up=%lus radio=%s(0x%02X) tx=%lu drop=%lu q=%u "
-            "wifi=%s atem=%s prog=0x%04X prev=0x%04X\n",
+            "wifi=%s atem=%s prog=0x%04X prev=0x%04X reach=0x%04X\n",
             (unsigned long)(millis() / 1000), radio.isConnected() ? "OK" : "DEAD",
             radio.getChipStatus(), (unsigned long)g_loraTxCount,
             (unsigned long)g_loraDropCount, qDepth, ipbuf,
             atemPhase == ATEM_RUNNING      ? "RUNNING"
             : atemPhase == ATEM_CONNECTING ? "CONNECTING"
                                            : "IDLE",
-            g_progMask, g_prevMask);
+            g_progMask, g_prevMask, reachMask);
   } else if (cmd == "ping") {
     if (locatorStep == 0) {
       hublogf("[CMD] locator ping -> cam 1\n");
@@ -600,6 +656,8 @@ static void pollSerialCommands() {
 
 void loop() {
   processLoraQueue();
+  serviceTelemetry();  // receive slave telemetry in idle windows
+  sweepReachability(); // log cameras going online/offline
 
   // Radio recovery: re-init every 10s while disconnected (begin() bails out
   // in ~150ms when the module is absent, so this stays affordable)
