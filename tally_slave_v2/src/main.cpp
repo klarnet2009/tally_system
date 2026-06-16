@@ -103,12 +103,32 @@ void armReceive() {
 #endif
 }
 
+// Buzzer policy: never sound while the camera is ON AIR — a live mic would
+// capture the tone. -DTALLY_QUIET disables the buzzer entirely for
+// sound-sensitive productions. Visual indications always fire.
+static bool buzzerAllowed() {
+#ifdef TALLY_QUIET
+  return false;
+#else
+  TallyState s = tallyLink.state();
+  return s != STATE_PROGRAM && s != STATE_BOTH;
+#endif
+}
+static void buzzOn(int freq) {
+  if (buzzerAllowed())
+    tone(PIN_BUZZER, freq);
+}
+static void buzzPulse(int freq, int durMs) { // non-blocking
+  if (buzzerAllowed())
+    tone(PIN_BUZZER, freq, durMs);
+}
+
 void startLocator() {
   locatorActive = true;
   locatorStart = millis();
   locatorPhaseOn = true;
   setColor(COLOR_PING, 200);
-  tone(PIN_BUZZER, 2400);
+  buzzOn(2400);
 }
 
 void updateLocator() {
@@ -134,7 +154,7 @@ void updateLocator() {
     locatorPhaseOn = on;
     if (on) {
       setColor(COLOR_PING, 200);
-      tone(PIN_BUZZER, 2400);
+      buzzOn(2400);
     } else {
       setColor(COLOR_OFF);
       noTone(PIN_BUZZER);
@@ -157,7 +177,7 @@ void onLocatorPing() {
 void onLinkChange(bool lost) {
   if (lost) {
     Serial.println("[WARN] Signal lost!");
-    tone(PIN_BUZZER, 800, 300); // non-blocking beep
+    buzzPulse(800, 300);
   } else {
     Serial.println("[LINK] Signal restored");
     if (!locatorActive)
@@ -217,28 +237,29 @@ void setup() {
                         PIN_LORA_NSS, PIN_LORA_BUSY, PIN_LORA_DIO1,
                         PIN_LORA_NRESET, PIN_LORA_RXEN, PIN_LORA_TXEN);
 
-  if (!ok) {
-    Serial.printf("FAILED: %s\n", radio.initErrorStr());
-    beep(400, 500);
-    while (1) {
-      setColor(COLOR_INIT_FAIL, 100);
-      delay(100);
-      setColor(COLOR_OFF);
-      delay(100);
-    }
+  if (ok) {
+    Serial.println("OK");
+    flashColor(COLOR_INIT_OK, 3, 150, 100);
+    beep(1000, 100);
+    tallyApplyRadioProfile(radio);
+  } else {
+    // Non-terminal: instead of trapping the operator on a forever-blink that
+    // needs a manual power-cycle, fall through to loop() — tryRadioRecover()
+    // re-inits every 10s (the slave has a real reset line) and the signal-lost
+    // indication shows "not working" until it heals. A warm-boot module that
+    // came up slow/wedged then self-recovers.
+    Serial.printf("FAILED: %s — retrying in loop()\n", radio.initErrorStr());
+    beep(400, 200);
   }
-
-  Serial.println("OK");
-  flashColor(COLOR_INIT_OK, 3, 150, 100);
-  beep(1000, 100);
-
-  tallyApplyRadioProfile(radio);
 
   tallyLink.begin(SLAVE_CAM_ID, onTallyState, onLocatorPing, onLinkChange);
 
+  // ISR only sets a flag, harmless even if the radio is down; if recovery
+  // brings it up later RX still works (the loop also polls DIO1 level).
   attachInterrupt(digitalPinToInterrupt(PIN_LORA_DIO1), onDio1, RISING);
-  armReceive();
-  Serial.println("[LoRa] Listening...");
+  if (ok)
+    armReceive();
+  Serial.println(ok ? "[LoRa] Listening..." : "[LoRa] Waiting for radio...");
 }
 
 // ===== LOOP =====
@@ -249,8 +270,6 @@ void loop() {
   // === RX: interrupt-driven (no SPI polling — under POWER_SAVE any NSS
   // activity during the radio's sleep phase would silently kill the cycle)
   if (g_dio1Flag || digitalRead(PIN_LORA_DIO1) == HIGH) {
-    g_dio1Flag = false;
-
     // Bounded drain: a second packet can complete while we process the first
     // (continuous RX keeps receiving); re-checking available() before the
     // re-arm closes the window where its RxDone would be wiped by the IRQ
@@ -276,6 +295,11 @@ void loop() {
     }
     // Unconditional re-arm: RxDone (even a CRC error) ends the duty cycle
     radio.rearmAfterIrq();
+    // Clear the flag AFTER re-arming: if DIO1 fires during the re-arm's
+    // standby→SET_RX SPI sequence, the flag stays set and we re-enter next
+    // loop (a harmless duplicate pass gated by available()) instead of
+    // losing that packet to the re-arm's IRQ clear.
+    g_dio1Flag = false;
   }
 
   // === LINK SUPERVISION (hub broadcasts every TALLY_REFRESH_MS) ===
@@ -290,11 +314,11 @@ void loop() {
       pulseOn = !pulseOn;
       setColor(pulseOn ? COLOR_LOST : COLOR_OFF, 60);
     }
-    // Short beep every 5 seconds
+    // Short beep every 5 seconds (suppressed if the held state is ON AIR)
     static uint32_t lastLostBeep = 0;
     if (millis() - lastLostBeep > 5000) {
       lastLostBeep = millis();
-      tone(PIN_BUZZER, 600, 100);
+      buzzPulse(600, 100);
     }
   }
 
@@ -312,8 +336,9 @@ void loop() {
   if (millis() - lastHeartbeat > 10000) {
     lastHeartbeat = millis();
     Serial.printf("[STATUS] Up:%lus State:%d LastRX:%lus ago RX:%lu Fail:%lu\n",
-                  millis() / 1000, tallyLink.state(), tallyLink.msSinceLastRx() / 1000,
-                  rxCount, rxFails);
+                  (unsigned long)(millis() / 1000), (int)tallyLink.state(),
+                  (unsigned long)(tallyLink.msSinceLastRx() / 1000),
+                  (unsigned long)rxCount, (unsigned long)rxFails);
     rxCount = 0;
     rxFails = 0;
   }
@@ -338,7 +363,7 @@ void loop() {
       tallyLink.forceState(STATE_OFF);
       applyTallyColor();
     } else if (cmd == "beep") {
-      beep(1000, 200);
+      tone(PIN_BUZZER, 1000, 200); // non-blocking; diagnostic, bypasses policy
     } else if (cmd == "help") {
       Serial.println("Commands: test, red, green, off, beep, help");
     }
