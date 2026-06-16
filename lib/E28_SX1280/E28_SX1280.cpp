@@ -70,9 +70,13 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
 
   digitalWrite(_pinNSS, HIGH);
 
-  // Initialize SPI with CALLER-provided pins
+  // Initialize SPI with CALLER-provided pins. The SX1280 requires MODE0
+  // (CPOL=0/CPHA=0); assert it explicitly instead of relying on the Arduino
+  // default. The bus is dedicated to the radio, so configuring it once here
+  // (the HW retains mode/bitorder/clock until changed) is sufficient.
   SPI.begin(sck, miso, mosi, _pinNSS);
-  SPI.setFrequency(8000000); // 8 MHz
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  SPI.endTransaction();
 
   // Reset the module
   reset();
@@ -149,6 +153,14 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
   };
   writeCommand(SX1280_CMD_SET_DIO_IRQ_PARAMS, irqParams, 8);
 
+  // A BUSY timeout anywhere in the config block above flips _connected false
+  // (and writeCommand then no-ops the rest). Treat that as a failed init so the
+  // caller's retry re-resets the chip rather than running with half a config.
+  if (!_connected) {
+    _initError = E28_ERR_BUSY_STUCK;
+    return false;
+  }
+
   // Verify chip is connected via GetStatus
   uint8_t status = getChipStatus();
   // SPI returns 0xFF (all high) or 0x00 if no chip connected
@@ -214,6 +226,11 @@ bool E28Radio::waitBusyFor(uint32_t timeoutMs) {
 }
 
 void E28Radio::writeCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
+  // Abort if a prior BUSY timeout already declared the chip gone: clocking
+  // more bytes into a wedged module only leaves it half-configured. begin()
+  // re-validates _connected after the config block and re-resets on failure.
+  if (!_connected)
+    return;
   waitBusy();
 
   digitalWrite(_pinNSS, LOW);
@@ -241,6 +258,8 @@ void E28Radio::writeCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
 }
 
 void E28Radio::readCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
+  if (!_connected)
+    return;
   waitBusy();
 
   digitalWrite(_pinNSS, LOW);

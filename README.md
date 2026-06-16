@@ -5,9 +5,11 @@ This project implements a wireless Tally Light system using ESP32 microcontrolle
 ## Project Structure
 
 - **tally_hub/**: Firmware for the Master Controller (ESP32-S3 + E28-2G4M27S + OLED).
-- **tally_slave/**: Firmware for Receiver Units (ESP32-C3 SuperMini + E28-2G4M12SX).
-- **lib/**: Shared drivers (E28_SX1280, TallyProtocol) used by all projects via `lib_extra_dirs`.
+- **tally_slave_v2/**: **Primary** receiver firmware (ESP32-C3 SuperMini + E28-2G4M12SX, WS2812B + buzzer). See `tally_slave_v2/src/pins.h` and `tally_slave_v2/HARDWARE_GUIDE.md`.
+- **tally_slave/**: Legacy mono-LED receiver firmware (different, older pinout — do not wire a v2 board to it).
+- **lib/**: Shared drivers (E28_SX1280, TallyProtocol, TallyLink) used by all projects via `lib_extra_dirs`.
 - **documentation/**: Wiring diagrams and pinouts.
+- **DEBUGGING.md**: Debug surfaces (serial consoles, log lines, commands, LED/beep codes) and init-error triage.
 
 ## Hardware Setup
 
@@ -17,11 +19,12 @@ This project implements a wireless Tally Light system using ESP32 microcontrolle
 - **Display**: SSD1306 OLED (I2C)
 - **Pinout**: See `tally_hub/src/config.h` or documentation.
 
-### Slave (Receiver)
+### Slave (Receiver) — v2, primary
 - **Controller**: ESP32-C3 SuperMini
 - **Radio**: E28-2G4M12SX (Low Power)
-- **Feedback**: Built-in LED (GPIO 8) + External Tally LED.
-- **Pinout**: See `tally_slave/src/main.cpp` or `documentation/wiring_slave.svg`.
+- **Feedback**: WS2812B RGB LED (GPIO 7) + buzzer (GPIO 8).
+- **Pinout**: See `tally_slave_v2/src/pins.h` (single source of truth) and `tally_slave_v2/HARDWARE_GUIDE.md`.
+  The legacy `tally_slave/` firmware uses a different older pinout — don't cross them.
 
 ## Building & Flashing
 

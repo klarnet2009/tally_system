@@ -7,6 +7,7 @@
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <esp_system.h> // esp_reset_reason()
 
 #include "AtemClientAdapter.h"
 #include "E28_SX1280.h"
@@ -23,7 +24,7 @@ static uint32_t g_loraDropCount = 0; // Packets lost: queue overflow / radio / T
 // Serial0 = UART0 via the devkit's USB bridge (GPIO43/44). Neither touches
 // the E28 pins. Log to both so whichever cable is plugged in shows logs.
 static void hublogf(const char *fmt, ...) {
-  char buf[160];
+  char buf[256]; // worst-case [STATUS] line is ~127 chars; headroom for growth
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -53,10 +54,20 @@ static bool radioInit() {
   bool ok = radio.begin(E28_PIN_SCK, E28_PIN_MISO, E28_PIN_MOSI, E28_PIN_NSS,
                         E28_PIN_BUSY, E28_PIN_DIO1, E28_PIN_RESET, E28_PIN_RXEN,
                         E28_PIN_TXEN);
-  if (ok)
+  if (ok) {
     tallyApplyRadioProfile(radio);
+    radio.startReceive(); // listen for slave telemetry between TX bursts
+  }
   return ok;
 }
+
+// ===== Per-camera reachability (from slave CMD_TELEMETRY) =====
+// The hub is otherwise blind to whether a slave is actually lit; this closes
+// the loop. Indexed by camera ID 1..16.
+static uint32_t g_camLastSeen[17] = {0};
+static int8_t g_camRssi[17] = {0};
+static bool g_camReachable[17] = {false};
+#define CAM_REACHABLE_MS (3 * TALLY_TELEMETRY_MS) // missed ~3 telemetry beats
 
 // ⚡ Bolt: Non-blocking transmission queue to prevent delay() stalls in main loop
 #define LORA_QUEUE_SIZE 16
@@ -88,6 +99,9 @@ static void processLoraQueue() {
       else
         g_loraDropCount++;
       lastTxDoneTime = millis();
+      // Back to listening when the queue is drained (TX pulls us out of RX)
+      if (g_loraQueueHead == g_loraQueueTail)
+        radio.startReceive();
     }
     return;
   }
@@ -106,6 +120,45 @@ static void processLoraQueue() {
       if (radio.startSend(buf, TALLY_PACKET_SIZE)) {
         g_loraQueueTail = (g_loraQueueTail + 1) % LORA_QUEUE_SIZE;
       }
+    }
+  }
+}
+
+// Receive slave telemetry during idle (non-TX) windows and update the
+// reachability table. Cheap: one available() check per loop, a receive only
+// when a frame is waiting.
+static void serviceTelemetry() {
+  if (radio.txActive() || !radio.isConnected())
+    return;
+  if (!radio.available())
+    return;
+  uint8_t buf[TALLY_PACKET_SIZE];
+  uint8_t len = radio.receive(buf, TALLY_PACKET_SIZE);
+  radio.startReceive(); // re-arm for the next frame
+  if (len == 0)
+    return;
+  TallyPacket pkt;
+  if (!TallyProtocol::deserialize(buf, len, pkt))
+    return;
+  if (TallyProtocol::cmdCode(pkt) == CMD_TELEMETRY) {
+    uint8_t id = pkt.aux;
+    if (id >= 1 && id <= 16) {
+      g_camLastSeen[id] = millis();
+      g_camRssi[id] = TallyProtocol::telemetryRssi(pkt);
+    }
+  }
+}
+
+// Mark cameras online/offline and log only the transitions (not every beat),
+// so a dead/returning slave is visible without log spam.
+static void sweepReachability() {
+  for (uint8_t id = 1; id <= 16; id++) {
+    bool reach = g_camLastSeen[id] != 0 &&
+                 (millis() - g_camLastSeen[id] < CAM_REACHABLE_MS);
+    if (reach != g_camReachable[id]) {
+      g_camReachable[id] = reach;
+      hublogf("[TLM] cam %u %s (rssi=%d)\n", id, reach ? "ONLINE" : "OFFLINE",
+              g_camRssi[id]);
     }
   }
 }
@@ -317,11 +370,15 @@ void drawTallyGrid(uint16_t progMask, uint16_t prevMask) {
   for (int r = 0; r < rows; r++) {
     for (int c = 0; c < cols; c++) {
       int idx = r * cols + c;
-      uint16_t bit = 1U << (TALLY_INPUTS[idx] - 1);
-      uint8_t status = (progMask & bit) ? 2 : ((prevMask & bit) ? 1 : 0);
+      uint8_t human = TALLY_INPUTS[idx];
+      uint8_t status = 0;
+      if (human >= 1 && human <= 16) { // guard the bit shift against bad config
+        uint16_t bit = 1U << (human - 1);
+        status = (progMask & bit) ? 2 : ((prevMask & bit) ? 1 : 0);
+      }
       int x = c * cellW;
       int y = yOff + r * cellH;
-      drawCell(x, y, cellW, cellH, TALLY_INPUTS[idx], status);
+      drawCell(x, y, cellW, cellH, human, status);
     }
   }
 }
@@ -487,9 +544,13 @@ void setup() {
   pinMode(0, INPUT_PULLUP); // Boot button for locator
 
   hublogf("\n=== Tally HUB (ESP32-S3 + E28-2G4M27S) ===\n");
-  hublogf("[CFG] netId=0x%02X freq=%lu preamble=%d refresh=%dms\n",
+  // Reset reason turns "module not connected after a warm reboot" from a
+  // guess into a fact: ESP_RST_BROWNOUT after a TX storm = the PA/WiFi rail
+  // is sagging (decouple it), vs ESP_RST_SW/POWERON = ordinary boot.
+  hublogf("[BOOT] reset_reason=%d\n", (int)esp_reset_reason());
+  hublogf("[CFG] netId=0x%02X freq=%lu preamble=%d power=%d refresh=%dms\n",
           TALLY_NET_ID, (unsigned long)TALLY_RF_FREQ_HZ,
-          TALLY_PREAMBLE_SYMBOLS, TALLY_REFRESH_MS);
+          TALLY_PREAMBLE_SYMBOLS, TALLY_TX_POWER, TALLY_REFRESH_MS);
 #ifdef LORA_TEST_MODE
   hublogf("[CFG] LORA_TEST_MODE active — ATEM disabled, cam1 toggle stream\n");
 #endif
@@ -547,16 +608,25 @@ static void handleSerialCommand(const String &cmd) {
   if (cmd == "status") {
     uint8_t qDepth =
         (g_loraQueueHead + LORA_QUEUE_SIZE - g_loraQueueTail) % LORA_QUEUE_SIZE;
+    char ipbuf[20];
+    if (WiFi.status() == WL_CONNECTED)
+      snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", WiFi.localIP()[0],
+               WiFi.localIP()[1], WiFi.localIP()[2], WiFi.localIP()[3]);
+    else
+      strcpy(ipbuf, "DOWN");
+    uint16_t reachMask = 0;
+    for (uint8_t id = 1; id <= 16; id++)
+      if (g_camReachable[id])
+        reachMask |= (1U << (id - 1));
     hublogf("[STATUS] up=%lus radio=%s(0x%02X) tx=%lu drop=%lu q=%u "
-            "wifi=%s atem=%s prog=0x%04X prev=0x%04X\n",
-            millis() / 1000, radio.isConnected() ? "OK" : "DEAD",
-            radio.getChipStatus(), g_loraTxCount, g_loraDropCount, qDepth,
-            WiFi.status() == WL_CONNECTED ? ipToStr(WiFi.localIP()).c_str()
-                                          : "DOWN",
+            "wifi=%s atem=%s prog=0x%04X prev=0x%04X reach=0x%04X\n",
+            (unsigned long)(millis() / 1000), radio.isConnected() ? "OK" : "DEAD",
+            radio.getChipStatus(), (unsigned long)g_loraTxCount,
+            (unsigned long)g_loraDropCount, qDepth, ipbuf,
             atemPhase == ATEM_RUNNING      ? "RUNNING"
             : atemPhase == ATEM_CONNECTING ? "CONNECTING"
                                            : "IDLE",
-            g_progMask, g_prevMask);
+            g_progMask, g_prevMask, reachMask);
   } else if (cmd == "ping") {
     if (locatorStep == 0) {
       hublogf("[CMD] locator ping -> cam 1\n");
@@ -586,6 +656,8 @@ static void pollSerialCommands() {
 
 void loop() {
   processLoraQueue();
+  serviceTelemetry();  // receive slave telemetry in idle windows
+  sweepReachability(); // log cameras going online/offline
 
   // Radio recovery: re-init every 10s while disconnected (begin() bails out
   // in ~150ms when the module is absent, so this stays affordable)
@@ -628,12 +700,14 @@ void loop() {
     g_progMask = 0;
     g_prevMask = 0;
     for (int i = 0; i < 8; i++) {
-      uint8_t idx0 = TALLY_INPUTS[i] - 1;
       uint8_t human = TALLY_INPUTS[i];
+      if (human < 1 || human > 16)
+        continue; // out-of-range entry would make the bit shift below UB
+      uint8_t idx0 = human - 1;
       if (atem->isOnAir(idx0))
-        g_progMask |= (1U << (human - 1));
+        g_progMask |= (1U << idx0);
       if (atem->isPreview(idx0))
-        g_prevMask |= (1U << (human - 1));
+        g_prevMask |= (1U << idx0);
     }
   }
 #endif
@@ -649,7 +723,27 @@ void loop() {
     lastSentProg = g_progMask;
     lastSentPrev = g_prevMask;
     lastStateSend = millis();
-    enqueueLora(TallyProtocol::createStateAllPacket(g_progMask, g_prevMask));
+    // sourceLive: in production, true only while ATEM is actually connected
+    // (frozen masks after an ATEM drop are flagged stale so slaves can warn);
+    // in test mode the generated stream is always "live".
+#ifdef LORA_TEST_MODE
+    bool sourceLive = true;
+#else
+    bool sourceLive = (atemPhase == ATEM_RUNNING);
+#endif
+    TallyPacket pkt =
+        TallyProtocol::createStateAllPacket(g_progMask, g_prevMask, sourceLive);
+    // Burst-on-change: a tally transition ("camera goes ON AIR") is otherwise a
+    // single fire-and-forget packet; one RF collision would show the wrong
+    // light until the next heartbeat (up to TALLY_REFRESH_MS). Sending the
+    // change 3x (queued, ~2ms apart) drops the residual loss from p to ~p^3 and
+    // cuts worst-case wrong-light latency from ~500ms to tens of ms. Heartbeats
+    // (no change) send once — slaves act on STATE_ALL idempotently.
+    enqueueLora(pkt);
+    if (masksChanged) {
+      enqueueLora(pkt);
+      enqueueLora(pkt);
+    }
   }
 
   pollSerialCommands();
@@ -701,8 +795,10 @@ void loop() {
   static bool drawnConnected = false;
 
   // ⚡ Bolt: Prevent slow, blocking I2C screen updates during high-priority
-  // non-blocking UI sequences (like LOCATOR).
-  bool uiActive = (locatorStep > 0);
+  // non-blocking UI sequences (like LOCATOR). Also skip the blit while a TX is
+  // in flight: a ~23ms full-frame I2C blit would otherwise defer checkTxDone()
+  // (PA-off) and the next packet by that much. The redraw runs next pass.
+  bool uiActive = (locatorStep > 0) || radio.txActive();
   bool connected = (atemPhase == ATEM_RUNNING);
 
   if (!uiActive) {

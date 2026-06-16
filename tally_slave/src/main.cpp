@@ -57,13 +57,24 @@ void updateLed() {
         }
     }
 
-    // 2. Signal lost: slow blink so the operator knows the state is stale
+    // 2. Signal lost (radio dead): even slow blink — state is stale.
     if (tallyLink.signalLost()) {
         if (now - lastLedToggle >= 500) {
             lastLedToggle = now;
             ledIsOn = !ledIsOn;
             digitalWrite(PIN_LED, ledIsOn ? LED_ON : LED_OFF);
         }
+        return;
+    }
+
+    // 2b. Source stale (link alive, ATEM frozen): a distinct double-blink
+    // per second, so the operator can tell "switcher frozen" from both a
+    // steady tally and the even signal-lost blink.
+    if (tallyLink.sourceStale()) {
+        uint32_t ph = now % 1000;
+        bool on = (ph < 80) || (ph >= 160 && ph < 240);
+        digitalWrite(PIN_LED, on ? LED_ON : LED_OFF);
+        ledIsOn = on;
         return;
     }
 
@@ -112,24 +123,26 @@ void setup() {
     // LoRa Setup
     Serial.print("LoRa Init... ");
     // Init with explicit pins for C3
-    if (radio.begin(SLAVE_PIN_SCK, SLAVE_PIN_MISO, SLAVE_PIN_MOSI,
-                    SLAVE_PIN_NSS, SLAVE_PIN_BUSY, SLAVE_PIN_DIO1,
-                    SLAVE_PIN_RESET, SLAVE_PIN_RXEN, SLAVE_PIN_TXEN)) {
+    bool ok = radio.begin(SLAVE_PIN_SCK, SLAVE_PIN_MISO, SLAVE_PIN_MOSI,
+                          SLAVE_PIN_NSS, SLAVE_PIN_BUSY, SLAVE_PIN_DIO1,
+                          SLAVE_PIN_RESET, SLAVE_PIN_RXEN, SLAVE_PIN_TXEN);
+    if (ok) {
         Serial.println("OK");
         // Blink LED to confirm init
         for(int i=0; i<3; i++) { digitalWrite(PIN_LED, LED_ON); delay(100); digitalWrite(PIN_LED, LED_OFF); delay(100); }
+        tallyApplyRadioProfile(radio);
     } else {
-        Serial.printf("FAILED: %s\n", radio.initErrorStr());
-        // Fast blink error
-        while(1) { digitalWrite(PIN_LED, LED_ON); delay(50); digitalWrite(PIN_LED, LED_OFF); delay(50); }
+        // Non-terminal: fall through to loop() so tryRadioRecover() re-inits
+        // every 10s instead of trapping in a forever-blink (the old while(1))
+        // that needed a manual power-cycle. Signal-lost blink shows "not working".
+        Serial.printf("FAILED: %s - retrying in loop()\n", radio.initErrorStr());
     }
-
-    tallyApplyRadioProfile(radio);
 
     tallyLink.begin(SLAVE_CAM_ID, onTallyState, onLocatorPing, onLinkChange);
 
     // Set to RX mode
-    radio.startReceive();
+    if (ok)
+        radio.startReceive();
 }
 
 // Re-init the radio if a runtime fault (stuck BUSY) latched it disconnected,

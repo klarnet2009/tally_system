@@ -11,6 +11,7 @@
 static inline void tallyApplyRadioProfile(E28Radio &radio) {
   radio.setFrequency(TALLY_RF_FREQ_HZ);
   radio.setPreambleLength(TALLY_PREAMBLE_SYMBOLS);
+  radio.setTxPower(TALLY_TX_POWER); // was never applied by the hub before
 }
 
 #endif // TALLY_RADIO_H
