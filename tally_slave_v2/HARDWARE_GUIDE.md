@@ -164,7 +164,7 @@ python -m platformio device monitor -p COM3 -b 115200
 4. **[4/4] SX1281 LoRa** — 3 этапа:
    - **[A] SPI Status** — GetStatus, ожидается 0x40
    - **[B] Buffer Write/Read** — записывает `0xDEADBEEF`, читает обратно
-   - **[C] Radio Config** — Standby, LoRa mode, 2.402GHz
+   - **[C] Radio Config** — Standby, LoRa mode, 2480 MHz (production profile)
 
 ---
 
@@ -196,9 +196,11 @@ ReadBuffer:   TX: 1B offset 00 data0 data1 ...
 ```
 SetStandby     → STDBY_RC (0x00)
 SetPacketType  → LoRa (0x01)
-SetRfFrequency → 2.402 GHz (0xB8, 0xE3, 0x4C)
-SetModParams   → SF7, BW1600, CR 4/5
+SetRfFrequency → 2480 MHz   (TALLY_RF_FREQ_HZ; bytes computed by setFrequency())
+SetModParams   → SF7, BW406.25kHz (LORA_BW_0400), CR 4/5
 ```
+Note: the production RF profile (frequency, preamble, TX power) lives in
+`lib/TallyProtocol/TallyConfig.h` and is applied via `tallyApplyRadioProfile()`.
 
 ---
 
