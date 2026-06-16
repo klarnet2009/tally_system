@@ -23,4 +23,8 @@
 // Passive Buzzer
 #define PIN_BUZZER 8
 
+// BOOT button (held at power-up to enter camera-ID set mode; GPIO9 strapping
+// pin, safe to read after boot)
+#define PIN_BOOT 9
+
 #endif // SLAVE_V2_PINS_H

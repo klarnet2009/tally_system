@@ -12,6 +12,7 @@
 
 #include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
+#include <Preferences.h>
 #include <E28_SX1280.h>
 #include <TallyLink.h>
 #include <TallyProtocol.h>
@@ -20,9 +21,13 @@
 #include "pins.h"
 
 // ===== CONFIGURATION =====
+// Compile-time fallback only; the live camera ID is stored in NVS and set in
+// the field (BOOT button or serial "id N"), so ONE binary serves every camera.
 #ifndef SLAVE_CAM_ID
-#define SLAVE_CAM_ID 1 // Camera ID this slave responds to (-DSLAVE_CAM_ID=n)
+#define SLAVE_CAM_ID 1
 #endif
+
+static uint8_t g_camId = SLAVE_CAM_ID;
 
 // ===== COLORS =====
 #define COLOR_OFF 0x000000
@@ -177,6 +182,65 @@ void onLocatorPing() {
   startLocator();
 }
 
+// ===== Camera ID provisioning (NVS) =====
+// One universal binary: the camera ID lives in NVS, not the firmware image.
+// Set it in the field by holding BOOT at power-up (tap to count) or via the
+// serial "id N" command. SLAVE_CAM_ID is only the first-boot default.
+static uint8_t loadCamId() {
+  Preferences p;
+  p.begin("tally", true);
+  uint8_t id = p.getUChar("camid", SLAVE_CAM_ID);
+  p.end();
+  if (id < 1 || id > 16)
+    id = SLAVE_CAM_ID;
+  return id;
+}
+
+static void saveCamId(uint8_t id) {
+  Preferences p;
+  p.begin("tally", false);
+  p.putUChar("camid", id);
+  p.end();
+}
+
+// If BOOT is held at power-up, enter set-ID mode: each tap increments the
+// count (1..8, wraps), the LED flashes the count and the buzzer chirps; 3s of
+// inactivity commits to NVS. Blocking, but this only runs at boot on request.
+static uint8_t runSetIdModeIfRequested(uint8_t current) {
+  pinMode(PIN_BOOT, INPUT_PULLUP);
+  delay(20);
+  if (digitalRead(PIN_BOOT) == HIGH)
+    return current; // not held — normal boot
+
+  Serial.println("[CFG] Set-ID mode: tap BOOT to count (1..8), idle 3s to save");
+  while (digitalRead(PIN_BOOT) == LOW)
+    delay(10); // wait for the initial hold to release
+
+  uint8_t count = 0;
+  uint32_t lastActivity = millis();
+  while (millis() - lastActivity < 3000) {
+    if (digitalRead(PIN_BOOT) == LOW) {
+      delay(30); // debounce
+      if (digitalRead(PIN_BOOT) == LOW) {
+        count = (count >= 8) ? 1 : count + 1;
+        flashColor(COLOR_PING, count, 130, 130); // blink the count back
+        beep(1500, 80);
+        lastActivity = millis();
+        while (digitalRead(PIN_BOOT) == LOW)
+          delay(10); // wait for release
+      }
+    }
+    delay(10);
+  }
+  if (count >= 1 && count <= 16) {
+    saveCamId(count);
+    Serial.printf("[CFG] Saved camera ID = %d\n", count);
+    flashColor(COLOR_INIT_OK, 2, 200, 150);
+    return count;
+  }
+  return current;
+}
+
 void onLinkChange(bool lost) {
   if (lost) {
     Serial.println("[WARN] Signal lost!");
@@ -224,16 +288,25 @@ void setup() {
 
   Serial.begin(115200);
   delay(2000);
-  Serial.println("\n=============================");
-  Serial.println("  SUFIDE Tally Slave v2");
-  Serial.printf("  Camera ID: %d  NetID: 0x%02X\n", SLAVE_CAM_ID, TALLY_NET_ID);
-  Serial.println("=============================");
 
   led.begin();
   setColor(COLOR_OFF);
-
   pinMode(PIN_BUZZER, OUTPUT);
   noTone(PIN_BUZZER);
+
+  // Resolve camera ID from NVS (or the set-ID flow if BOOT is held)
+  g_camId = loadCamId();
+  g_camId = runSetIdModeIfRequested(g_camId);
+
+  Serial.println("\n=============================");
+  Serial.println("  SUFIDE Tally Slave v2");
+  Serial.printf("  Camera ID: %d  NetID: 0x%02X\n", g_camId, TALLY_NET_ID);
+#ifdef POWER_SAVE
+  Serial.println("  RX: duty-cycle (POWER_SAVE)");
+#else
+  Serial.println("  RX: continuous");
+#endif
+  Serial.println("=============================");
 
   Serial.print("[LoRa] Init... ");
   bool ok = radio.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI,
@@ -255,7 +328,7 @@ void setup() {
     beep(400, 200);
   }
 
-  tallyLink.begin(SLAVE_CAM_ID, onTallyState, onLocatorPing, onLinkChange);
+  tallyLink.begin(g_camId, onTallyState, onLocatorPing, onLinkChange);
 
   // ISR only sets a flag, harmless even if the radio is down; if recovery
   // brings it up later RX still works (the loop also polls DIO1 level).
@@ -358,6 +431,24 @@ void loop() {
     radio.restartReceive();
   }
 
+  // === TELEMETRY (slave -> hub): periodic so the hub knows this camera is
+  // reachable. Brief blocking TX of one frame, then re-arm RX. Jittered by
+  // camId so slaves don't all transmit in lockstep on the shared channel.
+  // (Not collision-free — a real fix would add CAD/LBT; fine for a small fleet
+  // at this rate. battery mV is 0/unknown until a VBAT sense divider is wired.)
+  static uint32_t lastTlm = 0;
+  uint32_t tlmInterval = TALLY_TELEMETRY_MS + (uint32_t)g_camId * 37;
+  if (radio.isConnected() && !locatorActive &&
+      millis() - lastTlm > tlmInterval) {
+    lastTlm = millis();
+    TallyPacket t = TallyProtocol::createTelemetryPacket(
+        g_camId, 0, radio.getRSSI(), TALLY_TLM_NO_BATTERY);
+    uint8_t buf[TALLY_PACKET_SIZE];
+    TallyProtocol::serialize(t, buf);
+    radio.send(buf, TALLY_PACKET_SIZE); // blocking, ~one packet airtime
+    radio.restartReceive();             // back to listening
+  }
+
   // Heartbeat: status log every 10 seconds
   if (millis() - lastHeartbeat > 10000) {
     lastHeartbeat = millis();
@@ -390,8 +481,18 @@ void loop() {
       applyTallyColor();
     } else if (cmd == "beep") {
       tone(PIN_BUZZER, 1000, 200); // non-blocking; diagnostic, bypasses policy
+    } else if (cmd.startsWith("id ")) {
+      int n = cmd.substring(3).toInt();
+      if (n >= 1 && n <= 16) {
+        saveCamId((uint8_t)n);
+        Serial.printf("[CFG] camId=%d saved — rebooting\n", n);
+        delay(200);
+        ESP.restart();
+      } else {
+        Serial.println("[CFG] id must be 1..16");
+      }
     } else if (cmd == "help") {
-      Serial.println("Commands: test, red, green, off, beep, help");
+      Serial.println("Commands: test, red, green, off, beep, id <1-16>, help");
     }
   }
 
