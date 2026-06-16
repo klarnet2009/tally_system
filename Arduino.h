@@ -8,6 +8,8 @@
 #define INPUT 0
 #define LOW 0
 #define HIGH 1
+#define MSBFIRST 1
+#define SPI_MODE0 0
 
 void pinMode(int, int);
 void digitalWrite(int, int);
@@ -17,10 +19,19 @@ void delayMicroseconds(int);
 uint32_t millis();
 void yield();
 
+// Mirror of the Arduino SPISettings used in real ESP32 builds (stub only).
+class SPISettings {
+public:
+    SPISettings(uint32_t, int, int) {}
+    SPISettings() {}
+};
+
 class SPIClass {
 public:
     void begin(int, int, int, int);
     void setFrequency(uint32_t);
+    void beginTransaction(SPISettings) {}
+    void endTransaction() {}
     uint8_t transfer(uint8_t);
     void writeBytes(uint8_t*, uint32_t);
     void transferBytes(uint8_t*, uint8_t*, uint32_t);

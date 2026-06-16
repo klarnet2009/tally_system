@@ -25,4 +25,16 @@
 #define TALLY_DC_RX_MS 3    // duty-cycle RX window
 #define TALLY_DC_SLEEP_MS 6 // duty-cycle sleep window (~33% radio-on)
 
+// SX1280 *chip* TX power in dBm (-18..+12). The E28-2G4M27S adds ~13-14 dB of
+// external PA gain on top, so this is NOT the radiated EIRP. Applied on every
+// (re)init via tallyApplyRadioProfile() so it can't silently default.
+// WARNING (regulatory): EU EN 300 328 caps 2.4 GHz SRD at +20 dBm EIRP. The
+// final radiated power must be measured/chosen deliberately — do NOT raise this
+// toward +12 (≈ +26 dBm at the antenna with this module) without (a) confirming
+// the legal EIRP for the deployment region and (b) the rail decoupling fix, or
+// the PA current spike browns out the shared 3V3 rail. Default kept low.
+#ifndef TALLY_TX_POWER
+#define TALLY_TX_POWER 1
+#endif
+
 #endif // TALLY_CONFIG_H
