@@ -57,13 +57,24 @@ void updateLed() {
         }
     }
 
-    // 2. Signal lost: slow blink so the operator knows the state is stale
+    // 2. Signal lost (radio dead): even slow blink — state is stale.
     if (tallyLink.signalLost()) {
         if (now - lastLedToggle >= 500) {
             lastLedToggle = now;
             ledIsOn = !ledIsOn;
             digitalWrite(PIN_LED, ledIsOn ? LED_ON : LED_OFF);
         }
+        return;
+    }
+
+    // 2b. Source stale (link alive, ATEM frozen): a distinct double-blink
+    // per second, so the operator can tell "switcher frozen" from both a
+    // steady tally and the even signal-lost blink.
+    if (tallyLink.sourceStale()) {
+        uint32_t ph = now % 1000;
+        bool on = (ph < 80) || (ph >= 160 && ph < 240);
+        digitalWrite(PIN_LED, on ? LED_ON : LED_OFF);
+        ledIsOn = on;
         return;
     }
 

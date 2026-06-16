@@ -30,7 +30,8 @@
 #define COLOR_PREVIEW 0x00FF00   // Green
 #define COLOR_BOTH 0xFFFF00      // Yellow
 #define COLOR_PING 0x0000FF      // Blue (locator flash)
-#define COLOR_LOST 0xFF4500      // Orange (signal lost)
+#define COLOR_LOST 0xFF4500      // Orange (radio signal lost)
+#define COLOR_STALE 0xFFFFFF     // White (tally source frozen — don't trust)
 #define COLOR_INIT_OK 0x00FF00   // Green
 #define COLOR_INIT_FAIL 0xFF0000 // Red
 
@@ -165,7 +166,9 @@ void updateLocator() {
 // ===== TallyLink presentation callbacks =====
 void onTallyState(TallyState ts) {
   Serial.printf("[TALLY] State:%d RSSI:%d\n", ts, radio.getRSSI());
-  if (!locatorActive && !tallyLink.signalLost())
+  // Only paint a solid colour when the light is trustworthy; otherwise the
+  // signal-lost / source-stale indications below own the LED.
+  if (!locatorActive && tallyLink.trustworthy())
     applyTallyColor();
 }
 
@@ -305,20 +308,43 @@ void loop() {
   // === LINK SUPERVISION (hub broadcasts every TALLY_REFRESH_MS) ===
   tallyLink.tick();
 
-  if (tallyLink.signalLost() && !locatorActive) {
-    // Pulse orange every second
-    static uint32_t lastPulse = 0;
-    static bool pulseOn = false;
-    if (millis() - lastPulse > 1000) {
-      lastPulse = millis();
-      pulseOn = !pulseOn;
-      setColor(pulseOn ? COLOR_LOST : COLOR_OFF, 60);
-    }
-    // Short beep every 5 seconds (suppressed if the held state is ON AIR)
-    static uint32_t lastLostBeep = 0;
-    if (millis() - lastLostBeep > 5000) {
-      lastLostBeep = millis();
-      buzzPulse(600, 100);
+  // === "DON'T TRUST THE LIGHT" indications (priority just below locator) ===
+  // signalLost  = radio link dead: orange pulse + periodic beep.
+  // sourceStale = link alive but the hub's ATEM source is frozen: hold the
+  //               last tally colour but blink WHITE over it, so the operator
+  //               sees the colour may be stale without losing the held state.
+  static bool wasUntrusted = false;
+  if (!locatorActive) {
+    if (tallyLink.signalLost()) {
+      wasUntrusted = true;
+      static uint32_t lastPulse = 0;
+      static bool pulseOn = false;
+      if (millis() - lastPulse > 1000) {
+        lastPulse = millis();
+        pulseOn = !pulseOn;
+        setColor(pulseOn ? COLOR_LOST : COLOR_OFF, 60);
+      }
+      static uint32_t lastLostBeep = 0;
+      if (millis() - lastLostBeep > 5000) {
+        lastLostBeep = millis();
+        buzzPulse(600, 100);
+      }
+    } else if (tallyLink.sourceStale()) {
+      wasUntrusted = true;
+      static uint32_t lastBlink = 0;
+      static bool whiteOn = false;
+      if (millis() - lastBlink > 400) {
+        lastBlink = millis();
+        whiteOn = !whiteOn;
+        if (whiteOn)
+          setColor(COLOR_STALE, 120);
+        else
+          applyTallyColor();
+      }
+    } else if (wasUntrusted) {
+      // Just regained trust — repaint the true colour once.
+      wasUntrusted = false;
+      applyTallyColor();
     }
   }
 
