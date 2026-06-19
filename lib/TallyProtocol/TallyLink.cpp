@@ -11,6 +11,15 @@ void TallyLink::begin(uint8_t cameraId, StateCallback onState,
 }
 
 bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
+    // ⚡ Bolt: Fast-path algorithmic early return. Inspect the target camera ID directly
+    // from the raw buffer for PING packets to bypass computationally expensive
+    // deserialization and CRC checks for packets not destined for this device.
+    if (len >= 4 && buf[0] == TALLY_START_BYTE && buf[1] == CMD_PING) {
+        if (buf[3] != _cameraId && buf[3] != TALLY_BROADCAST_ID) {
+            return false;
+        }
+    }
+
     TallyPacket pkt;
     if (!TallyProtocol::deserialize(buf, len, pkt)) {
         return false;
