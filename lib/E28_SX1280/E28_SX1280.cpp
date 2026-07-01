@@ -232,12 +232,15 @@ void E28Radio::writeCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
   if (!_connected)
     return;
   waitBusy();
+  if (!_connected) // BUSY timed out just now — don't clock a wedged module
+    return;
 
   digitalWrite(_pinNSS, LOW);
   if (len > 0) {
-    // ⚡ Bolt: Fast-path for small writes (e.g. IRQ clears, config) to avoid large stack alloc/memcpy
-    if (len <= 8) {
-      uint8_t txBuf[9];
+    // ⚡ Bolt: Fast-path for small writes (IRQ clears, config, and the 9-byte
+    // tally frame) to avoid the 260-byte stack alloc/memcpy
+    if (len <= 12) {
+      uint8_t txBuf[13];
       txBuf[0] = cmd;
       // ⚡ Bolt: Rely on compiler intrinsics for memory copies instead of manual loops
       memcpy(&txBuf[1], data, len);
@@ -261,13 +264,15 @@ void E28Radio::readCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
   if (!_connected)
     return;
   waitBusy();
+  if (!_connected)
+    return;
 
   digitalWrite(_pinNSS, LOW);
   if (len > 0) {
     // ⚡ Bolt: Fast-path for small reads (e.g. IRQ checks) to avoid large stack alloc/memcpy
-    if (len <= 8) {
-      uint8_t txBuf[10] = {cmd, 0x00}; // NOP
-      uint8_t rxBuf[10] = {0};
+    if (len <= 12) {
+      uint8_t txBuf[14] = {cmd, 0x00}; // NOP
+      uint8_t rxBuf[14] = {0};
       uint32_t totalLen = len + 2;
       SPI.transferBytes(txBuf, rxBuf, totalLen);
       // ⚡ Bolt: Rely on compiler intrinsics for memory copies instead of manual loops
@@ -378,7 +383,11 @@ void E28Radio::setPacketParams(uint8_t payloadLen) {
 
 void E28Radio::clearIrqStatus() {
   // ⚡ Bolt: Inline SPI transaction to bypass writeCommand wrapper overhead in high-frequency loops
+  if (!_connected)
+    return;
   waitBusy();
+  if (!_connected)
+    return;
   digitalWrite(_pinNSS, LOW);
   uint8_t txBuf[3] = {SX1280_CMD_CLR_IRQ_STATUS, 0xFF, 0xFF};
   SPI.writeBytes(txBuf, 3);
@@ -388,7 +397,11 @@ void E28Radio::clearIrqStatus() {
 
 uint16_t E28Radio::getIrqStatus() {
   // ⚡ Bolt: Inline SPI transaction to bypass readCommand wrapper array creation and func call overhead
+  if (!_connected)
+    return 0;
   waitBusy();
+  if (!_connected)
+    return 0;
   digitalWrite(_pinNSS, LOW);
   uint8_t txBuf[4] = {SX1280_CMD_GET_IRQ_STATUS, 0x00, 0x00, 0x00};
   uint8_t rxBuf[4] = {0};
@@ -409,11 +422,14 @@ bool E28Radio::send(uint8_t *data, uint8_t len) {
 
   // Write data to buffer
   waitBusy();
+  if (!_connected) // BUSY timed out mid-sequence — abort instead of clocking on
+    return false;
   digitalWrite(_pinNSS, LOW);
   if (len > 0) {
-    // ⚡ Bolt: Fast-path for small payloads to avoid large stack alloc/memcpy overhead
-    if (len <= 8) {
-        uint8_t txBuf[10];
+    // ⚡ Bolt: Fast-path for small payloads (covers the 9-byte tally frame)
+    // to avoid the 260-byte stack alloc/memcpy overhead
+    if (len <= 12) {
+        uint8_t txBuf[14];
         uint32_t totalLen = len + 2;
         txBuf[0] = SX1280_CMD_WRITE_BUFFER;
         txBuf[1] = 0x00; // Offset
@@ -481,11 +497,14 @@ bool E28Radio::startSend(uint8_t *data, uint8_t len) {
 
   // Write data to buffer
   waitBusy();
+  if (!_connected) // BUSY timed out mid-sequence — abort instead of clocking on
+    return false;
   digitalWrite(_pinNSS, LOW);
   if (len > 0) {
-    // ⚡ Bolt: Fast-path for small payloads to avoid large stack alloc/memcpy overhead
-    if (len <= 8) {
-        uint8_t txBuf[10];
+    // ⚡ Bolt: Fast-path for small payloads (covers the 9-byte tally frame)
+    // to avoid the 260-byte stack alloc/memcpy overhead
+    if (len <= 12) {
+        uint8_t txBuf[14];
         uint32_t totalLen = len + 2;
         txBuf[0] = SX1280_CMD_WRITE_BUFFER;
         txBuf[1] = 0x00; // Offset
@@ -676,6 +695,8 @@ uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
 
   // Wait for SX1280 to finish internal processing
   waitBusy();
+  if (!_connected) // BUSY timed out — don't clock a wedged module
+    return 0;
 
   // ⚡ Bolt: Inline GET_RX_BUFFER_STATUS to bypass readCommand wrapper overhead and redundant waitBusy() on hot RX path
   digitalWrite(_pinNSS, LOW);
@@ -693,12 +714,15 @@ uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
 
   // Read data from buffer
   waitBusy();
+  if (!_connected)
+    return 0;
   digitalWrite(_pinNSS, LOW);
   if (payloadLen > 0) {
-    // ⚡ Bolt: Fast-path for small payloads to avoid large stack alloc/memset/memcpy overhead
-    if (payloadLen <= 8) {
-        uint8_t txBuf[11] = {0};
-        uint8_t rxBuf[11] = {0};
+    // ⚡ Bolt: Fast-path for small payloads (covers the 9-byte tally frame)
+    // to avoid the 260-byte stack alloc/memset/memcpy overhead
+    if (payloadLen <= 12) {
+        uint8_t txBuf[15] = {0};
+        uint8_t rxBuf[15] = {0};
         uint32_t totalLen = payloadLen + 3;
 
         txBuf[0] = SX1280_CMD_READ_BUFFER;

@@ -45,6 +45,8 @@ public:
     void print(const char* str) {}
     void println(const char* str = "") {}
     void printf(const char* format, ...) {}
+    void setTxTimeoutMs(unsigned long) {} // HWCDC API (real header: HWCDC.h)
+    void setTimeout(unsigned long) {}
 };
 extern SerialMock Serial;
 
