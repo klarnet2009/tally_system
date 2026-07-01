@@ -67,7 +67,10 @@ static bool radioInit() {
 static uint32_t g_camLastSeen[17] = {0};
 static int8_t g_camRssi[17] = {0};
 static bool g_camReachable[17] = {false};
-#define CAM_REACHABLE_MS (3 * TALLY_TELEMETRY_MS) // missed ~3 telemetry beats
+// Slaves jitter their interval by camId*37ms (worst case ~2.6s for cam 16), so
+// 4x the base leaves ~3 real beats of margin — 3x flapped OFFLINE/ONLINE on a
+// high-ID camera after just two lost frames.
+#define CAM_REACHABLE_MS (4 * TALLY_TELEMETRY_MS)
 
 // ⚡ Bolt: Non-blocking transmission queue to prevent delay() stalls in main loop
 #define LORA_QUEUE_SIZE 16
@@ -134,7 +137,9 @@ static void serviceTelemetry() {
     return;
   uint8_t buf[TALLY_PACKET_SIZE];
   uint8_t len = radio.receive(buf, TALLY_PACKET_SIZE);
-  radio.startReceive(); // re-arm for the next frame
+  // Cheap re-arm (IRQ clear + SET_RX): the full startReceive() would bounce
+  // through standby and could cut a frame already mid-air in continuous RX
+  radio.rearmAfterIrq();
   if (len == 0)
     return;
   TallyPacket pkt;
@@ -534,6 +539,10 @@ void setup() {
   Serial.begin();
   Serial.setTxTimeoutMs(0);
   Serial0.begin(115200); // UART bridge port (GPIO43/44)
+  // readStringUntil() otherwise stalls the loop for its default 1s timeout on
+  // a noise burst without a newline (e.g. a floating/glitching UART line)
+  Serial.setTimeout(50);
+  Serial0.setTimeout(50);
 
   I2Cbus.begin(OLED_I2C_SDA, OLED_I2C_SCL, 400000);
   display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);

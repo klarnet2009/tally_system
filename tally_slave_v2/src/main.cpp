@@ -203,13 +203,12 @@ static void saveCamId(uint8_t id) {
   p.end();
 }
 
-// If BOOT is held at power-up, enter set-ID mode: each tap increments the
-// count (1..8, wraps), the LED flashes the count and the buzzer chirps; 3s of
-// inactivity commits to NVS. Blocking, but this only runs at boot on request.
-static uint8_t runSetIdModeIfRequested(uint8_t current) {
-  pinMode(PIN_BOOT, INPUT_PULLUP);
-  delay(20);
-  if (digitalRead(PIN_BOOT) == HIGH)
+// Set-ID mode: each tap increments the count (1..8, wraps), the LED flashes
+// the count and the buzzer chirps; 3s of inactivity commits to NVS. Blocking,
+// but this only runs at boot on request. `requested` comes from the boot-delay
+// watcher in setup() — see the GPIO9 strap-pin note there.
+static uint8_t runSetIdModeIfRequested(uint8_t current, bool requested) {
+  if (!requested && digitalRead(PIN_BOOT) == HIGH)
     return current; // not held — normal boot
 
   Serial.println("[CFG] Set-ID mode: tap BOOT to count (1..8), idle 3s to save");
@@ -287,16 +286,37 @@ void setup() {
 #endif
 
   Serial.begin(115200);
-  delay(2000);
+  // Field units run on battery with NO USB host: HWCDC's default 100ms TX
+  // timeout would otherwise stall every log line once the FIFO fills — and
+  // onTallyState logs BEFORE painting the LED, so tally latency would spike
+  // exactly in the deployed configuration. Zero = drop logs when nobody reads.
+  Serial.setTxTimeoutMs(0);
+  Serial.setTimeout(50); // don't stall 1s on a partial serial command
+
+  // CDC settle delay doubles as the set-ID entry window. GPIO9 is the C3's
+  // boot strap: held LOW while power is APPLIED, the ROM enters download mode
+  // and this firmware never runs. So the rule is: power on first, then press
+  // and hold BOOT (>=200ms) within these ~2 seconds.
+  pinMode(PIN_BOOT, INPUT_PULLUP);
+  bool bootHeld = false;
+  for (int i = 0, lowStreak = 0; i < 200; i++) { // 200 x 10ms = 2s
+    if (digitalRead(PIN_BOOT) == LOW) {
+      if (++lowStreak >= 20) // 200ms continuous — a glitch can't trigger it
+        bootHeld = true;
+    } else {
+      lowStreak = 0;
+    }
+    delay(10);
+  }
 
   led.begin();
   setColor(COLOR_OFF);
   pinMode(PIN_BUZZER, OUTPUT);
   noTone(PIN_BUZZER);
 
-  // Resolve camera ID from NVS (or the set-ID flow if BOOT is held)
+  // Resolve camera ID from NVS (or the set-ID flow if BOOT was held)
   g_camId = loadCamId();
-  g_camId = runSetIdModeIfRequested(g_camId);
+  g_camId = runSetIdModeIfRequested(g_camId, bootHeld);
 
   Serial.println("\n=============================");
   Serial.println("  SUFIDE Tally Slave v2");
