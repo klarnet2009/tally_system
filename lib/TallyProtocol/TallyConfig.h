@@ -11,7 +11,23 @@
 // 2480 MHz: above WiFi ch 1-11, inside the 2400-2483.5 MHz ISM band.
 // (The old implicit default, 2400.0 MHz, sat half outside the band edge
 // and under WiFi channel 1.)
+// Overridable via build_flags (like TALLY_NET_ID) so two systems can run on
+// separate channels. Deliberately NOT a runtime knob: hub and slaves must
+// change together or the link dies — a coordinated channel-switch protocol
+// is the prerequisite for that. Keep within 2400.3–2483.3 MHz (BW/2 margin).
+#ifndef TALLY_RF_FREQ_HZ
 #define TALLY_RF_FREQ_HZ 2480000000UL
+#endif
+
+// AFA channel set (adaptive frequency agility): the escape channels sit in
+// the gaps of the standard WiFi 1/6/11 grid; index 0 is the home channel.
+// The hub announces a switch on the current channel (CMD_SET_CHANNEL), the
+// fleet follows; a slave that misses the announcement finds the hub again by
+// scanning this list (~2s per channel) once it declares signal-lost. Keep
+// the list SHORT — scan time on a deaf slave grows with every entry.
+#define TALLY_CHAN_COUNT 3
+#define TALLY_CHAN_LIST                                                       \
+  { TALLY_RF_FREQ_HZ, 2449500000UL, 2424500000UL }
 
 #define TALLY_REFRESH_MS 500      // Periodic STATE_ALL re-send = link heartbeat
 // Derived from the heartbeat so they track it automatically. Raising

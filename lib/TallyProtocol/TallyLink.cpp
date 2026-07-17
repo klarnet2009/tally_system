@@ -38,6 +38,9 @@ bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
             _state = ts;
             if (_onState) _onState(ts);
         }
+    } else if (code == CMD_SET_CHANNEL) {
+        if (_onChannel)
+            _onChannel(TallyProtocol::channelFreq(pkt), pkt.aux);
     }
     // CMD_TELEMETRY is a slave->hub frame; a slave ignores it.
     return true;

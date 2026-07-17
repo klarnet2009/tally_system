@@ -25,7 +25,12 @@
 enum TallyCmd : uint8_t {
     CMD_PING        = 0x2, // aux = target camera ID (0xFF = all)
     CMD_STATE_ALL   = 0x6, // aux = flags; payload = progLo,progHi,prevLo,prevHi
-    CMD_TELEMETRY   = 0x7  // slave -> hub: aux = camId; payload = batt,rssi,flags
+    CMD_TELEMETRY   = 0x7, // slave -> hub: aux = camId; payload = batt,rssi,flags
+    CMD_SET_CHANNEL = 0x8  // hub -> slaves: aux = channel index (informational);
+                           // payload = target frequency in Hz, little-endian.
+                           // The frequency is authoritative (survives a table
+                           // mismatch between builds); the index just aligns
+                           // the slave's scan starting point.
 };
 
 // STATE_ALL aux-byte flags
@@ -65,6 +70,12 @@ public:
     // Slave -> hub telemetry
     static TallyPacket createTelemetryPacket(uint8_t cameraId, uint16_t battMv,
                                              int8_t rssi, uint8_t flags);
+    // Hub -> slaves: coordinated channel switch (AFA)
+    static TallyPacket createSetChannelPacket(uint8_t chanIdx, uint32_t freqHz);
+    static uint32_t channelFreq(const TallyPacket& p) {
+        return (uint32_t)p.payload[0] | ((uint32_t)p.payload[1] << 8) |
+               ((uint32_t)p.payload[2] << 16) | ((uint32_t)p.payload[3] << 24);
+    }
 
     // Accessors
     static uint8_t cmdCode(const TallyPacket& p) { return TALLY_CMD_CODE(p.command); }

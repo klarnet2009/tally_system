@@ -17,9 +17,15 @@ public:
     typedef void (*StateCallback)(TallyState newState);
     typedef void (*LocatorCallback)();
     typedef void (*LinkCallback)(bool lost);
+    typedef void (*ChannelCallback)(uint32_t freqHz, uint8_t chanIdx);
 
     void begin(uint8_t cameraId, StateCallback onState,
                LocatorCallback onLocator, LinkCallback onLink);
+
+    // Optional (separate setter so v1's begin() signature stays stable):
+    // fired on a valid CMD_SET_CHANNEL from the hub. The callback owns the
+    // radio retune; TallyLink stays presentation/radio-agnostic.
+    void setChannelCallback(ChannelCallback cb) { _onChannel = cb; }
 
     // Feed a raw RX buffer. Returns true for a valid packet on our network
     // (callers may count failures for diagnostics).
@@ -53,6 +59,7 @@ private:
     StateCallback _onState = nullptr;
     LocatorCallback _onLocator = nullptr;
     LinkCallback _onLink = nullptr;
+    ChannelCallback _onChannel = nullptr;
 };
 
 #endif // TALLY_LINK_H
