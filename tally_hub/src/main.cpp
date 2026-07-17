@@ -11,6 +11,7 @@
 
 #include "AtemClientAdapter.h"
 #include "E28_SX1280.h"
+#include "TallyLog.h"
 #include "TallyProtocol.h"
 #include "TallyRadio.h"
 #include "config.h"
@@ -18,6 +19,19 @@
 static E28Radio radio;
 static uint32_t g_loraTxCount = 0;   // TX packet counter
 static uint32_t g_loraDropCount = 0; // Packets lost: queue overflow / radio / TX fail
+
+// Runtime TX power (serial "power N", chip dBm). Boot default is the config
+// constant; radioInit() re-applies this AFTER the shared profile so a live
+// override survives radio recovery/reinit instead of silently resetting.
+static int8_t g_txPower = TALLY_TX_POWER;
+
+// AFA: current channel (survives recovery, same pattern as g_txPower) and a
+// pending switch. A "chan <i>" command enqueues CMD_SET_CHANNEL announcements
+// on the CURRENT channel; the hub itself retunes only when the TX queue has
+// fully drained, so every announcement leaves on the old frequency first.
+static const uint32_t g_chanList[] = TALLY_CHAN_LIST;
+static uint32_t g_chanFreq = TALLY_RF_FREQ_HZ;
+static uint32_t g_pendingChanFreq = 0; // 0 = no switch pending
 
 // ===== Debug logging =====
 // The S3 has two consoles: Serial = native USB-Serial-JTAG (GPIO19/20),
@@ -31,6 +45,7 @@ static void hublogf(const char *fmt, ...) {
   va_end(ap);
   Serial.print(buf);
   Serial0.print(buf);
+  TallyLog.write(buf); // flash sink: field logs survive without a tether
 }
 
 // Locator state (file scope: triggered by the BOOT button and the serial
@@ -56,6 +71,8 @@ static bool radioInit() {
                         E28_PIN_TXEN);
   if (ok) {
     tallyApplyRadioProfile(radio);
+    radio.setTxPower(g_txPower);     // keep any live "power N" override
+    radio.setFrequency(g_chanFreq);  // keep the current AFA channel too
     radio.startReceive(); // listen for slave telemetry between TX bursts
   }
   return ok;
@@ -100,8 +117,18 @@ static void processLoraQueue() {
         g_loraDropCount++;
       lastTxDoneTime = millis();
       // Back to listening when the queue is drained (TX pulls us out of RX)
-      if (g_loraQueueHead == g_loraQueueTail)
+      if (g_loraQueueHead == g_loraQueueTail) {
+        // Pending AFA switch: every announcement has now left on the old
+        // channel — retune before re-arming RX
+        if (g_pendingChanFreq) {
+          g_chanFreq = g_pendingChanFreq;
+          g_pendingChanFreq = 0;
+          radio.setFrequency(g_chanFreq);
+          hublogf("[CHAN] hub now on %lu.%lu MHz\n", g_chanFreq / 1000000UL,
+                  (g_chanFreq % 1000000UL) / 100000UL);
+        }
         radio.startReceive();
+      }
     }
     return;
   }
@@ -111,6 +138,13 @@ static void processLoraQueue() {
     if (!radio.isConnected()) {
       g_loraDropCount++;
       g_loraQueueTail = (g_loraQueueTail + 1) % LORA_QUEUE_SIZE;
+      // Announcements undeliverable, but honour the operator's intent: the
+      // driver remembers the frequency and recovery re-applies it
+      if (g_loraQueueHead == g_loraQueueTail && g_pendingChanFreq) {
+        g_chanFreq = g_pendingChanFreq;
+        g_pendingChanFreq = 0;
+        radio.setFrequency(g_chanFreq);
+      }
       return;
     }
     // Minimum 2ms gap between packets, enforced non-blockingly
@@ -535,6 +569,9 @@ void setup() {
   Serial.setTxTimeoutMs(0);
   Serial0.begin(115200); // UART bridge port (GPIO43/44)
 
+  // Flash log first, so even the boot banner lands in it (2x256KB ring)
+  TallyLog.begin(262144);
+
   I2Cbus.begin(OLED_I2C_SDA, OLED_I2C_SCL, 400000);
   display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   display.setTextWrap(false);
@@ -544,6 +581,9 @@ void setup() {
   pinMode(0, INPUT_PULLUP); // Boot button for locator
 
   hublogf("\n=== Tally HUB (ESP32-S3 + E28-2G4M27S) ===\n");
+  hublogf("[LOG] flash log %s, %u KB used — dump: 'log', wipe: 'logclear'\n",
+          TallyLog.ok() ? "OK" : "UNAVAILABLE",
+          (unsigned)(TallyLog.size() / 1024));
   // Reset reason turns "module not connected after a warm reboot" from a
   // guess into a fact: ESP_RST_BROWNOUT after a TX storm = the PA/WiFi rail
   // is sagging (decouple it), vs ESP_RST_SW/POWERON = ordinary boot.
@@ -579,6 +619,7 @@ void setup() {
     hublogf("[E28] init FAILED after 5 attempts — recovery retries every 10s\n");
 
   // ==== Wi-Fi ====
+#ifndef NO_WIFI
   drawCenteredMsg("Wi-Fi: connecting...", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -597,14 +638,56 @@ void setup() {
     hublogf("[WiFi] connected, IP %s\n", ipToStr(WiFi.localIP()).c_str());
     drawCenteredMsg("Wi-Fi: connected", ipToStr(WiFi.localIP()).c_str());
   }
+#else
+  // Radio bring-up build: keep the WiFi radio fully off so it can't contend
+  // for the 3.3V rail with the E28 PA (the brownout path noted above).
+  WiFi.mode(WIFI_OFF);
+  hublogf("[WiFi] disabled (NO_WIFI build) — radio debug mode\n");
+  drawCenteredMsg("Wi-Fi: OFF", "radio debug build");
+#endif
 
   // Show LoRa debug screen for 3 seconds
   drawLoRaDebug();
   delay(3000);
 }
 
+// AFA site survey: sample the ambient noise floor on every candidate channel
+// and print a comparison. Blocks the loop ~150ms/channel — acceptable for a
+// hand-typed diagnostic (slaves tolerate 6 missed heartbeats).
+static void noiseSurvey() {
+  if (!radio.isConnected()) {
+    hublogf("[NOISE] radio DEAD — fix the module first\n");
+    return;
+  }
+  for (uint8_t i = 0; i < TALLY_CHAN_COUNT; i++) {
+    radio.setFrequency(g_chanList[i]);
+    radio.startReceive();
+    delay(25); // PLL settle + RSSI integration
+    int32_t sum = 0;
+    int8_t peak = -127; // loudest (closest to 0) sample = worst interferer
+    const int N = 16;
+    for (int k = 0; k < N; k++) {
+      int8_t r = radio.getRssiInst();
+      sum += r;
+      if (r > peak)
+        peak = r;
+      delay(6);
+    }
+    hublogf("[NOISE] ch%u %lu.%lu MHz: avg=%ld dBm peak=%d dBm%s\n", i,
+            g_chanList[i] / 1000000UL, (g_chanList[i] % 1000000UL) / 100000UL,
+            (long)(sum / N), (int)peak,
+            g_chanList[i] == g_chanFreq ? "  <- current" : "");
+  }
+  // Back to the working channel
+  radio.setFrequency(g_chanFreq);
+  radio.startReceive();
+  hublogf("[NOISE] quieter than -100 = clean; louder than -85 = busy\n");
+}
+
 // ===== Serial console (both ports): status / ping / reinit / help =====
-static void handleSerialCommand(const String &cmd) {
+// io = the port the command arrived on (log dumps go only there); nullptr
+// for internally-generated commands (the 10s status heartbeat).
+static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
   if (cmd == "status") {
     uint8_t qDepth =
         (g_loraQueueHead + LORA_QUEUE_SIZE - g_loraQueueTail) % LORA_QUEUE_SIZE;
@@ -618,11 +701,14 @@ static void handleSerialCommand(const String &cmd) {
     for (uint8_t id = 1; id <= 16; id++)
       if (g_camReachable[id])
         reachMask |= (1U << (id - 1));
-    hublogf("[STATUS] up=%lus radio=%s(0x%02X) tx=%lu drop=%lu q=%u "
-            "wifi=%s atem=%s prog=0x%04X prev=0x%04X reach=0x%04X\n",
+    hublogf("[STATUS] up=%lus radio=%s(0x%02X) pwr=%d ch=%lu.%lu tx=%lu "
+            "drop=%lu rxerr=%lu q=%u wifi=%s atem=%s prog=0x%04X prev=0x%04X "
+            "reach=0x%04X\n",
             (unsigned long)(millis() / 1000), radio.isConnected() ? "OK" : "DEAD",
-            radio.getChipStatus(), (unsigned long)g_loraTxCount,
-            (unsigned long)g_loraDropCount, qDepth, ipbuf,
+            radio.getChipStatus(), (int)g_txPower, g_chanFreq / 1000000UL,
+            (g_chanFreq % 1000000UL) / 100000UL, (unsigned long)g_loraTxCount,
+            (unsigned long)g_loraDropCount, (unsigned long)radio.getRxErrors(),
+            qDepth, ipbuf,
             atemPhase == ATEM_RUNNING      ? "RUNNING"
             : atemPhase == ATEM_CONNECTING ? "CONNECTING"
                                            : "IDLE",
@@ -636,8 +722,84 @@ static void handleSerialCommand(const String &cmd) {
   } else if (cmd == "reinit") {
     hublogf("[CMD] radio re-init: %s (%s)\n",
             radioInit() ? "OK" : "FAILED", radio.initErrorStr());
+  } else if (cmd.startsWith("power")) {
+    // Range/stability testing: change chip TX power live, no reflash.
+    // The 27S PA adds ~14 dB on top of the chip dBm figure.
+    String arg = cmd.substring(5);
+    arg.trim();
+    if (!arg.length()) {
+      hublogf("[PWR] chip=%d dBm (~%d dBm EIRP with 27S PA). Set: power <-18..12>\n",
+              (int)g_txPower, (int)g_txPower + 14);
+    } else if (arg[0] != '-' && (arg[0] < '0' || arg[0] > '9')) {
+      hublogf("[PWR] usage: power <-18..12>\n");
+    } else {
+      int p = arg.toInt();
+      if (p < -18 || p > 12) {
+        hublogf("[PWR] out of range: chip is -18..12 dBm\n");
+      } else {
+        g_txPower = (int8_t)p;
+        radio.setTxPower(g_txPower);
+        hublogf("[PWR] chip=%d dBm (~%d dBm EIRP)%s\n", p, p + 14,
+                p > 4 ? " — WARNING: >4 risks 3V3 brownout until the rail fix;"
+                        " EU EIRP cap is ~chip +6"
+                      : "");
+      }
+    }
+  } else if (cmd.startsWith("chan")) {
+    String arg = cmd.substring(4);
+    arg.trim();
+    if (!arg.length()) {
+      for (uint8_t i = 0; i < TALLY_CHAN_COUNT; i++)
+        hublogf("[CHAN] %u: %lu.%lu MHz%s\n", i, g_chanList[i] / 1000000UL,
+                (g_chanList[i] % 1000000UL) / 100000UL,
+                g_chanList[i] == g_chanFreq ? "  <- current" : "");
+      hublogf("Switch fleet: chan <0..%u>\n", TALLY_CHAN_COUNT - 1);
+    } else if (arg[0] < '0' || arg[0] > '9') {
+      hublogf("[CHAN] usage: chan <0..%u>\n", TALLY_CHAN_COUNT - 1);
+    } else {
+      uint8_t i = (uint8_t)arg.toInt();
+      if (i >= TALLY_CHAN_COUNT) {
+        hublogf("[CHAN] no such channel (0..%u)\n", TALLY_CHAN_COUNT - 1);
+      } else if (g_chanList[i] == g_chanFreq) {
+        hublogf("[CHAN] already on ch%u\n", i);
+      } else {
+        // Announce 6x on the CURRENT channel (residual loss ~p^6), then the
+        // queue-drain hook retunes the hub. Slaves that miss every copy find
+        // us again via their signal-lost channel scan within ~6s.
+        TallyPacket pkt =
+            TallyProtocol::createSetChannelPacket(i, g_chanList[i]);
+        for (int k = 0; k < 6; k++)
+          enqueueLora(pkt);
+        g_pendingChanFreq = g_chanList[i];
+        hublogf("[CHAN] announcing switch to ch%u (%lu.%lu MHz)...\n", i,
+                g_chanList[i] / 1000000UL,
+                (g_chanList[i] % 1000000UL) / 100000UL);
+      }
+    }
+  } else if (cmd == "noise") {
+    noiseSurvey();
+  } else if (cmd == "log") {
+    // Field-log dump to the asking console only (up to ~512KB @115200 ≈ 45s)
+    TallyLog.dump(io ? *io : Serial);
+  } else if (cmd == "logclear") {
+    TallyLog.clear();
+    hublogf("[LOG] cleared\n");
+  } else if (cmd == "cams") {
+    // Per-camera return-channel report: walk-test readout in one command
+    bool any = false;
+    for (uint8_t id = 1; id <= 16; id++) {
+      if (g_camLastSeen[id] == 0)
+        continue;
+      any = true;
+      hublogf("[CAM %2u] %s rssi=%4d dBm  last seen %lus ago\n", id,
+              g_camReachable[id] ? "ONLINE " : "OFFLINE", (int)g_camRssi[id],
+              (unsigned long)((millis() - g_camLastSeen[id]) / 1000));
+    }
+    if (!any)
+      hublogf("[CAM] no telemetry received from any slave yet\n");
   } else if (cmd == "help") {
-    hublogf("Commands: status, ping, reinit, help\n");
+    hublogf("Commands: status, cams, ping, power [n], chan [i], noise, "
+            "log, logclear, reinit, help\n");
   } else if (cmd.length()) {
     hublogf("Unknown command '%s' — try 'help'\n", cmd.c_str());
   }
@@ -649,7 +811,7 @@ static void pollSerialCommands() {
     if (port->available()) {
       String cmd = port->readStringUntil('\n');
       cmd.trim();
-      handleSerialCommand(cmd);
+      handleSerialCommand(cmd, port);
     }
   }
 }
@@ -658,6 +820,7 @@ void loop() {
   processLoraQueue();
   serviceTelemetry();  // receive slave telemetry in idle windows
   sweepReachability(); // log cameras going online/offline
+  TallyLog.tick();     // periodic flash-log flush
 
   // Radio recovery: re-init every 10s while disconnected (begin() bails out
   // in ~150ms when the module is absent, so this stays affordable)
@@ -673,6 +836,7 @@ void loop() {
   }
 
   // WiFi reconnect (non-blocking)
+#ifndef NO_WIFI
   if (WiFi.status() != WL_CONNECTED) {
     static uint32_t lastRetry = 0;
     if (millis() - lastRetry > WIFI_RETRY_MS) {
@@ -681,6 +845,7 @@ void loop() {
       WiFi.begin(WIFI_SSID, WIFI_PASS);
     }
   }
+#endif
 
 #ifdef LORA_TEST_MODE
   // === TEST STREAM: cam 1 RED <-> GREEN every 1s (radio bring-up without ATEM)
