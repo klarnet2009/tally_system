@@ -15,10 +15,26 @@
 #include <Preferences.h>
 #include <E28_SX1280.h>
 #include <TallyLink.h>
+#include <TallyLog.h>
 #include <TallyProtocol.h>
 #include <TallyRadio.h>
 
 #include "pins.h"
+
+// Serial + flash log in one call: field events must survive without a
+// tethered laptop. Bench-only chatter (help text, command echo) stays on
+// plain Serial so it doesn't churn the ring.
+static void slogf(const char *fmt, ...)
+    __attribute__((format(printf, 1, 2)));
+static void slogf(const char *fmt, ...) {
+  char buf[192];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  Serial.print(buf);
+  TallyLog.write(buf);
+}
 
 // ===== CONFIGURATION =====
 // Compile-time fallback only; the live camera ID is stored in NVS and set in
@@ -28,6 +44,16 @@
 #endif
 
 static uint8_t g_camId = SLAVE_CAM_ID;
+
+// Runtime TX power (serial "power N", chip dBm; the 12SX has no external PA).
+// Re-applied after every radio recovery so a live override sticks.
+static int8_t g_txPower = TALLY_TX_POWER;
+
+// AFA: current channel. Normally follows the hub's CMD_SET_CHANNEL; if we
+// lose the link (missed announcement, reboot while the fleet runs on an
+// escape channel), the scan in loop() walks this list until the hub is found.
+static const uint32_t kChanList[] = TALLY_CHAN_LIST;
+static uint8_t g_chanIdx = 0;
 
 // ===== COLORS =====
 #define COLOR_OFF 0x000000
@@ -170,7 +196,7 @@ void updateLocator() {
 
 // ===== TallyLink presentation callbacks =====
 void onTallyState(TallyState ts) {
-  Serial.printf("[TALLY] State:%d RSSI:%d\n", ts, radio.getRSSI());
+  slogf("[TALLY] State:%d RSSI:%d\n", ts, radio.getRSSI());
   // Only paint a solid colour when the light is trustworthy; otherwise the
   // signal-lost / source-stale indications below own the LED.
   if (!locatorActive && tallyLink.trustworthy())
@@ -178,8 +204,22 @@ void onTallyState(TallyState ts) {
 }
 
 void onLocatorPing() {
-  Serial.println("[LOCATOR] Alert!");
+  slogf("[LOCATOR] Alert!\n");
   startLocator();
+}
+
+// Hub announced a coordinated channel switch (AFA). The packet's frequency is
+// authoritative; the index only aligns our scan starting point.
+void onChannelChange(uint32_t freqHz, uint8_t chanIdx) {
+  if (freqHz < 2400300000UL || freqHz > 2483300000UL)
+    return; // sanity: stay inside the 2.4 GHz ISM band whatever the packet says
+  if (chanIdx < TALLY_CHAN_COUNT)
+    g_chanIdx = chanIdx;
+  slogf("[CHAN] hub -> %lu.%lu MHz (ch%u)\n",
+        (unsigned long)(freqHz / 1000000UL),
+        (unsigned long)((freqHz % 1000000UL) / 100000UL), chanIdx);
+  radio.setFrequency(freqHz);
+  radio.restartReceive();
 }
 
 // ===== Camera ID provisioning (NVS) =====
@@ -243,10 +283,10 @@ static uint8_t runSetIdModeIfRequested(uint8_t current) {
 
 void onLinkChange(bool lost) {
   if (lost) {
-    Serial.println("[WARN] Signal lost!");
+    slogf("[WARN] Signal lost!\n");
     buzzPulse(800, 300);
   } else {
-    Serial.println("[LINK] Signal restored");
+    slogf("[LINK] Signal restored\n");
     if (!locatorActive)
       applyTallyColor();
   }
@@ -262,16 +302,18 @@ void tryRadioRecover() {
   if (millis() - lastTry < 10000)
     return;
   lastTry = millis();
-  Serial.println("[LoRa] Recovering...");
+  slogf("[LoRa] Recovering...\n");
   if (radio.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS,
                   PIN_LORA_BUSY, PIN_LORA_DIO1, PIN_LORA_NRESET, PIN_LORA_RXEN,
                   PIN_LORA_TXEN)) {
     tallyApplyRadioProfile(radio);
+    radio.setTxPower(g_txPower); // keep any live "power N" override
+    radio.setFrequency(kChanList[g_chanIdx]); // stay on the fleet's channel
     armReceive();
     tallyLink.noteAlive();
-    Serial.println("[LoRa] Recovered");
+    slogf("[LoRa] Recovered\n");
   } else {
-    Serial.printf("[LoRa] Recovery failed: %s\n", radio.initErrorStr());
+    slogf("[LoRa] Recovery failed: %s\n", radio.initErrorStr());
   }
 }
 
@@ -298,6 +340,9 @@ void setup() {
   g_camId = loadCamId();
   g_camId = runSetIdModeIfRequested(g_camId);
 
+  // Flash log before the banner so every boot is captured (2x128KB ring)
+  TallyLog.begin(131072);
+
   Serial.println("\n=============================");
   Serial.println("  SUFIDE Tally Slave v2");
   Serial.printf("  Camera ID: %d  NetID: 0x%02X\n", g_camId, TALLY_NET_ID);
@@ -307,6 +352,13 @@ void setup() {
   Serial.println("  RX: continuous");
 #endif
   Serial.println("=============================");
+  slogf("[BOOT] camId=%d netId=0x%02X rx=%s log=%s\n", g_camId, TALLY_NET_ID,
+#ifdef POWER_SAVE
+        "duty-cycle",
+#else
+        "continuous",
+#endif
+        TallyLog.ok() ? "OK" : "UNAVAILABLE");
 
   Serial.print("[LoRa] Init... ");
   bool ok = radio.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI,
@@ -314,7 +366,7 @@ void setup() {
                         PIN_LORA_NRESET, PIN_LORA_RXEN, PIN_LORA_TXEN);
 
   if (ok) {
-    Serial.println("OK");
+    slogf("[LoRa] init OK\n");
     flashColor(COLOR_INIT_OK, 3, 150, 100);
     beep(1000, 100);
     tallyApplyRadioProfile(radio);
@@ -324,11 +376,13 @@ void setup() {
     // re-inits every 10s (the slave has a real reset line) and the signal-lost
     // indication shows "not working" until it heals. A warm-boot module that
     // came up slow/wedged then self-recovers.
-    Serial.printf("FAILED: %s — retrying in loop()\n", radio.initErrorStr());
+    slogf("[LoRa] init FAILED: %s — retrying in loop()\n",
+          radio.initErrorStr());
     beep(400, 200);
   }
 
   tallyLink.begin(g_camId, onTallyState, onLocatorPing, onLinkChange);
+  tallyLink.setChannelCallback(onChannelChange);
 
   // ISR only sets a flag, harmless even if the radio is down; if recovery
   // brings it up later RX still works (the loop also polls DIO1 level).
@@ -342,6 +396,7 @@ void setup() {
 void loop() {
   tryRadioRecover();
   updateLocator();
+  TallyLog.tick(); // periodic flash-log flush
 
   // === RX: interrupt-driven (no SPI polling — under POWER_SAVE any NSS
   // activity during the radio's sleep phase would silently kill the cycle)
@@ -361,10 +416,10 @@ void loop() {
         } else {
           rxFails++;
           if (rxFails <= 10) {
-            Serial.printf("[RX_FAIL] len=%d raw: ", len);
+            char hex[3 * 16 + 1] = {0};
             for (int i = 0; i < len && i < 16; i++)
-              Serial.printf("%02X ", buf[i]);
-            Serial.println();
+              snprintf(hex + i * 3, 4, "%02X ", buf[i]);
+            slogf("[RX_FAIL] len=%d raw: %s\n", len, hex);
           }
         }
       }
@@ -431,6 +486,22 @@ void loop() {
     radio.restartReceive();
   }
 
+  // === AFA CHANNEL SCAN: link lost -> maybe the hub escaped a jammed
+  // channel (or we rebooted while the fleet runs elsewhere). Walk the list,
+  // ~2s per channel (>=3 hub heartbeats each). Any valid packet ends the
+  // scan by clearing signalLost; the current channel stays where we heard it.
+  static uint32_t lastScanHop = 0;
+  if (radio.isConnected() && tallyLink.signalLost() &&
+      millis() - lastScanHop > 2000) {
+    lastScanHop = millis();
+    g_chanIdx = (uint8_t)((g_chanIdx + 1) % TALLY_CHAN_COUNT);
+    radio.setFrequency(kChanList[g_chanIdx]);
+    radio.restartReceive();
+    slogf("[SCAN] listening on ch%u (%lu.%lu MHz)\n", g_chanIdx,
+          (unsigned long)(kChanList[g_chanIdx] / 1000000UL),
+          (unsigned long)((kChanList[g_chanIdx] % 1000000UL) / 100000UL));
+  }
+
   // === TELEMETRY (slave -> hub): periodic so the hub knows this camera is
   // reachable. Brief blocking TX of one frame, then re-arm RX. Jittered by
   // camId so slaves don't all transmit in lockstep on the shared channel.
@@ -452,10 +523,12 @@ void loop() {
   // Heartbeat: status log every 10 seconds
   if (millis() - lastHeartbeat > 10000) {
     lastHeartbeat = millis();
-    Serial.printf("[STATUS] Up:%lus State:%d LastRX:%lus ago RX:%lu Fail:%lu\n",
-                  (unsigned long)(millis() / 1000), (int)tallyLink.state(),
-                  (unsigned long)(tallyLink.msSinceLastRx() / 1000),
-                  (unsigned long)rxCount, (unsigned long)rxFails);
+    slogf("[STATUS] Up:%lus State:%d Ch:%u LastRX:%lus ago RX:%lu "
+          "Fail:%lu RxErr:%lu\n",
+          (unsigned long)(millis() / 1000), (int)tallyLink.state(), g_chanIdx,
+          (unsigned long)(tallyLink.msSinceLastRx() / 1000),
+          (unsigned long)rxCount, (unsigned long)rxFails,
+          (unsigned long)radio.getRxErrors());
     rxCount = 0;
     rxFails = 0;
   }
@@ -481,6 +554,24 @@ void loop() {
       applyTallyColor();
     } else if (cmd == "beep") {
       tone(PIN_BUZZER, 1000, 200); // non-blocking; diagnostic, bypasses policy
+    } else if (cmd.startsWith("power")) {
+      // Range testing: telemetry TX power live, no reflash (chip dBm, no PA)
+      String arg = cmd.substring(5);
+      arg.trim();
+      if (!arg.length()) {
+        Serial.printf("[PWR] chip=%d dBm. Set: power <-18..12>\n",
+                      (int)g_txPower);
+      } else {
+        int p = arg.toInt();
+        if ((arg[0] != '-' && (arg[0] < '0' || arg[0] > '9')) || p < -18 ||
+            p > 12) {
+          Serial.println("[PWR] usage: power <-18..12>");
+        } else {
+          g_txPower = (int8_t)p;
+          radio.setTxPower(g_txPower);
+          Serial.printf("[PWR] chip=%d dBm\n", p);
+        }
+      }
     } else if (cmd.startsWith("id ")) {
       int n = cmd.substring(3).toInt();
       if (n >= 1 && n <= 16) {
@@ -491,8 +582,14 @@ void loop() {
       } else {
         Serial.println("[CFG] id must be 1..16");
       }
+    } else if (cmd == "log") {
+      TallyLog.dump(Serial);
+    } else if (cmd == "logclear") {
+      TallyLog.clear();
+      Serial.println("[LOG] cleared");
     } else if (cmd == "help") {
-      Serial.println("Commands: test, red, green, off, beep, id <1-16>, help");
+      Serial.println("Commands: test, red, green, off, beep, power [n], "
+                     "log, logclear, id <1-16>, help");
     }
   }
 
