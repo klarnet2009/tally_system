@@ -48,6 +48,7 @@
 #define SX1280_CMD_SET_BUFFER_BASE_ADDR 0x8F
 #define SX1280_CMD_GET_RX_BUFFER_STATUS 0x17
 #define SX1280_CMD_GET_PACKET_STATUS 0x1D
+#define SX1280_CMD_GET_RSSI_INST 0x1F
 #define SX1280_CMD_SET_RX_DUTY_CYCLE 0x94
 #define SX1280_CMD_CLR_IRQ_STATUS 0x97
 #define SX1280_CMD_SET_DIO_IRQ_PARAMS 0x8D
@@ -91,7 +92,9 @@ enum E28InitError : uint8_t {
   E28_OK = 0,
   E28_ERR_BUSY_STUCK, // BUSY never went low: no power / BUSY miswired / chip hung
   E28_ERR_MISO_LOW,   // status reads 0x00: MISO stuck low — module unpowered/shorted
-  E28_ERR_MISO_HIGH   // status reads 0xFF: MISO stuck high — module absent/miswired
+  E28_ERR_MISO_HIGH,  // status reads 0xFF: MISO stuck high — module absent/miswired
+  E28_ERR_READBACK    // status reads fine but SetPacketType didn't land:
+                      // commands don't reach the chip — MOSI/SCK wiring
 };
 
 class E28Radio {
@@ -149,6 +152,12 @@ public:
   uint8_t receive(uint8_t *buffer, uint8_t maxLen);
   int8_t getRSSI();
   int8_t getSNR();
+  // Instantaneous channel RSSI while in RX (no packet needed): the ambient
+  // noise floor — the "how busy is this channel" meter for AFA site surveys.
+  int8_t getRssiInst();
+  // Corrupted receptions (PHY CRC / header errors) since boot: the on-site
+  // interference meter. Rising fast while RX: stays quiet = channel is dirty.
+  uint32_t getRxErrors() const { return _rxErrors; }
 
   // Power management
   void sleep();
@@ -188,6 +197,7 @@ private:
   uint8_t _dcPeriodBase;
 
   uint16_t _lastPktLen; // setPacketParams cache (0xFFFF = invalid)
+  uint32_t _rxErrors;   // CRC/header-corrupted receptions since boot
   E28InitError _initError;
 
   int8_t _lastRSSI;

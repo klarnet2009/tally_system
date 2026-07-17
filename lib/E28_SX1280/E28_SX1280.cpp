@@ -18,6 +18,7 @@ E28Radio::E28Radio() {
   _dcSleepCount = 0;
   _dcPeriodBase = 0x02;
   _lastPktLen = 0xFFFF;
+  _rxErrors = 0;
   _initError = E28_OK;
 }
 
@@ -27,6 +28,7 @@ const char *E28Radio::initErrorStr() const {
   case E28_ERR_BUSY_STUCK: return "BUSY stuck (power?)";
   case E28_ERR_MISO_LOW:   return "MISO low (no 3V3?)";
   case E28_ERR_MISO_HIGH:  return "MISO high (no module?)";
+  case E28_ERR_READBACK:   return "cfg readback (MOSI/SCK?)";
   }
   return "?";
 }
@@ -53,29 +55,37 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
   _pinRXEN = rxen;
   _pinTXEN = txen;
 
-  // Configure pins
+  // Configure pins. Preload the NSS latch HIGH *before* pinMode: the ESP32
+  // output latch defaults LOW, so OUTPUT-first would glitch NSS low for the
+  // rest of this pin setup while SCK/MOSI still float — the chip can read
+  // that as the start of a garbage SPI frame (a classic source of
+  // works-sometimes warm-boot init failures). Write-then-pinMode brings the
+  // pin up already deselected. Same trick for the RF switch pins.
+  digitalWrite(_pinNSS, HIGH);
   pinMode(_pinNSS, OUTPUT);
   pinMode(_pinBUSY, INPUT);
   pinMode(_pinDIO1, INPUT);
   if (_pinRESET != -1)
     pinMode(_pinRESET, OUTPUT);
   if (_pinRXEN != -1) {
-    pinMode(_pinRXEN, OUTPUT);
     digitalWrite(_pinRXEN, LOW);
+    pinMode(_pinRXEN, OUTPUT);
   }
   if (_pinTXEN != -1) {
-    pinMode(_pinTXEN, OUTPUT);
     digitalWrite(_pinTXEN, LOW);
+    pinMode(_pinTXEN, OUTPUT);
   }
-
-  digitalWrite(_pinNSS, HIGH);
 
   // Initialize SPI with CALLER-provided pins. The SX1280 requires MODE0
   // (CPOL=0/CPHA=0); assert it explicitly instead of relying on the Arduino
   // default. The bus is dedicated to the radio, so configuring it once here
   // (the HW retains mode/bitorder/clock until changed) is sufficient.
+  // 4 MHz, deliberately far below the chip's 18 MHz max: our frames are 9
+  // bytes so SPI speed is irrelevant, while jumper-wire/module-socket wiring
+  // plus GPIO-matrix routing erode setup/hold margin at 8 MHz+ — marginal
+  // timing there shows up as exactly the "init sometimes fails" flakiness.
   SPI.begin(sck, miso, mosi, _pinNSS);
-  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
   SPI.endTransaction();
 
   // Reset the module
@@ -144,10 +154,14 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
   uint8_t bufferAddr[2] = {0x00, 0x00}; // TX base, RX base
   writeCommand(SX1280_CMD_SET_BUFFER_BASE_ADDR, bufferAddr, 2);
 
-  // Configure DIO1 for TX/RX done + CRC error interrupts
+  // Configure DIO1 for TX/RX done + corrupted-reception interrupts.
+  // HeaderError (bit5) matters under interference: a reception aborted on a
+  // damaged header raises no RxDone, and a duty-cycled receiver that doesn't
+  // see DIO1 would sit deaf until the timed safety net. Routing it to DIO1
+  // makes the slave's unconditional rearmAfterIrq() heal the cycle instantly.
   uint8_t irqParams[8] = {
-      0x00, 0x43, // IRQ mask: TxDone | RxDone | CrcError
-      0x00, 0x43, // DIO1 mask
+      0x00, 0x63, // IRQ mask: TxDone | RxDone | HeaderError | CrcError
+      0x00, 0x63, // DIO1 mask
       0x00, 0x00, // DIO2 mask
       0x00, 0x00  // DIO3 mask
   };
@@ -169,6 +183,21 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
     _connected = false;
     return false;
   }
+
+  // Config readback: GetPacketType must return LORA. Status reads only prove
+  // the MISO line works; this proves commands actually LAND on the chip
+  // (MOSI/SCK integrity). Without it, a marginal MOSI wire yields a
+  // "successful" init and a radio that is silently deaf/mute — the
+  // hardest-to-diagnose flavour of "it didn't start". Failing here routes
+  // into the caller's retry/recovery loop with an actionable reason.
+  uint8_t pktType = 0xEE; // poison: stays 0xEE if the read never happens
+  readCommand(SX1280_CMD_GET_PACKET_TYPE, &pktType, 1);
+  if (pktType != SX1280_PACKET_TYPE_LORA) {
+    _initError = E28_ERR_READBACK;
+    _connected = false;
+    return false;
+  }
+
   _connected = true;
   _initError = E28_OK;
   return true;
@@ -662,8 +691,11 @@ bool E28Radio::available() {
 
   // Read IRQ register directly (no DIO1 pin check — unreliable on some boards)
   uint16_t irq = getIrqStatus();
-  // Check for CRC error first — discard bad packet silently
-  if (irq & 0x0040) { // CrcError bit
+  // Corrupted reception: CRC fail on a full packet, or a header that didn't
+  // survive interference. Checked before RxDone so a bad frame is never
+  // surfaced; counted so the error rate is visible on the status lines.
+  if (irq & 0x0060) { // CrcError | HeaderError
+    _rxErrors++;
     clearIrqStatus();
     return false;
   }
@@ -747,6 +779,14 @@ uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
 int8_t E28Radio::getRSSI() { return _lastRSSI; }
 
 int8_t E28Radio::getSNR() { return _lastSNR; }
+
+int8_t E28Radio::getRssiInst() {
+  if (!_connected)
+    return 0;
+  uint8_t v = 0;
+  readCommand(SX1280_CMD_GET_RSSI_INST, &v, 1);
+  return -(int8_t)(v / 2); // same -x/2 dBm encoding as packet RSSI
+}
 
 void E28Radio::sleep() {
   // Disable RF switch
