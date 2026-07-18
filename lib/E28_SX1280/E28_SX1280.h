@@ -204,10 +204,18 @@ private:
   int8_t _lastSNR;
 
   void reset();
-  void waitBusy();
+  // false = module gone (prior latch, or BUSY stuck >1s just now). Callers
+  // must bail on false — the compiler-visible return replaces the old
+  // hand-written `waitBusy(); if (!_connected) return X;` pattern that every
+  // call site had to remember to repeat.
+  bool waitBusy();
   bool waitBusyFor(uint32_t timeoutMs); // bounded variant for probe paths
   void writeCommand(uint8_t cmd, uint8_t *data, uint8_t len);
   void readCommand(uint8_t cmd, uint8_t *data, uint8_t len);
+  // Shared TX-FIFO fill (WRITE_BUFFER at offset 0) for send()/startSend() —
+  // one copy, so a buffer-size/threshold tweak can't be applied to only one
+  // of them. false = module dropped off the bus before/during the fill.
+  bool writeTxBuffer(uint8_t *data, uint8_t len);
   void setModulationParams();
   void setPacketParams(uint8_t payloadLen);
   void clearIrqStatus();

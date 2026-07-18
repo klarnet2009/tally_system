@@ -113,8 +113,10 @@ void onLinkChange(bool lost) {
 void setup() {
     Serial.begin(115200);
     // No USB host in the field: HWCDC's default 100ms TX timeout would stall
-    // every log line once the FIFO fills. Zero = drop logs when nobody reads.
-    Serial.setTxTimeoutMs(0);
+    // every log line once the FIFO fills. 1ms (NOT 0: HWCDC's `tries--` has no
+    // zero-guard — 0 underflows to a ~49-day hang when a host is attached but
+    // not reading) = one quick retry, then logs drop silently as intended.
+    Serial.setTxTimeoutMs(1);
     delay(2000);
     Serial.println("\n=== Tally Slave (ESP-C3 + E28) ===");
     Serial.printf("Camera ID: %d\n", SLAVE_CAM_ID);
@@ -204,20 +206,10 @@ void loop() {
     // Signal-lost timer (hub broadcasts at TALLY_REFRESH_MS)
     tallyLink.tick();
 
-    // Telemetry (slave -> hub), mirrors v2: without it the hub's reachability
-    // table reports v1-based cameras OFFLINE forever. Brief blocking TX of one
-    // frame, then back to RX. Jittered by camId against lockstep collisions.
-    static uint32_t lastTlm = 0;
-    uint32_t tlmInterval = TALLY_TELEMETRY_MS + (uint32_t)SLAVE_CAM_ID * 37;
-    if (radio.isConnected() && millis() - lastTlm > tlmInterval) {
-        lastTlm = millis();
-        TallyPacket t = TallyProtocol::createTelemetryPacket(
-            SLAVE_CAM_ID, 0, radio.getRSSI(), TALLY_TLM_NO_BATTERY);
-        uint8_t tbuf[TALLY_PACKET_SIZE];
-        TallyProtocol::serialize(t, tbuf);
-        radio.send(tbuf, TALLY_PACKET_SIZE);
-        radio.restartReceive(); // back to listening
-    }
+    // Telemetry (slave -> hub): without it the hub's reachability table
+    // reports v1-based cameras OFFLINE forever. Shared beat (TallyRadio.h) —
+    // deferred while the locator owns the LED, same as v2.
+    tallyTelemetryTick(radio, SLAVE_CAM_ID, locatorStartTime == 0);
 
     // Heartbeat debug every 5s
     if (millis() - lastHeartbeat > 5000) {

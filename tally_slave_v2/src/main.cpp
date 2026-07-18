@@ -248,7 +248,12 @@ static void saveCamId(uint8_t id) {
 // but this only runs at boot on request. `requested` comes from the boot-delay
 // watcher in setup() — see the GPIO9 strap-pin note there.
 static uint8_t runSetIdModeIfRequested(uint8_t current, bool requested) {
-  if (!requested && digitalRead(PIN_BOOT) == HIGH)
+  // Trust ONLY the debounced boot watcher. A raw digitalRead fallback here
+  // used to enter set-ID on any instantaneous LOW (a fresh tap landing after
+  // the watch window, a bounce, strap-pin noise) that the 200ms-hold check
+  // had just rejected — hanging boot for 3s+ and risking a wrong camera ID
+  // being committed to NVS from stray taps.
+  if (!requested)
     return current; // not held — normal boot
 
   Serial.println("[CFG] Set-ID mode: tap BOOT to count (1..8), idle 3s to save");
@@ -331,22 +336,33 @@ void setup() {
   // Field units run on battery with NO USB host: HWCDC's default 100ms TX
   // timeout would otherwise stall every log line once the FIFO fills — and
   // onTallyState logs BEFORE painting the LED, so tally latency would spike
-  // exactly in the deployed configuration. Zero = drop logs when nobody reads.
-  Serial.setTxTimeoutMs(0);
-  Serial.setTimeout(50); // don't stall 1s on a partial serial command
+  // exactly in the deployed configuration. 1ms, NOT 0: HWCDC::write()'s
+  // `tries--` has no zero-guard, so 0 underflows on the first no-progress
+  // pass (host attached, nobody reading) into a ~49-day loop() freeze.
+  Serial.setTxTimeoutMs(1);
 
   // CDC settle delay doubles as the set-ID entry window. GPIO9 is the C3's
   // boot strap: held LOW while power is APPLIED, the ROM enters download mode
   // and this firmware never runs. So the rule is: power on first, then press
   // and hold BOOT (>=200ms) within these ~2 seconds.
   pinMode(PIN_BOOT, INPUT_PULLUP);
+  // millis()-based (like every other timer in this file), not iteration
+  // counting: the 2s window and 200ms hold threshold stay true even if this
+  // loop body ever grows another statement.
   bool bootHeld = false;
-  for (int i = 0, lowStreak = 0; i < 200; i++) { // 200 x 10ms = 2s
+  bool lowRun = false;
+  uint32_t lowStart = 0;
+  uint32_t watchStart = millis();
+  while (millis() - watchStart < 2000) { // CDC settle + set-ID entry window
     if (digitalRead(PIN_BOOT) == LOW) {
-      if (++lowStreak >= 20) // 200ms continuous — a glitch can't trigger it
+      if (!lowRun) {
+        lowRun = true;
+        lowStart = millis();
+      } else if (millis() - lowStart >= 200) { // continuous hold, not a glitch
         bootHeld = true;
+      }
     } else {
-      lowStreak = 0;
+      lowRun = false;
     }
     delay(10);
   }
@@ -523,22 +539,10 @@ void loop() {
   }
 
   // === TELEMETRY (slave -> hub): periodic so the hub knows this camera is
-  // reachable. Brief blocking TX of one frame, then re-arm RX. Jittered by
-  // camId so slaves don't all transmit in lockstep on the shared channel.
-  // (Not collision-free — a real fix would add CAD/LBT; fine for a small fleet
-  // at this rate. battery mV is 0/unknown until a VBAT sense divider is wired.)
-  static uint32_t lastTlm = 0;
-  uint32_t tlmInterval = TALLY_TELEMETRY_MS + (uint32_t)g_camId * 37;
-  if (radio.isConnected() && !locatorActive &&
-      millis() - lastTlm > tlmInterval) {
-    lastTlm = millis();
-    TallyPacket t = TallyProtocol::createTelemetryPacket(
-        g_camId, 0, radio.getRSSI(), TALLY_TLM_NO_BATTERY);
-    uint8_t buf[TALLY_PACKET_SIZE];
-    TallyProtocol::serialize(t, buf);
-    radio.send(buf, TALLY_PACKET_SIZE); // blocking, ~one packet airtime
-    radio.restartReceive();             // back to listening
-  }
+  // reachable. Shared beat (TallyRadio.h, one copy for v1/v2) — deferred
+  // while the locator owns the LED. (Not collision-free — a real fix would
+  // add CAD/LBT; fine for a small fleet at this rate.)
+  tallyTelemetryTick(radio, g_camId, !locatorActive);
 
   // Heartbeat: status log every 10 seconds
   if (millis() - lastHeartbeat > 10000) {
@@ -553,10 +557,22 @@ void loop() {
     rxFails = 0;
   }
 
-  // Serial commands (for testing)
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
+  // Serial commands (for testing) — non-blocking line accumulator: the
+  // Stream timeout is per-character, so readStringUntil() either stalls the
+  // loop (1s default) or truncates hand-typed commands (any short timeout).
+  static String cmdLine;
+  while (Serial.available()) {
+    char ch = (char)Serial.read();
+    if (ch != '\n' && ch != '\r') {
+      if (cmdLine.length() < 100) // bound against a noise flood
+        cmdLine += ch;
+      continue;
+    }
+    String cmd = cmdLine;
+    cmdLine = "";
     cmd.trim();
+    if (!cmd.length())
+      continue;
 
     // red/green/off drive the link state (not just the LED) so the next
     // heartbeat doesn't leave a stale test colour stuck on the pixel

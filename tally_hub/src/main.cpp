@@ -571,12 +571,13 @@ static void atemTick() {
 void setup() {
   // Native USB CDC; no host attached must never block the loop
   Serial.begin();
-  Serial.setTxTimeoutMs(0);
+  // 1ms, NOT 0: HWCDC::write()'s retry loop does `tries--` on a uint32_t with
+  // no zero-guard, so 0 underflows to 0xFFFFFFFF on the first no-progress pass
+  // (host attached but nobody reading, TX ring full) and loop() freezes for
+  // ~49 days — the exact hang this timeout is meant to prevent. 1 = one 1ms
+  // retry, then CDC is marked disconnected and logs drop silently as intended.
+  Serial.setTxTimeoutMs(1);
   Serial0.begin(115200); // UART bridge port (GPIO43/44)
-  // readStringUntil() otherwise stalls the loop for its default 1s timeout on
-  // a noise burst without a newline (e.g. a floating/glitching UART line)
-  Serial.setTimeout(50);
-  Serial0.setTimeout(50);
 
   // Flash log first, so even the boot banner lands in it (2x256KB ring)
   TallyLog.begin(262144);
@@ -815,12 +816,24 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
 }
 
 static void pollSerialCommands() {
+  // Non-blocking line accumulator instead of readStringUntil(): the Stream
+  // timeout is per-CHARACTER (timedRead restarts its clock every byte), so
+  // any timeout either stalls the loop on line noise (1s default) or splits
+  // hand-typed commands at normal inter-keystroke gaps (50ms). Accumulating
+  // available bytes and acting only on a complete newline does neither.
+  static String lineBuf[2];
   Stream *ports[2] = {&Serial, &Serial0};
-  for (Stream *port : ports) {
-    if (port->available()) {
-      String cmd = port->readStringUntil('\n');
-      cmd.trim();
-      handleSerialCommand(cmd, port);
+  for (int i = 0; i < 2; i++) {
+    while (ports[i]->available()) {
+      char c = (char)ports[i]->read();
+      if (c == '\n' || c == '\r') {
+        lineBuf[i].trim();
+        if (lineBuf[i].length())
+          handleSerialCommand(lineBuf[i], ports[i]);
+        lineBuf[i] = "";
+      } else if (lineBuf[i].length() < 100) { // bound against a noise flood
+        lineBuf[i] += c;
+      }
     }
   }
 }
