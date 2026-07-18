@@ -28,7 +28,11 @@
 #define E28_PIN_NSS     10  // SD D2
 #define E28_PIN_BUSY    4   // Input
 #define E28_PIN_DIO1    2   // SD D0
-#define E28_PIN_RESET   -1  // No reset line: driver soft-wakes the chip
+// Hard reset line — added after field history showed the classic botched-POR
+// pattern (random start on power-up, then flawless until power-off): a bad
+// VCC ramp latches the SX1280 in a dead state that no SPI retry recovers.
+// With NRESET wired, every init attempt starts from a clean hardware reset.
+#define E28_PIN_RESET   5   // -> E28 pad 11 (NRESET)
 #define E28_PIN_RXEN    1   // LNA Control
 #define E28_PIN_TXEN    3   // PA Control
 
