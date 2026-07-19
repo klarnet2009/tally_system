@@ -1,13 +1,17 @@
 #ifndef AUTORF_H
 #define AUTORF_H
 
-// ===== AutoRF: automatic channel selection + adaptive power =====
-// Zero-operator RF management, built from three field-proven references:
-//  - Semtech/ChirpStack ADR (LoRaWAN): link-margin control loop with an
-//    "installation margin" and slow stepwise convergence.
-//  - ExpressLRS Dynamic Power (same SX1280 silicon): LQ (link quality) is
-//    the reliability signal, RSSI the margin signal — lower power ONLY when
-//    LQ is good; raise fast on link loss / sudden drops.
+// ===== AutoRF: automatic channel selection + adaptive UPLINK power =====
+// Zero-operator RF management, built from field-proven references.
+// DESIGN NOTE: the HUB's own TX power is FIXED at TALLY_TX_POWER. The hub is
+// mains/USB powered, so trading forward-link margin — the safety-critical
+// "light comes on" path — for spectrum tidiness or power saving isn't worth
+// it; the hub simply runs at full margin for the best possible range. Adaptive
+// power is kept ONLY for the battery-powered slaves' uplink telemetry, where
+// it actually saves energy. Channel selection stays automatic. References:
+//  - ExpressLRS Dynamic Power (same SX1280 silicon): LQ is the reliability
+//    signal, RSSI the margin signal — used for the per-cam UPLINK loop.
+//  - Semtech/ChirpStack ADR (LoRaWAN): stepwise link-margin convergence.
 //  - Bluetooth AFH: channels are classified by OUR OWN error rate, not by
 //    foreign energy; unused channels are re-scouted periodically (a bad
 //    channel is never blacklisted forever).
@@ -31,17 +35,13 @@
 #define AUTORF_OPPORT_DWELL_MS (30UL * 60 * 1000)  // stricter for opportunistic
 #define AUTORF_MAX_SWITCHES_HOUR 4
 #define AUTORF_BLOCK_LOG_MS (5UL * 60 * 1000)      // "switch blocked" rate
-#define AUTORF_PWR_EVAL_MS 30000UL      // hub power eval period
-#define AUTORF_CAM_PWR_EVAL_MS 60000UL  // per-cam power eval period
+// Uplink (slave telemetry) power control — hub TX power is fixed, no knobs.
+#define AUTORF_CAM_PWR_EVAL_MS 60000UL  // per-cam uplink power eval period
 #define AUTORF_TARGET_DBM (-102)        // uplink telemetry target at the hub
-#define AUTORF_WEAK_HIGH (-99)          // downlink weakest above -> lower
-#define AUTORF_WEAK_LOW (-105)          // downlink weakest below -> raise
-                                        // (SF9 floor -114, margin 9-12 dB)
-#define AUTORF_HUB_PWR_MAX 4            // auto cap: 3V3 rail brownout limit
-#define AUTORF_PWR_STEP 3
-#define AUTORF_PWR_HOLD_MS (10UL * 60 * 1000) // no down-steps after OFFLINE
-#define AUTORF_RESTORE_WINDOW_MS (2UL * 60 * 1000) // power-down -> OFFLINE
-#define AUTORF_CRASH_DROP_DB 10         // sudden per-cam downlink drop
+                                        // (SF9 floor -114, ~12 dB margin)
+#define AUTORF_PWR_STEP 3               // dB per uplink power step
+#define AUTORF_RESTORE_WINDOW_MS (2UL * 60 * 1000) // cam vanished right after a
+                                        // power-down -> blind-restore window
 
 static bool g_autoRf = true; // manual `chan`/`power` flips this off
 
@@ -56,13 +56,11 @@ static uint32_t g_lastAutoSwitch = 0;
 static uint32_t g_switchHourStart = 0;
 static uint8_t g_switchesThisHour = 0;
 static uint32_t g_lastBlockLog = 0;
-static uint32_t g_pwrHoldUntil = 0;    // down-steps frozen until then
 static int8_t g_camPower[17];          // hub-assigned telemetry power per cam
 static int8_t g_camPowerPrev[17];      // for the blind-restore path
 static int8_t g_camPowerFloor[17];     // never auto-assign below this
 static uint32_t g_camPwrEvalAt[17];
 static uint32_t g_camPwrCmdAt[17];     // last power command to this cam
-static int8_t g_camDlPrev[17];         // downlink rssi last eval (crash detect)
 
 static void autoRfInit() {
   if (g_autoRfInited)
@@ -180,16 +178,10 @@ static void autoRfTrySwitch(uint8_t idx, const char *reason) {
           (g_chanList[idx] % 1000000UL) / 100000UL, reason);
 }
 
-static void autoRfSetHubPower(int8_t p) {
-  g_txPower = p;
-  radio.setTxPower(p);
-}
-
-// ExpressLRS rule: a lost camera raises the hub power one step (bounded,
-// once per hold window so a flapping cam can't ratchet), and freezes
-// down-steps for a while. A cam that went OFFLINE shortly after we LOWERED
-// its power gets a blind restore (the downlink is strong, it will hear) and
-// a floor so we never hide it again.
+// A cam that went OFFLINE shortly after we LOWERED its UPLINK (telemetry)
+// power gets a blind restore — the downlink is strong so it will hear the
+// command — plus a floor so we never hide it again. Hub TX power is fixed, so
+// a lost cam no longer changes it (the forward link is already at full power).
 static void autoRfOnCamChange(uint8_t id, bool online) {
   if (!g_autoRf || id < 1 || id > 16)
     return;
@@ -213,12 +205,6 @@ static void autoRfOnCamChange(uint8_t id, bool online) {
     hublogf("[AUTO] cam %u vanished after power-down — restored %d dBm, floor set\n",
             id, (int)g_camPower[id]);
   }
-  if (now > g_pwrHoldUntil && g_txPower < AUTORF_HUB_PWR_MAX) {
-    autoRfSetHubPower(g_txPower + AUTORF_PWR_STEP);
-    hublogf("[AUTO] cam %u OFFLINE — hub power up to %d dBm, hold 10min\n", id,
-            (int)g_txPower);
-  }
-  g_pwrHoldUntil = now + AUTORF_PWR_HOLD_MS;
 }
 
 // The two ADR loops + channel state machine. Call every loop pass; all
@@ -297,46 +283,9 @@ static void autoRfTick() {
     }
   }
 
-  // --- Downlink power (hub): keep the WEAKEST online cam inside
-  // [AUTORF_WEAK_LOW, AUTORF_WEAK_HIGH]. LQ gate: ExpressLRS lowers power
-  // only when the link is healthy — so do we; up-steps are always allowed.
-  int8_t weakest = 0;
-  uint8_t online = 0;
-  bool lqGood = g_rxErrEma < AUTORF_RXERR_TRIG;
-  for (uint8_t id = 1; id <= 16; id++) {
-    if (!g_camReachable[id])
-      continue;
-    if (g_camLinkPoor[id])
-      lqGood = false;
-    if (!online || g_camRssi[id] < weakest)
-      weakest = g_camRssi[id];
-    online++;
-  }
-  if (online && now > g_pwrHoldUntil) {
-    if (weakest < AUTORF_WEAK_LOW && g_txPower < AUTORF_HUB_PWR_MAX) {
-      autoRfSetHubPower(g_txPower + AUTORF_PWR_STEP);
-      hublogf("[AUTO] weakest cam %d dBm — hub power up to %d dBm\n",
-              (int)weakest, (int)g_txPower);
-    } else if (lqGood && weakest > AUTORF_WEAK_HIGH && g_txPower > -18) {
-      autoRfSetHubPower(g_txPower - AUTORF_PWR_STEP);
-      hublogf("[AUTO] weakest cam %d dBm, link clean — hub power down to %d dBm\n",
-              (int)weakest, (int)g_txPower);
-    }
-  }
-
-  // --- Sudden per-cam downlink crash (moved behind a wall): react within
-  // one eval instead of waiting for the OFFLINE timeout.
-  for (uint8_t id = 1; id <= 16; id++) {
-    if (g_camReachable[id] && g_camDlPrev[id] != 0 &&
-        g_camDlPrev[id] - g_camRssi[id] >= AUTORF_CRASH_DROP_DB &&
-        g_txPower < AUTORF_HUB_PWR_MAX) {
-      autoRfSetHubPower(g_txPower + AUTORF_PWR_STEP);
-      hublogf("[AUTO] cam %u downlink crashed %d dB — hub power up to %d dBm\n",
-              id, (int)(g_camDlPrev[id] - g_camRssi[id]), (int)g_txPower);
-    }
-    if (g_camLastSeen[id])
-      g_camDlPrev[id] = g_camRssi[id];
-  }
+  // --- Downlink power (hub): FIXED at TALLY_TX_POWER. The hub is mains/USB
+  // powered, so it always runs at full forward-link margin (the safety-
+  // critical "light on" path) — no adaptive up/down here. See header note.
 
   // --- Uplink power (per-cam telemetry): converge each cam's RSSI at the
   // hub onto AUTORF_TARGET_DBM, 3dB steps, bounded by its floor.
@@ -382,9 +331,10 @@ static void autoRfManualOverride(const char *what) {
 static void autoRfReport() {
   autoRfInit();
   uint8_t cur = autoRfCurIdx();
-  hublogf("[AUTO] mode=%s cur=ch%u rxerr=%.1f/min switches=%u/%u per hour\n",
-          g_autoRf ? "ON" : "OFF (manual)", cur, (double)g_rxErrEma,
-          g_switchesThisHour, AUTORF_MAX_SWITCHES_HOUR);
+  hublogf("[AUTO] mode=%s cur=ch%u hubpwr=%d dBm (fixed) rxerr=%.1f/min "
+          "switches=%u/%u per hour\n",
+          g_autoRf ? "ON" : "OFF (manual)", cur, (int)g_txPower,
+          (double)g_rxErrEma, g_switchesThisHour, AUTORF_MAX_SWITCHES_HOUR);
   for (uint8_t i = 0; i < TALLY_CHAN_COUNT; i++)
     hublogf("[AUTO] ch%u: noise=%d dBm%s\n", i, (int)g_noise[i],
             i == cur ? " <- current" : "");
