@@ -34,6 +34,12 @@ E28Radio radio;
 TallyLink tallyLink;
 uint32_t lastHeartbeat = 0;
 
+// AFA: follow the hub's CMD_SET_CHANNEL, and scan this list when the link is
+// lost (same behaviour as v2). The announced frequency is authoritative —
+// recovery and scan hops track it here, not a fixed table entry.
+static const uint32_t kChanList[] = TALLY_CHAN_LIST;
+static uint32_t g_chanFreq = TALLY_RF_FREQ_HZ;
+
 // ⚡ Bolt: State tracking for non-blocking LED updates
 uint32_t locatorStartTime = 0;
 uint32_t lastLedToggle = 0;
@@ -110,6 +116,21 @@ void onLinkChange(bool lost) {
     Serial.println(lost ? "[LINK] Signal lost!" : "[LINK] Signal restored");
 }
 
+// Hub announced a coordinated channel switch (AFA) — follow it, same as v2.
+// Without this a "chan N" on the hub stranded every v1 unit on the old
+// channel until the hub came back.
+void onChannelChange(uint32_t freqHz, uint8_t chanIdx) {
+    (void)chanIdx; // v1's scan walks the list from wherever it is
+    if (freqHz < 2400300000UL || freqHz > 2483300000UL)
+        return; // sanity: stay inside the 2.4 GHz ISM band
+    g_chanFreq = freqHz; // remember for radio recovery — it is authoritative
+    Serial.printf("[CHAN] hub -> %lu.%lu MHz\n",
+                  (unsigned long)(freqHz / 1000000UL),
+                  (unsigned long)((freqHz % 1000000UL) / 100000UL));
+    radio.setFrequency(freqHz);
+    radio.restartReceive();
+}
+
 void setup() {
     Serial.begin(115200);
     // No USB host in the field: HWCDC's default 100ms TX timeout would stall
@@ -144,15 +165,19 @@ void setup() {
     }
 
     tallyLink.begin(SLAVE_CAM_ID, onTallyState, onLocatorPing, onLinkChange);
+    tallyLink.setChannelCallback(onChannelChange); // follow AFA switches
 
     // Set to RX mode
     if (ok)
         radio.startReceive();
 }
 
-// Post-recovery hook for the shared tallyRadioRecover() (TallyRadio.h): v1
-// has no runtime power/channel overrides — just re-arm continuous RX.
-static void onRadioRecovered() { radio.startReceive(); }
+// Post-recovery hook for the shared tallyRadioRecover() (TallyRadio.h):
+// restore the hub-announced channel, then re-arm continuous RX.
+static void onRadioRecovered() {
+    radio.setFrequency(g_chanFreq); // not blindly the home channel
+    radio.startReceive();
+}
 
 // Re-init the radio if a runtime fault (stuck BUSY) latched it disconnected,
 // so a transient glitch can't leave the receiver permanently deaf.
@@ -198,6 +223,40 @@ void loop() {
 
     // Signal-lost timer (hub broadcasts at TALLY_REFRESH_MS)
     tallyLink.tick();
+
+    // RX safety net (same as v2): timed full re-arm restores RX no matter
+    // what state the chip fell into (undetected RX abort, ESD glitch) —
+    // tryRadioRecover() only fires when the driver itself latched a fault.
+    static uint32_t lastRearm = 0;
+    if (tallyLink.msSinceLastRx() > TALLY_RX_REARM_MS &&
+        millis() - lastRearm > TALLY_RX_REARM_MS) {
+        lastRearm = millis();
+        radio.restartReceive();
+    }
+
+    // AFA channel scan (same as v2): link lost -> maybe the hub escaped a
+    // jammed channel (or we rebooted while the fleet runs elsewhere). Walk
+    // the list, ~2s per channel, full first dwell on the current one.
+    static uint32_t lastScanHop = 0;
+    static bool scanning = false;
+    static uint8_t scanIdx = 0;
+    if (!tallyLink.signalLost()) {
+        scanning = false;
+    } else if (radio.isConnected()) {
+        if (!scanning) {
+            scanning = true;
+            lastScanHop = millis();
+        } else if (millis() - lastScanHop > 2000) {
+            lastScanHop = millis();
+            scanIdx = (scanIdx + 1) % TALLY_CHAN_COUNT;
+            g_chanFreq = kChanList[scanIdx]; // where we're listening now
+            radio.setFrequency(g_chanFreq);
+            radio.restartReceive();
+            Serial.printf("[SCAN] listening on %lu.%lu MHz\n",
+                          (unsigned long)(g_chanFreq / 1000000UL),
+                          (unsigned long)((g_chanFreq % 1000000UL) / 100000UL));
+        }
+    }
 
     // Telemetry (slave -> hub): without it the hub's reachability table
     // reports v1-based cameras OFFLINE forever. Shared beat (TallyRadio.h) —
