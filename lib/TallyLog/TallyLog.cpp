@@ -82,7 +82,7 @@ void TallyLogClass::rotateIfNeeded() {
     Serial.println("[LOG] flash reopen failed after rotation — logging disabled");
 }
 
-void TallyLogClass::dump(Stream &out) {
+void TallyLogClass::dump(Stream &out, void (*pump)()) {
   if (!_ok) {
     out.println("[LOG] flash log unavailable");
     return;
@@ -103,6 +103,8 @@ void TallyLogClass::dump(Stream &out) {
       if (!n)
         break;
       out.write(buf, n);
+      if (pump)
+        pump(); // let the caller's loop duties (heartbeat, ATEM) run
     }
     f.close();
     out.printf("---->8---- END %s\n", names[i]);

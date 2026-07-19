@@ -84,10 +84,11 @@ static bool radioInit() {
 static uint32_t g_camLastSeen[17] = {0};
 static int8_t g_camRssi[17] = {0};
 static bool g_camReachable[17] = {false};
-// Slaves jitter their interval by camId*37ms (worst case ~2.6s for cam 16), so
-// 4x the base leaves ~3 real beats of margin — 3x flapped OFFLINE/ONLINE on a
-// high-ID camera after just two lost frames.
-#define CAM_REACHABLE_MS (4 * TALLY_TELEMETRY_MS)
+// Slaves jitter their interval by camId*JITTER (worst case ~2.6s for cam 16),
+// and the hub is deaf during its own ~96ms heartbeat TX every 500ms (~19%
+// duty) — the window must cover the worst-case jittered interval with beats
+// to spare, or a few lost uplinks flap a high-ID camera OFFLINE/ONLINE.
+#define CAM_REACHABLE_MS (4 * (TALLY_TELEMETRY_MS + 16 * TALLY_TELEMETRY_JITTER_MS))
 
 // ⚡ Bolt: Non-blocking transmission queue to prevent delay() stalls in main loop
 #define LORA_QUEUE_SIZE 16
@@ -109,7 +110,7 @@ static void processLoraQueue() {
   static uint32_t lastTxDoneTime = 0;
 
   // Finish the in-flight transmission first (checkTxDone tears down PA/IRQ);
-  // the loop never blocks on TX airtime (~15ms with the long preamble)
+  // the loop never blocks on TX airtime (~96ms at SF9 with the long preamble)
   if (radio.txActive()) {
     if (radio.checkTxDone()) {
       // A 100ms timeout (stuck PA/antenna fault) counts as a drop, not a TX,
@@ -198,6 +199,43 @@ static void sweepReachability() {
       g_camReachable[id] = reach;
       hublogf("[TLM] cam %u %s (rssi=%d)\n", id, reach ? "ONLINE" : "OFFLINE",
               g_camRssi[id]);
+    }
+  }
+}
+
+// === STATE_ALL broadcast: on change + every TALLY_REFRESH_MS (heartbeat).
+// Runs even with ATEM down — losing the switcher must not look like a dead
+// radio link to the slaves; they keep showing the last known masks.
+// Extracted from loop() so the log-dump pump can keep beating mid-dump.
+static void heartbeatTick() {
+  static uint32_t lastStateSend = 0;
+  static uint16_t lastSentProg = 0xFFFF;
+  static uint16_t lastSentPrev = 0xFFFF;
+  bool masksChanged = (g_progMask != lastSentProg) || (g_prevMask != lastSentPrev);
+  if (masksChanged || millis() - lastStateSend >= TALLY_REFRESH_MS) {
+    lastSentProg = g_progMask;
+    lastSentPrev = g_prevMask;
+    lastStateSend = millis();
+    // sourceLive: in production, true only while ATEM is actually connected
+    // (frozen masks after an ATEM drop are flagged stale so slaves can warn);
+    // in test mode the generated stream is always "live".
+#ifdef LORA_TEST_MODE
+    bool sourceLive = true;
+#else
+    bool sourceLive = (atemPhase == ATEM_RUNNING);
+#endif
+    TallyPacket pkt =
+        TallyProtocol::createStateAllPacket(g_progMask, g_prevMask, sourceLive);
+    // Burst-on-change: a tally transition ("camera goes ON AIR") is otherwise a
+    // single fire-and-forget packet; one RF collision would show the wrong
+    // light until the next heartbeat (up to TALLY_REFRESH_MS). Sending the
+    // change 3x (queued, ~2ms apart) drops the residual loss from p to ~p^3 and
+    // cuts worst-case wrong-light latency from ~500ms to tens of ms. Heartbeats
+    // (no change) send once — slaves act on STATE_ALL idempotently.
+    enqueueLora(pkt);
+    if (masksChanged) {
+      enqueueLora(pkt);
+      enqueueLora(pkt);
     }
   }
 }
@@ -498,7 +536,8 @@ static void atemTick() {
       atemPhase = ATEM_RUNNING;
       hublogf("[ATEM] connected\n");
     } else if (millis() - atemAttemptStart > ATEM_CONNECT_TIMEOUT_MS) {
-      atemPhase = ATEM_IDLE; // next try after ATEM_RETRY_MS
+      atemPhase = ATEM_IDLE;
+      lastAtemAttempt = millis(); // the logged retry delay must actually happen
       hublogf("[ATEM] connect timeout, retry in %ds\n", ATEM_RETRY_MS / 1000);
     }
     break;
@@ -613,6 +652,11 @@ static void noiseSurvey() {
     hublogf("[NOISE] radio DEAD — fix the module first\n");
     return;
   }
+  if (radio.txActive()) {
+    // Retuning mid-TX kills the packet on air and miscounts the drop
+    hublogf("[NOISE] TX in flight — try again in a moment\n");
+    return;
+  }
   for (uint8_t i = 0; i < TALLY_CHAN_COUNT; i++) {
     radio.setFrequency(g_chanList[i]);
     radio.startReceive();
@@ -636,6 +680,19 @@ static void noiseSurvey() {
   radio.setFrequency(g_chanFreq);
   radio.startReceive();
   hublogf("[NOISE] quieter than -100 = clean; louder than -85 = busy\n");
+}
+
+// The log dump streams up to ~512KB at 115200 ≈ 45s; without a pump the loop
+// would freeze that long — no heartbeats (fleet-wide signal-lost alarm at 3s
+// + AFA channel scans), a dropped ATEM connection, a stalled TX queue. The
+// dump calls this after every 256B chunk, keeping the fleet alive mid-dump.
+static void logDumpPump() {
+  processLoraQueue();
+  serviceTelemetry();
+  heartbeatTick();
+#ifndef LORA_TEST_MODE
+  atemTick();
+#endif
 }
 
 // ===== Serial console (both ports): status / ping / reinit / help =====
@@ -674,6 +731,10 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
       locatorNextMs = millis();
     }
   } else if (cmd == "reinit") {
+    if (radio.txActive()) {
+      hublogf("[CMD] TX in flight — reinit would kill it; try again\n");
+      return;
+    }
     hublogf("[CMD] radio re-init: %s (%s)\n",
             radioInit() ? "OK" : "FAILED", radio.initErrorStr());
   } else if (cmd.startsWith("power")) {
@@ -767,8 +828,9 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
     delay(300);
     ESP.restart();
   } else if (cmd == "log") {
-    // Field-log dump to the asking console only (up to ~512KB @115200 ≈ 45s)
-    TallyLog.dump(io ? *io : Serial);
+    // Field-log dump to the asking console only (up to ~512KB @115200 ≈ 45s;
+    // logDumpPump keeps heartbeats/ATEM/telemetry running between chunks)
+    TallyLog.dump(io ? *io : Serial, logDumpPump);
   } else if (cmd == "logclear") {
     TallyLog.clear();
     hublogf("[LOG] cleared\n");
@@ -878,39 +940,8 @@ void loop() {
   }
 #endif
 
-  // === STATE_ALL broadcast: on change + every TALLY_REFRESH_MS (heartbeat).
-  // Runs even with ATEM down — losing the switcher must not look like a dead
-  // radio link to the slaves; they keep showing the last known masks.
-  static uint32_t lastStateSend = 0;
-  static uint16_t lastSentProg = 0xFFFF;
-  static uint16_t lastSentPrev = 0xFFFF;
-  bool masksChanged = (g_progMask != lastSentProg) || (g_prevMask != lastSentPrev);
-  if (masksChanged || millis() - lastStateSend >= TALLY_REFRESH_MS) {
-    lastSentProg = g_progMask;
-    lastSentPrev = g_prevMask;
-    lastStateSend = millis();
-    // sourceLive: in production, true only while ATEM is actually connected
-    // (frozen masks after an ATEM drop are flagged stale so slaves can warn);
-    // in test mode the generated stream is always "live".
-#ifdef LORA_TEST_MODE
-    bool sourceLive = true;
-#else
-    bool sourceLive = (atemPhase == ATEM_RUNNING);
-#endif
-    TallyPacket pkt =
-        TallyProtocol::createStateAllPacket(g_progMask, g_prevMask, sourceLive);
-    // Burst-on-change: a tally transition ("camera goes ON AIR") is otherwise a
-    // single fire-and-forget packet; one RF collision would show the wrong
-    // light until the next heartbeat (up to TALLY_REFRESH_MS). Sending the
-    // change 3x (queued, ~2ms apart) drops the residual loss from p to ~p^3 and
-    // cuts worst-case wrong-light latency from ~500ms to tens of ms. Heartbeats
-    // (no change) send once — slaves act on STATE_ALL idempotently.
-    enqueueLora(pkt);
-    if (masksChanged) {
-      enqueueLora(pkt);
-      enqueueLora(pkt);
-    }
-  }
+  // === STATE_ALL broadcast: on change + heartbeat (see heartbeatTick())
+  heartbeatTick();
 
   pollSerialCommands();
 
@@ -980,7 +1011,7 @@ void loop() {
   }
 
   // Second queue pass: with one pass per ~10ms loop, TxDone detection (and
-  // PA-off) lagged the ~15ms airtime by up to a full tick; this halves it
+  // PA-off) lagged the ~96ms airtime by up to a full tick; this halves it
   processLoraQueue();
 
   delay(10);

@@ -21,9 +21,12 @@ public:
   void write(const char *line);
   void logf(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
-  void tick();            // periodic flush — call every loop pass
-  void dump(Stream &out); // stream /log.old then /log.txt with cut markers
-  void clear();           // wipe both files, start fresh
+  void tick(); // periodic flush — call every loop pass
+  // Stream /log.old then /log.txt with cut markers. pump (optional) runs
+  // after every chunk so a long dump can't starve the caller's loop duties
+  // (hub: radio heartbeats / ATEM keepalive during a ~45s dump).
+  void dump(Stream &out, void (*pump)() = nullptr);
+  void clear(); // wipe both files, start fresh
 
   size_t size() const { return _size; }
   bool ok() const { return _ok; }
