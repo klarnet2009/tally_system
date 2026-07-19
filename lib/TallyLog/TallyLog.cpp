@@ -78,6 +78,8 @@ void TallyLogClass::rotateIfNeeded() {
   _size = 0;
   if (_ok)
     logf("===== ROTATED =====\n");
+  else
+    Serial.println("[LOG] flash reopen failed after rotation — logging disabled");
 }
 
 void TallyLogClass::dump(Stream &out) {
@@ -108,6 +110,8 @@ void TallyLogClass::dump(Stream &out) {
   s_file = LittleFS.open(kLog, FILE_APPEND);
   _ok = (bool)s_file;
   _size = _ok ? s_file.size() : 0;
+  if (!_ok)
+    Serial.println("[LOG] flash reopen failed after dump — logging disabled");
 }
 
 void TallyLogClass::clear() {
@@ -121,4 +125,6 @@ void TallyLogClass::clear() {
   _size = 0;
   if (_ok)
     logf("===== LOG CLEARED =====\n");
+  else
+    Serial.println("[LOG] flash reopen failed after clear — logging disabled");
 }

@@ -4,7 +4,7 @@
 //  Pinout verified per HARDWARE_GUIDE.md (2026-02-10), see pins.h
 //
 //  RX is interrupt-driven (DIO1) and, with -DPOWER_SAVE, duty-cycled:
-//  the radio sleeps ~66% of the time and still catches every packet
+//  the radio sleeps ~70% of the time and still catches every packet
 //  thanks to the hub's 40-symbol preamble (see TallyConfig.h).
 //  Protocol dispatch + link supervision live in TallyLink (shared with
 //  slave v1); this file only renders states on the LED/buzzer.

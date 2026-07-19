@@ -34,12 +34,17 @@
 // Slave -> hub telemetry interval (jittered per device to avoid lockstep
 // collisions on the shared channel).
 #define TALLY_TELEMETRY_MS 2000
+#define TALLY_TELEMETRY_JITTER_MS 37 // per-camId offset, worst case 16*37 = 592ms
 
-// TX preamble 40 symbols (~12.6 ms at SF7/BW406): guarantees a full RX window
-// of a duty-cycled receiver (3 ms on / 6 ms off) lands inside the preamble
+// TX preamble 40 symbols (~50 ms at SF9/BW406): guarantees a full RX window
+// of a duty-cycled receiver lands inside the preamble. Duty-cycle timing must
+// track the symbol time (1.26 ms at SF9): the chip's header-wait budget after
+// a preamble detect is sleep + 2*rx, so rx >= ~11.3 ms and sleep + 2*rx must
+// exceed the preamble — 12/28 gives 52 ms with ~30% radio-on (was 3/6 at SF7,
+// which is only 2.4 symbols per window at SF9 and misses most packets).
 #define TALLY_PREAMBLE_SYMBOLS 40
-#define TALLY_DC_RX_MS 3    // duty-cycle RX window
-#define TALLY_DC_SLEEP_MS 6 // duty-cycle sleep window (~33% radio-on)
+#define TALLY_DC_RX_MS 12   // duty-cycle RX window
+#define TALLY_DC_SLEEP_MS 28 // duty-cycle sleep window (~30% radio-on)
 
 // SX1280 *chip* TX power in dBm (-18..+12). The E28-2G4M27S adds ~13-14 dB of
 // external PA gain on top, so this is NOT the radiated EIRP. Applied on every

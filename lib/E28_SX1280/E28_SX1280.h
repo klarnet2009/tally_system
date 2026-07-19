@@ -97,7 +97,7 @@ public:
   // Transmission (non-blocking): startSend() kicks the TX and returns;
   // poll checkTxDone() — it tears down (IRQ clear, PA off, standby) when done.
   // After checkTxDone() returns true, txSucceeded() tells real TxDone (true)
-  // apart from the 100ms timeout/failure path (false).
+  // apart from the airtime-timeout/failure path (false).
   bool startSend(uint8_t *data, uint8_t len);
   bool checkTxDone();
   bool txActive() { return _txActive; }
@@ -159,6 +159,7 @@ private:
   bool _txActive;
   bool _txSuccess;        // result of the last completed async TX
   uint32_t _txStartMs;
+  uint8_t _txLen;         // payload length of the async TX in flight
 
   // Last-started RX mode, so rearmAfterIrq()/restartReceive() can re-issue it
   enum RxMode : uint8_t { RX_NONE, RX_CONTINUOUS, RX_DUTY_CYCLE };
@@ -186,6 +187,11 @@ private:
   // false = the BUSY wait failed; nothing was clocked, caller must bail.
   bool spiFrame(const uint8_t *header, uint8_t headerLen,
                 const uint8_t *txData, uint8_t *rxData, uint8_t len);
+  // TX-done timeout derived from the configured airtime (SF/BW/CR/preamble/
+  // payload), plus margin — a hardcoded cap silently truncates frames the
+  // moment airtime crosses it (the SF10 upgrade path blew through the old
+  // 100ms).
+  uint32_t txTimeoutMs(uint8_t payloadLen) const;
   void writeCommand(uint8_t cmd, uint8_t *data, uint8_t len);
   void readCommand(uint8_t cmd, uint8_t *data, uint8_t len);
   // Shared TX-FIFO fill (WRITE_BUFFER at offset 0) for send()/startSend() —

@@ -32,15 +32,15 @@ static inline void tallyApplyRadioProfile(E28Radio &radio) {
 // Slave -> hub telemetry beat, shared by v1 and v2 so the two firmwares
 // can't drift (they already had: v1's hand-copied block was missing v2's
 // locator gate). Call every loop pass; sends at most one frame per jittered
-// interval (camId*37ms offset breaks lockstep collisions on the shared
-// channel), then re-arms RX. `allowNow` lets a firmware defer TX around
-// UI-critical sections (both defer during the locator blink so a blocking
+// interval (camId*TALLY_TELEMETRY_JITTER_MS offset breaks lockstep collisions
+// on the shared channel), then re-arms RX. `allowNow` lets a firmware defer TX
+// around UI-critical sections (both defer during the locator blink so a blocking
 // ~15-100ms send can't stutter it). battMv=0 + TALLY_TLM_NO_BATTERY until a
 // VBAT divider is wired on either board.
 static inline void tallyTelemetryTick(E28Radio &radio, uint8_t camId,
                                       bool allowNow) {
   static uint32_t lastTlm = 0;
-  uint32_t interval = TALLY_TELEMETRY_MS + (uint32_t)camId * 37;
+  uint32_t interval = TALLY_TELEMETRY_MS + (uint32_t)camId * TALLY_TELEMETRY_JITTER_MS;
   if (!allowNow || !radio.isConnected() || millis() - lastTlm <= interval)
     return;
   lastTlm = millis();

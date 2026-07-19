@@ -391,6 +391,34 @@ bool E28Radio::writeTxBuffer(uint8_t *data, uint8_t len) {
   return spiFrame(hdr, 2, data, nullptr, len);
 }
 
+uint32_t E28Radio::txTimeoutMs(uint8_t payloadLen) const {
+  // LoRa airtime from the live modulation config (register encodings):
+  // SF = _sf>>4, CR index = _cr (0x01..0x04 = 4/5..4/8), preamble symbols =
+  // mantissa << exponent. Explicit header, CRC on, no IQ invert, DE=0
+  // (DE only matters at SF11/12 with BW<=125kHz, which this chip never runs).
+  uint32_t bwHz;
+  switch (_bw) {
+  case LORA_BW_1600: bwHz = 1625000; break;
+  case LORA_BW_0800: bwHz = 812500; break;
+  case LORA_BW_0200: bwHz = 203125; break;
+  case LORA_BW_0400:
+  default:           bwHz = 406250; break;
+  }
+  const uint8_t sf = _sf >> 4;
+  const uint16_t preambleSym =
+      (uint16_t)(_preambleByte & 0x0F) << (_preambleByte >> 4);
+  // Payload symbols: 8 + max(ceil((8PL - 4SF + 28 + 16) / 4SF) * (CR+4), 0)
+  int32_t num = 8 * (int32_t)payloadLen - 4 * sf + 28 + 16;
+  int32_t denom = 4 * sf;
+  int32_t sym = (num > 0) ? ((num + denom - 1) / denom) * (_cr + 4) : 0;
+  uint32_t payloadSym = 8 + (uint32_t)sym;
+  // (preamble + 4.25 + payload) * Tsym, all in integer microseconds
+  uint64_t tsymUs = ((uint64_t)1 << sf) * 1000000ULL / bwHz;
+  uint64_t airtimeUs =
+      (4ULL * preambleSym + 17 + 4ULL * payloadSym) * tsymUs / 4;
+  return (uint32_t)(airtimeUs / 1000ULL) + 50; // +50ms margin
+}
+
 bool E28Radio::send(uint8_t *data, uint8_t len) {
   if (!_connected)
     return false;
@@ -424,9 +452,10 @@ bool E28Radio::send(uint8_t *data, uint8_t len) {
   }
 
   // Wait for TX done (elapsed-time pattern: immune to millis() rollover)
-  uint32_t txStart = millis(); // 100ms TxDone timeout (packet is <5ms)
+  uint32_t txStart = millis();
+  uint32_t txTimeout = txTimeoutMs(len); // airtime + margin (~146ms at SF9)
   while (!isTxDone()) { // TxDone bit
-    if (millis() - txStart > 100) {
+    if (millis() - txStart > txTimeout) {
       if (_pinTXEN != -1)
         digitalWrite(_pinTXEN, LOW);
       standby();
@@ -475,6 +504,7 @@ bool E28Radio::startSend(uint8_t *data, uint8_t len) {
 
   _txActive = true;
   _txStartMs = millis();
+  _txLen = len;
   return true;
 }
 
@@ -482,12 +512,13 @@ bool E28Radio::checkTxDone() {
   if (!_txActive)
     return true;
 
-  // 100ms cap mirrors the blocking send(); a tally packet is on air <15ms
+  // Airtime-derived cap mirrors the blocking send() (~96ms airtime at SF9,
+  // so ~146ms with margin)
   bool done = isTxDone();
-  if (!done && millis() - _txStartMs <= 100)
+  if (!done && millis() - _txStartMs <= txTimeoutMs(_txLen))
     return false;
 
-  // done == true: real TxDone; done == false: 100ms timeout (TX failed).
+  // done == true: real TxDone; done == false: timeout (TX failed).
   // Callers count drops on !txSucceeded() so a stuck PA/antenna fault shows up.
   _txSuccess = done;
 
@@ -617,15 +648,20 @@ bool E28Radio::available() {
 
   // Read IRQ register directly (no DIO1 pin check — unreliable on some boards)
   uint16_t irq = getIrqStatus();
+  // RxDone first: when a valid frame completes and a colliding/foreign frame
+  // latches CrcError alongside it, draining the FIFO must win — receive()
+  // clears every IRQ bit anyway. The old order wiped the pending RxDone
+  // together with the error, silently abandoning a good frame.
+  if (irq & 0x0002) // RxDone bit
+    return true;
   // Corrupted reception: CRC fail on a full packet, or a header that didn't
-  // survive interference. Checked before RxDone so a bad frame is never
-  // surfaced; counted so the error rate is visible on the status lines.
+  // survive interference. Counted so the error rate is visible on the
+  // status lines.
   if (irq & 0x0060) { // CrcError | HeaderError
     _rxErrors++;
     clearIrqStatus();
-    return false;
   }
-  return (irq & 0x0002) != 0; // RxDone bit
+  return false;
 }
 
 uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
