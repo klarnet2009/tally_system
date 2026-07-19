@@ -36,16 +36,21 @@ static inline void tallyApplyRadioProfile(E28Radio &radio) {
 // on the shared channel), then re-arms RX. `allowNow` lets a firmware defer TX
 // around UI-critical sections (both defer during the locator blink so a blocking
 // ~15-100ms send can't stutter it). battMv=0 + TALLY_TLM_NO_BATTERY until a
-// VBAT divider is wired on either board.
+// VBAT divider is wired on either board. `linkPoor` (TallyLink::linkPoor())
+// tells the hub this receiver is missing heartbeats — its AutoRF uses it to
+// tell a struggling camera apart from a bad channel.
 static inline void tallyTelemetryTick(E28Radio &radio, uint8_t camId,
-                                      bool allowNow) {
+                                      bool allowNow, bool linkPoor) {
   static uint32_t lastTlm = 0;
   uint32_t interval = TALLY_TELEMETRY_MS + (uint32_t)camId * TALLY_TELEMETRY_JITTER_MS;
   if (!allowNow || !radio.isConnected() || millis() - lastTlm <= interval)
     return;
   lastTlm = millis();
+  uint8_t flags = TALLY_TLM_NO_BATTERY;
+  if (linkPoor)
+    flags |= TALLY_TLM_LINK_POOR;
   TallyPacket t = TallyProtocol::createTelemetryPacket(
-      camId, 0, radio.getRSSI(), TALLY_TLM_NO_BATTERY);
+      camId, 0, radio.getRSSI(), flags);
   uint8_t buf[TALLY_PACKET_SIZE];
   TallyProtocol::serialize(t, buf);
   radio.send(buf, TALLY_PACKET_SIZE); // blocking, ~one packet airtime

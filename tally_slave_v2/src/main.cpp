@@ -228,6 +228,17 @@ void onChannelChange(uint32_t freqHz, uint8_t chanIdx) {
   radio.restartReceive();
 }
 
+// Hub's AutoRF assigned our telemetry power (CMD_SET_POWER). Clamp to the
+// chip range; the value lives in RAM, so a reboot falls back to the config
+// default until the hub re-announces (hub re-sends on every ONLINE event).
+void onPowerChange(int8_t dbm) {
+  if (dbm < -18) dbm = -18;
+  if (dbm > 12) dbm = 12;
+  g_txPower = dbm;
+  radio.setTxPower(dbm);
+  slogf("[PWR] hub set telemetry power: %d dBm\n", (int)dbm);
+}
+
 // ===== Camera ID provisioning (NVS) =====
 // One universal binary: the camera ID lives in NVS, not the firmware image.
 // Set it in the field by holding BOOT at power-up (tap to count) or via the
@@ -435,6 +446,7 @@ void setup() {
 
   tallyLink.begin(g_camId, onTallyState, onLocatorPing, onLinkChange);
   tallyLink.setChannelCallback(onChannelChange);
+  tallyLink.setPowerCallback(onPowerChange); // follow AutoRF power
 
   // ISR only sets a flag, harmless even if the radio is down; if recovery
   // brings it up later RX still works (the loop also polls DIO1 level).
@@ -568,7 +580,7 @@ void loop() {
   // reachable. Shared beat (TallyRadio.h, one copy for v1/v2) — deferred
   // while the locator owns the LED. (Not collision-free — a real fix would
   // add CAD/LBT; fine for a small fleet at this rate.)
-  tallyTelemetryTick(radio, g_camId, !locatorActive);
+  tallyTelemetryTick(radio, g_camId, !locatorActive, tallyLink.linkPoor());
 
   // Heartbeat: status log every 10 seconds
   if (millis() - lastHeartbeat > 10000) {

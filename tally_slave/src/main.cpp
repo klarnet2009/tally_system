@@ -40,6 +40,10 @@ uint32_t lastHeartbeat = 0;
 static const uint32_t kChanList[] = TALLY_CHAN_LIST;
 static uint32_t g_chanFreq = TALLY_RF_FREQ_HZ;
 
+// Telemetry TX power. Boot default; the hub's AutoRF tunes it live via
+// CMD_SET_POWER (RAM-only, re-applied after every radio recovery).
+static int8_t g_txPower = TALLY_TX_POWER;
+
 // ⚡ Bolt: State tracking for non-blocking LED updates
 uint32_t locatorStartTime = 0;
 uint32_t lastLedToggle = 0;
@@ -131,6 +135,17 @@ void onChannelChange(uint32_t freqHz, uint8_t chanIdx) {
     radio.restartReceive();
 }
 
+// Hub's AutoRF assigned our telemetry power (CMD_SET_POWER). Clamp to the
+// chip range; the value lives in RAM, so a reboot falls back to the config
+// default until the hub re-announces (hub re-sends on every ONLINE event).
+void onPowerChange(int8_t dbm) {
+    if (dbm < -18) dbm = -18;
+    if (dbm > 12) dbm = 12;
+    g_txPower = dbm;
+    radio.setTxPower(dbm);
+    Serial.printf("[PWR] hub set telemetry power: %d dBm\n", (int)dbm);
+}
+
 void setup() {
     Serial.begin(115200);
     // No USB host in the field: HWCDC's default 100ms TX timeout would stall
@@ -166,6 +181,7 @@ void setup() {
 
     tallyLink.begin(SLAVE_CAM_ID, onTallyState, onLocatorPing, onLinkChange);
     tallyLink.setChannelCallback(onChannelChange); // follow AFA switches
+    tallyLink.setPowerCallback(onPowerChange);     // follow AutoRF power
 
     // Set to RX mode
     if (ok)
@@ -173,8 +189,9 @@ void setup() {
 }
 
 // Post-recovery hook for the shared tallyRadioRecover() (TallyRadio.h):
-// restore the hub-announced channel, then re-arm continuous RX.
+// restore the hub-announced channel and power, then re-arm continuous RX.
 static void onRadioRecovered() {
+    radio.setTxPower(g_txPower); // keep any hub-assigned power
     radio.setFrequency(g_chanFreq); // not blindly the home channel
     radio.startReceive();
 }
@@ -261,7 +278,8 @@ void loop() {
     // Telemetry (slave -> hub): without it the hub's reachability table
     // reports v1-based cameras OFFLINE forever. Shared beat (TallyRadio.h) —
     // deferred while the locator owns the LED, same as v2.
-    tallyTelemetryTick(radio, SLAVE_CAM_ID, locatorStartTime == 0);
+    tallyTelemetryTick(radio, SLAVE_CAM_ID, locatorStartTime == 0,
+                       tallyLink.linkPoor());
 
     // Heartbeat debug every 5s
     if (millis() - lastHeartbeat > 5000) {
