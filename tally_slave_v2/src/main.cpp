@@ -54,6 +54,10 @@ static int8_t g_txPower = TALLY_TX_POWER;
 // escape channel), the scan in loop() walks this list until the hub is found.
 static const uint32_t kChanList[] = TALLY_CHAN_LIST;
 static uint8_t g_chanIdx = 0;
+// The hub-announced frequency is authoritative (the packet carries it so a
+// hub/slave channel-table mismatch still works); the index only aligns the
+// scan start. Recovery must restore THIS, not a table entry.
+static uint32_t g_chanFreq = TALLY_RF_FREQ_HZ;
 
 // ===== COLORS =====
 #define COLOR_OFF 0x000000
@@ -190,11 +194,18 @@ void updateLocator() {
 
 // ===== TallyLink presentation callbacks =====
 void onTallyState(TallyState ts) {
-  slogf("[TALLY] State:%d RSSI:%d\n", ts, radio.getRSSI());
+  // Going on air: cut any already-sounding tone NOW. buzzerAllowed() gates
+  // only the START of a tone — a link-lost beep or locator tone already
+  // running would otherwise leak up to ~300ms into a live mic.
+  if (ts == STATE_PROGRAM || ts == STATE_BOTH)
+    noTone(PIN_BUZZER);
+  // Paint before logging: a LittleFS rotation stall inside slogf must not
+  // sit between "camera went on air" and the LED turning on.
   // Only paint a solid colour when the light is trustworthy; otherwise the
   // signal-lost / source-stale indications below own the LED.
   if (!locatorActive && tallyLink.trustworthy())
     applyTallyColor();
+  slogf("[TALLY] State:%d RSSI:%d\n", ts, radio.getRSSI());
 }
 
 void onLocatorPing() {
@@ -209,6 +220,7 @@ void onChannelChange(uint32_t freqHz, uint8_t chanIdx) {
     return; // sanity: stay inside the 2.4 GHz ISM band whatever the packet says
   if (chanIdx < TALLY_CHAN_COUNT)
     g_chanIdx = chanIdx;
+  g_chanFreq = freqHz; // remember for radio recovery — it is authoritative
   slogf("[CHAN] hub -> %lu.%lu MHz (ch%u)\n",
         (unsigned long)(freqHz / 1000000UL),
         (unsigned long)((freqHz % 1000000UL) / 100000UL), chanIdx);
@@ -237,6 +249,19 @@ static void saveCamId(uint8_t id) {
   p.end();
 }
 
+// Bounded wait for BOOT release: a strap/wiring fault holding GPIO9 low must
+// not wedge boot forever with zero indication. false = timed out — treat the
+// line as faulted and bail.
+static bool waitBootRelease(uint32_t timeoutMs) {
+  uint32_t t0 = millis();
+  while (digitalRead(PIN_BOOT) == LOW) {
+    if (millis() - t0 > timeoutMs)
+      return false;
+    delay(10);
+  }
+  return true;
+}
+
 // Set-ID mode: each tap increments the count (1..8, wraps), the LED flashes
 // the count and the buzzer chirps; 3s of inactivity commits to NVS. Blocking,
 // but this only runs at boot on request. `requested` comes from the boot-delay
@@ -251,8 +276,10 @@ static uint8_t runSetIdModeIfRequested(uint8_t current, bool requested) {
     return current; // not held — normal boot
 
   Serial.println("[CFG] Set-ID mode: tap BOOT to count (1..8), idle 3s to save");
-  while (digitalRead(PIN_BOOT) == LOW)
-    delay(10); // wait for the initial hold to release
+  if (!waitBootRelease(10000)) { // wait for the initial hold to release
+    Serial.println("[CFG] BOOT stuck low — aborting set-ID, normal boot");
+    return current;
+  }
 
   uint8_t count = 0;
   uint32_t lastActivity = millis();
@@ -264,8 +291,10 @@ static uint8_t runSetIdModeIfRequested(uint8_t current, bool requested) {
         flashColor(COLOR_PING, count, 130, 130); // blink the count back
         beep(1500, 80);
         lastActivity = millis();
-        while (digitalRead(PIN_BOOT) == LOW)
-          delay(10); // wait for release
+        if (!waitBootRelease(10000)) { // wait for release
+          Serial.println("[CFG] BOOT stuck low — aborting set-ID, normal boot");
+          return current;
+        }
       }
     }
     delay(10);
@@ -294,7 +323,7 @@ void onLinkChange(bool lost) {
 // restore v2's runtime radio state, then re-arm RX.
 static void onRadioRecovered() {
   radio.setTxPower(g_txPower); // keep any live "power N" override
-  radio.setFrequency(kChanList[g_chanIdx]); // stay on the fleet's channel
+  radio.setFrequency(g_chanFreq); // the hub-announced channel, not our table
   armReceive();
 }
 
@@ -424,6 +453,11 @@ void loop() {
   // === RX: interrupt-driven (no SPI polling — under POWER_SAVE any NSS
   // activity during the radio's sleep phase would silently kill the cycle)
   if (g_dio1Flag || digitalRead(PIN_LORA_DIO1) == HIGH) {
+    // Clear the flag FIRST: an ISR firing during the drain/re-arm below sets
+    // it again, so we re-enter next loop (a harmless duplicate pass gated by
+    // available()) instead of losing that packet. Clearing it AFTER the
+    // re-arm erased exactly the event it was meant to preserve.
+    g_dio1Flag = false;
     // Bounded drain: a second packet can complete while we process the first
     // (continuous RX keeps receiving); re-checking available() before the
     // re-arm closes the window where its RxDone would be wiped by the IRQ
@@ -449,11 +483,6 @@ void loop() {
     }
     // Unconditional re-arm: RxDone (even a CRC error) ends the duty cycle
     radio.rearmAfterIrq();
-    // Clear the flag AFTER re-arming: if DIO1 fires during the re-arm's
-    // standby→SET_RX SPI sequence, the flag stays set and we re-enter next
-    // loop (a harmless duplicate pass gated by available()) instead of
-    // losing that packet to the re-arm's IRQ clear.
-    g_dio1Flag = false;
   }
 
   // === LINK SUPERVISION (hub broadcasts every TALLY_REFRESH_MS) ===
@@ -514,15 +543,25 @@ void loop() {
   // ~2s per channel (>=3 hub heartbeats each). Any valid packet ends the
   // scan by clearing signalLost; the current channel stays where we heard it.
   static uint32_t lastScanHop = 0;
-  if (radio.isConnected() && tallyLink.signalLost() &&
-      millis() - lastScanHop > 2000) {
-    lastScanHop = millis();
-    g_chanIdx = (uint8_t)((g_chanIdx + 1) % TALLY_CHAN_COUNT);
-    radio.setFrequency(kChanList[g_chanIdx]);
-    radio.restartReceive();
-    slogf("[SCAN] listening on ch%u (%lu.%lu MHz)\n", g_chanIdx,
-          (unsigned long)(kChanList[g_chanIdx] / 1000000UL),
-          (unsigned long)((kChanList[g_chanIdx] % 1000000UL) / 100000UL));
+  static bool scanning = false;
+  if (!tallyLink.signalLost()) {
+    scanning = false;
+  } else if (radio.isConnected()) {
+    if (!scanning) {
+      // Full first dwell on the current channel: a spurious deaf spell must
+      // not hop away instantly — the hub may still be right here.
+      scanning = true;
+      lastScanHop = millis();
+    } else if (millis() - lastScanHop > 2000) {
+      lastScanHop = millis();
+      g_chanIdx = (uint8_t)((g_chanIdx + 1) % TALLY_CHAN_COUNT);
+      g_chanFreq = kChanList[g_chanIdx]; // where we're listening now
+      radio.setFrequency(g_chanFreq);
+      radio.restartReceive();
+      slogf("[SCAN] listening on ch%u (%lu.%lu MHz)\n", g_chanIdx,
+            (unsigned long)(g_chanFreq / 1000000UL),
+            (unsigned long)((g_chanFreq % 1000000UL) / 100000UL));
+    }
   }
 
   // === TELEMETRY (slave -> hub): periodic so the hub knows this camera is
