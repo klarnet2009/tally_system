@@ -64,7 +64,6 @@ static uint8_t g_chanIdx = 0;
 #define COLOR_LOST 0xFF4500      // Orange (radio signal lost)
 #define COLOR_STALE 0xFFFFFF     // White (tally source frozen — don't trust)
 #define COLOR_INIT_OK 0x00FF00   // Green
-#define COLOR_INIT_FAIL 0xFF0000 // Red
 
 // ===== GLOBALS =====
 Adafruit_NeoPixel led(NUM_LEDS, PIN_LED, NEO_GRB + NEO_KHZ800);
@@ -136,15 +135,10 @@ void armReceive() {
 }
 
 // Buzzer policy: never sound while the camera is ON AIR — a live mic would
-// capture the tone. -DTALLY_QUIET disables the buzzer entirely for
-// sound-sensitive productions. Visual indications always fire.
+// capture the tone. Visual indications always fire.
 static bool buzzerAllowed() {
-#ifdef TALLY_QUIET
-  return false;
-#else
   TallyState s = tallyLink.state();
   return s != STATE_PROGRAM && s != STATE_BOTH;
-#endif
 }
 static void buzzOn(int freq) {
   if (buzzerAllowed())
@@ -296,29 +290,22 @@ void onLinkChange(bool lost) {
   }
 }
 
+// Post-recovery hook for the shared tallyRadioRecover() (TallyRadio.h):
+// restore v2's runtime radio state, then re-arm RX.
+static void onRadioRecovered() {
+  radio.setTxPower(g_txPower); // keep any live "power N" override
+  radio.setFrequency(kChanList[g_chanIdx]); // stay on the fleet's channel
+  armReceive();
+}
+
 // Re-init the radio if a runtime fault (stuck BUSY) latched it disconnected.
 // Without this a single glitch would leave the receiver permanently deaf,
 // since every RX call is a guarded no-op while _connected is false.
 void tryRadioRecover() {
-  static uint32_t lastTry = 0;
-  if (radio.isConnected())
-    return;
-  if (millis() - lastTry < 10000)
-    return;
-  lastTry = millis();
-  slogf("[LoRa] Recovering...\n");
-  if (radio.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS,
-                  PIN_LORA_BUSY, PIN_LORA_DIO1, PIN_LORA_NRESET, PIN_LORA_RXEN,
-                  PIN_LORA_TXEN)) {
-    tallyApplyRadioProfile(radio);
-    radio.setTxPower(g_txPower); // keep any live "power N" override
-    radio.setFrequency(kChanList[g_chanIdx]); // stay on the fleet's channel
-    armReceive();
-    tallyLink.noteAlive();
-    slogf("[LoRa] Recovered\n");
-  } else {
-    slogf("[LoRa] Recovery failed: %s\n", radio.initErrorStr());
-  }
+  tallyRadioRecover(radio, tallyLink, PIN_LORA_SCK, PIN_LORA_MISO,
+                    PIN_LORA_MOSI, PIN_LORA_NSS, PIN_LORA_BUSY, PIN_LORA_DIO1,
+                    PIN_LORA_NRESET, PIN_LORA_RXEN, PIN_LORA_TXEN,
+                    onRadioRecovered);
 }
 
 // ===== SETUP =====

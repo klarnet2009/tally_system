@@ -61,8 +61,6 @@ struct TallyPacket {
 
 class TallyProtocol {
 public:
-    TallyProtocol();
-
     // Create packets (hub -> slaves)
     static TallyPacket createStateAllPacket(uint16_t progMask, uint16_t prevMask,
                                             bool sourceLive);
@@ -81,11 +79,7 @@ public:
     static uint8_t cmdCode(const TallyPacket& p) { return TALLY_CMD_CODE(p.command); }
     static TallyState stateForCamera(const TallyPacket& packet, uint8_t cameraId);
     static bool sourceLive(const TallyPacket& packet) { return packet.aux & TALLY_FLAG_SOURCE_LIVE; }
-    static uint16_t telemetryBattMv(const TallyPacket& p) {
-        return (uint16_t)p.payload[0] | ((uint16_t)p.payload[1] << 8);
-    }
     static int8_t telemetryRssi(const TallyPacket& p) { return (int8_t)p.payload[2]; }
-    static uint8_t telemetryFlags(const TallyPacket& p) { return p.payload[3]; }
 
     // Serialize/deserialize
     static void serialize(const TallyPacket& packet, uint8_t* buffer);

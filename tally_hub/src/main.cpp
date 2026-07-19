@@ -9,7 +9,6 @@
 #include <Wire.h>
 #include <esp_system.h> // esp_reset_reason()
 
-#include "AtemClientAdapter.h"
 #include "E28_SX1280.h"
 #include "TallyLog.h"
 #include "TallyProtocol.h"
@@ -49,9 +48,10 @@ static void hublogf(const char *fmt, ...) {
 }
 
 // Locator state (file scope: triggered by the BOOT button and the serial
-// "ping" command)
-static uint32_t locatorStartTime = 0;
-static uint8_t locatorStep = 0;
+// "ping" command): 3 pings 100ms apart, then a ~2s cooldown before another
+// trigger is accepted. locatorPingsLeft == 0 = idle.
+static uint8_t locatorPingsLeft = 0;
+static uint32_t locatorNextMs = 0; // next ping; after the last, re-arm time
 
 // Current tally masks broadcast to the slaves; the OLED grid is derived from
 // these too, so there is one source of truth for "what's on air".
@@ -207,16 +207,10 @@ TwoWire I2Cbus = TwoWire(0);
 Adafruit_SSD1306 display(128, 64, &I2Cbus, -1);
 
 #ifndef LORA_TEST_MODE
-static IAtemClient *atem = nullptr;
+static ATEMmin atem;
 static uint32_t lastPoll = 0;
 static uint32_t lastAtemAttempt = 0;
 #endif
-
-String ipToStr(IPAddress ip) {
-  char b[20];
-  snprintf(b, sizeof(b), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-  return String(b);
-}
 
 // ===== Improved OLED UI =====
 // Dual-color display: Yellow top 16px, Blue bottom 48px
@@ -299,51 +293,6 @@ void drawCenteredMsg(const char *l1, const char *l2 = nullptr) {
       x2 = 0;
     display.setCursor(x2, y1 + 12);
     display.print(l2);
-  }
-  display.display();
-}
-
-// Animated spinner: 8 dots around a circle, one filled at a time
-static void drawSpinner(int cx, int cy, int r, uint8_t frame) {
-  // ⚡ Bolt: 8-entry static float Lookup Tables for 45-degree multiples to avoid expensive trig calls
-  static const float COS_LUT[8] = {1.0f, 0.70710678f, 0.0f, -0.70710678f, -1.0f, -0.70710678f, 0.0f, 0.70710678f};
-  static const float SIN_LUT[8] = {0.0f, 0.70710678f, 1.0f, 0.70710678f, 0.0f, -0.70710678f, -1.0f, -0.70710678f};
-
-  for (int i = 0; i < 8; i++) {
-    int dx = cx + (int)(COS_LUT[i] * r);
-    int dy = cy + (int)(SIN_LUT[i] * r);
-    if (i == (frame % 8)) {
-      display.fillCircle(dx, dy, 2, WHITE); // Active dot
-    } else {
-      display.drawPixel(dx, dy, WHITE); // Dim dot
-    }
-  }
-}
-
-// Draw loading screen with spinner
-static void drawLoadingScreen(const char *title, const char *detail,
-                              uint8_t frame) {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
-
-  // Title - centered in upper area
-  int tx = (128 - strlen(title) * 6) / 2;
-  if (tx < 0)
-    tx = 0;
-  display.setCursor(tx, 16);
-  display.print(title);
-
-  // Spinner in center
-  drawSpinner(64, 38, 8, frame);
-
-  // Detail text below spinner
-  if (detail) {
-    int dx = (128 - strlen(detail) * 6) / 2;
-    if (dx < 0)
-      dx = 0;
-    display.setCursor(dx, 54);
-    display.print(detail);
   }
   display.display();
 }
@@ -535,19 +484,17 @@ static void atemTick() {
     if (WiFi.status() == WL_CONNECTED &&
         millis() - lastAtemAttempt > ATEM_RETRY_MS) {
       lastAtemAttempt = millis();
-      if (!atem)
-        atem = CreateAtemClient();
-      atem->begin(target);
-      atem->connect();
+      atem.begin(target);
+      atem.connect();
       atemAttemptStart = millis();
       atemPhase = ATEM_CONNECTING;
-      hublogf("[ATEM] connecting to %s...\n", ipToStr(target).c_str());
+      hublogf("[ATEM] connecting to %s...\n", target.toString().c_str());
     }
     break;
 
   case ATEM_CONNECTING:
-    atem->loop();
-    if (atem->connected()) {
+    atem.runLoop();
+    if (atem.isConnected()) {
       atemPhase = ATEM_RUNNING;
       hublogf("[ATEM] connected\n");
     } else if (millis() - atemAttemptStart > ATEM_CONNECT_TIMEOUT_MS) {
@@ -557,8 +504,8 @@ static void atemTick() {
     break;
 
   case ATEM_RUNNING:
-    atem->loop();
-    if (!atem->connected()) {
+    atem.runLoop();
+    if (!atem.isConnected()) {
       atemPhase = ATEM_IDLE;
       lastAtemAttempt = millis();
       hublogf("[ATEM] connection lost\n");
@@ -634,19 +581,16 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  // ждём Wi‑Fi с анимацией
-  uint8_t wifiFrame = 0;
+  // ждём Wi‑Fi (статичный экран уже нарисован выше)
   uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_RETRY_MS) {
-    drawLoadingScreen("Wi-Fi", WIFI_SSID, wifiFrame++);
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_RETRY_MS)
     delay(150);
-  }
   if (WiFi.status() != WL_CONNECTED) {
     hublogf("[WiFi] FAILED to join '%s' — retrying in background\n", WIFI_SSID);
     drawCenteredMsg("Wi-Fi: FAILED", "Retrying forever...");
   } else {
-    hublogf("[WiFi] connected, IP %s\n", ipToStr(WiFi.localIP()).c_str());
-    drawCenteredMsg("Wi-Fi: connected", ipToStr(WiFi.localIP()).c_str());
+    hublogf("[WiFi] connected, IP %s\n", WiFi.localIP().toString().c_str());
+    drawCenteredMsg("Wi-Fi: connected", WiFi.localIP().toString().c_str());
   }
 #else
   // Radio bring-up build: keep the WiFi radio fully off so it can't contend
@@ -724,10 +668,10 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
                                            : "IDLE",
             g_progMask, g_prevMask, reachMask);
   } else if (cmd == "ping") {
-    if (locatorStep == 0) {
+    if (locatorPingsLeft == 0 && (int32_t)(millis() - locatorNextMs) >= 0) {
       hublogf("[CMD] locator ping -> cam 1\n");
-      locatorStep = 1;
-      locatorStartTime = millis();
+      locatorPingsLeft = 3;
+      locatorNextMs = millis();
     }
   } else if (cmd == "reinit") {
     hublogf("[CMD] radio re-init: %s (%s)\n",
@@ -925,9 +869,10 @@ void loop() {
       if (human < 1 || human > 16)
         continue; // out-of-range entry would make the bit shift below UB
       uint8_t idx0 = human - 1;
-      if (atem->isOnAir(idx0))
+      uint8_t tflags = atem.getTallyByIndexTallyFlags(idx0); // bit0 pgm, bit1 pvw
+      if (tflags & 0x01)
         g_progMask |= (1U << idx0);
-      if (atem->isPreview(idx0))
+      if (tflags & 0x02)
         g_prevMask |= (1U << idx0);
     }
   }
@@ -977,34 +922,22 @@ void loop() {
     handleSerialCommand("status");
   }
 
-  // Locator / Ping (Button 0 or serial "ping") — works without ATEM
-  // ⚡ Bolt: Non-blocking locator logic using enqueueLora
-  if (digitalRead(0) == LOW && locatorStep == 0) {
+  // Locator / Ping (Button 0 or serial "ping") — works without ATEM.
+  // Non-blocking: 3 pings 100ms apart; after the last one locatorNextMs
+  // holds a ~2s cooldown that gates retriggering (see the triggers above).
+  if (digitalRead(0) == LOW && locatorPingsLeft == 0 &&
+      (int32_t)(millis() - locatorNextMs) >= 0) {
     drawCenteredMsg("LOCATOR", "Ping sent -> Cam 1");
-    locatorStep = 1;
-    locatorStartTime = millis();
+    locatorPingsLeft = 3;
+    locatorNextMs = millis();
   }
 
-  if (locatorStep > 0) {
-    uint32_t now = millis();
-    uint32_t elapsed = now - locatorStartTime;
-
-    // Steps 1, 3, 5: Enqueue ping (wait 50ms before steps 3 and 5)
-    if ((locatorStep == 1) || (locatorStep % 2 != 0 && locatorStep <= 5 && elapsed >= 50)) {
-      TallyPacket pkt = TallyProtocol::createPingPacket(1);
-      enqueueLora(pkt);
-      locatorStep++;
-      locatorStartTime = now;
-    }
-    // Steps 2, 4, 6: Wait 100ms
-    else if (locatorStep % 2 == 0 && locatorStep <= 6 && elapsed >= 100) {
-      locatorStep++;
-      locatorStartTime = now;
-    }
-    // Wait 2000ms after sequence before allowing another ping
-    else if (locatorStep == 7 && elapsed >= 2000) {
-      locatorStep = 0;
-    }
+  if (locatorPingsLeft > 0 && (int32_t)(millis() - locatorNextMs) >= 0) {
+    TallyPacket pkt = TallyProtocol::createPingPacket(1);
+    enqueueLora(pkt);
+    locatorPingsLeft--;
+    // 100ms to the next ping; after the 3rd, a ~2s cooldown gates retrigger
+    locatorNextMs = millis() + (locatorPingsLeft ? 100 : 2000);
   }
 
   // ==== OLED: tally grid when ATEM is live, debug screen otherwise ====
@@ -1019,7 +952,7 @@ void loop() {
   // non-blocking UI sequences (like LOCATOR). Also skip the blit while a TX is
   // in flight: a ~23ms full-frame I2C blit would otherwise defer checkTxDone()
   // (PA-off) and the next packet by that much. The redraw runs next pass.
-  bool uiActive = (locatorStep > 0) || radio.txActive();
+  bool uiActive = (locatorPingsLeft > 0) || radio.txActive();
   bool connected = (atemPhase == ATEM_RUNNING);
 
   if (!uiActive) {
@@ -1032,7 +965,7 @@ void loop() {
         drawnPrev = g_prevMask;
         drawnConnected = true;
         display.clearDisplay();
-        drawStatusBar(ipToStr(WiFi.localIP()), WiFi.status() == WL_CONNECTED,
+        drawStatusBar(WiFi.localIP().toString(), WiFi.status() == WL_CONNECTED,
                       radio.isConnected(), true);
         drawTallyGrid(g_progMask, g_prevMask);
         display.display();

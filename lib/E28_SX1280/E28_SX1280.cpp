@@ -33,18 +33,6 @@ const char *E28Radio::initErrorStr() const {
   return "?";
 }
 
-bool E28Radio::begin() {
-#ifndef E28_PIN_RXEN
-#define E28_PIN_RXEN -1
-#endif
-#ifndef E28_PIN_TXEN
-#define E28_PIN_TXEN -1
-#endif
-  return begin(E28_PIN_SCK, E28_PIN_MISO, E28_PIN_MOSI, E28_PIN_NSS,
-               E28_PIN_BUSY, E28_PIN_DIO1, E28_PIN_RESET, E28_PIN_RXEN,
-               E28_PIN_TXEN);
-}
-
 bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
                      int8_t busy, int8_t dio1, int8_t rst, int8_t rxen,
                      int8_t txen) {
@@ -263,71 +251,42 @@ bool E28Radio::waitBusyFor(uint32_t timeoutMs) {
   return true;
 }
 
-void E28Radio::writeCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
-  // Abort if a prior BUSY timeout already declared the chip gone: clocking
-  // more bytes into a wedged module only leaves it half-configured. begin()
-  // re-validates _connected after the config block and re-resets on failure.
-  if (!waitBusy()) // gone before, or BUSY timed out just now — don't clock it
-    return;
-
+// Every SPI exchange as ONE NSS-framed transfer: header byte(s), then `len`
+// body bytes — from txData (command write), or zeros while the body's RX
+// bytes are captured into rxData (command read). One fixed buffer: the old
+// <=12-byte "fast path" saved ~250 bytes of stack for a handful of cycles
+// and was copy-pasted into five functions. false = the BUSY wait failed
+// (module wedged/gone) and nothing was clocked — callers must bail; begin()
+// re-validates _connected after its config block and re-resets on failure.
+bool E28Radio::spiFrame(const uint8_t *header, uint8_t headerLen,
+                        const uint8_t *txData, uint8_t *rxData, uint8_t len) {
+  if (!waitBusy())
+    return false;
+  uint32_t totalLen = (uint32_t)headerLen + len; // worst case 3 + 255 = 258
+  uint8_t txBuf[260];
+  uint8_t rxBuf[260];
+  memcpy(txBuf, header, headerLen);
+  if (txData)
+    memcpy(txBuf + headerLen, txData, len);
+  else
+    memset(txBuf + headerLen, 0, len);
   digitalWrite(_pinNSS, LOW);
-  if (len > 0) {
-    // ⚡ Bolt: Fast-path for small writes (IRQ clears, config, and the 9-byte
-    // tally frame) to avoid the 260-byte stack alloc/memcpy
-    if (len <= 12) {
-      uint8_t txBuf[13];
-      txBuf[0] = cmd;
-      // ⚡ Bolt: Rely on compiler intrinsics for memory copies instead of manual loops
-      memcpy(&txBuf[1], data, len);
-      SPI.writeBytes(txBuf, len + 1);
-    } else {
-      // ⚡ Bolt: Coalesce cmd and data into a single block transfer for larger payloads
-      uint8_t txBuf[260];
-      txBuf[0] = cmd;
-      memcpy(&txBuf[1], data, len);
-      SPI.writeBytes(txBuf, len + 1);
-    }
-  } else {
-    SPI.transfer(cmd);
-  }
+  SPI.transferBytes(txBuf, rxBuf, totalLen);
   digitalWrite(_pinNSS, HIGH);
+  if (rxData)
+    memcpy(rxData, rxBuf + headerLen, len);
+  // No trailing waitBusy: CPU execution (e.g. GPIO toggling) overlaps with
+  // the radio's BUSY time — the next command's waitBusy is the guard.
+  return true;
+}
 
-  // ⚡ Bolt: Removed redundant trailing waitBusy() to allow CPU execution (e.g. GPIO toggling) to overlap with radio BUSY time
+void E28Radio::writeCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
+  spiFrame(&cmd, 1, data, nullptr, len);
 }
 
 void E28Radio::readCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
-  if (!waitBusy())
-    return;
-
-  digitalWrite(_pinNSS, LOW);
-  if (len > 0) {
-    // ⚡ Bolt: Fast-path for small reads (e.g. IRQ checks) to avoid large stack alloc/memcpy
-    if (len <= 12) {
-      uint8_t txBuf[14] = {cmd, 0x00}; // NOP
-      uint8_t rxBuf[14] = {0};
-      uint32_t totalLen = len + 2;
-      SPI.transferBytes(txBuf, rxBuf, totalLen);
-      // ⚡ Bolt: Rely on compiler intrinsics for memory copies instead of manual loops
-      memcpy(data, &rxBuf[2], len);
-    } else {
-      // ⚡ Bolt: Coalesce cmd, NOP, and read dummy bytes into a single block transfer
-      uint8_t txBuf[260];
-      uint8_t rxBuf[260];
-      uint32_t totalLen = len + 2;
-
-      memset(txBuf, 0, totalLen);
-      txBuf[0] = cmd;
-      txBuf[1] = 0x00; // NOP
-
-      SPI.transferBytes(txBuf, rxBuf, totalLen);
-
-      memcpy(data, &rxBuf[2], len);
-    }
-  } else {
-    SPI.transfer(cmd);
-    SPI.transfer(0x00); // NOP
-  }
-  digitalWrite(_pinNSS, HIGH);
+  uint8_t hdr[2] = {cmd, 0x00}; // NOP after the opcode
+  spiFrame(hdr, 2, nullptr, data, len);
 }
 
 void E28Radio::setFrequency(uint32_t frequency) {
@@ -414,58 +373,22 @@ void E28Radio::setPacketParams(uint8_t payloadLen) {
 }
 
 void E28Radio::clearIrqStatus() {
-  // ⚡ Bolt: Inline SPI transaction to bypass writeCommand wrapper overhead in high-frequency loops
-  if (!waitBusy())
-    return;
-  digitalWrite(_pinNSS, LOW);
-  uint8_t txBuf[3] = {SX1280_CMD_CLR_IRQ_STATUS, 0xFF, 0xFF};
-  SPI.writeBytes(txBuf, 3);
-  digitalWrite(_pinNSS, HIGH);
-  // ⚡ Bolt: Removed redundant trailing waitBusy() to overlap CPU execution with radio BUSY time
+  uint8_t cmd = SX1280_CMD_CLR_IRQ_STATUS;
+  uint8_t clr[2] = {0xFF, 0xFF}; // clear every IRQ bit
+  spiFrame(&cmd, 1, clr, nullptr, 2);
 }
 
 uint16_t E28Radio::getIrqStatus() {
-  // ⚡ Bolt: Inline SPI transaction to bypass readCommand wrapper array creation and func call overhead
-  if (!waitBusy())
+  uint8_t hdr[2] = {SX1280_CMD_GET_IRQ_STATUS, 0x00}; // NOP
+  uint8_t irq[2] = {0};
+  if (!spiFrame(hdr, 2, nullptr, irq, 2))
     return 0;
-  digitalWrite(_pinNSS, LOW);
-  uint8_t txBuf[4] = {SX1280_CMD_GET_IRQ_STATUS, 0x00, 0x00, 0x00};
-  uint8_t rxBuf[4] = {0};
-  SPI.transferBytes(txBuf, rxBuf, 4);
-  digitalWrite(_pinNSS, HIGH);
-  return ((uint16_t)rxBuf[2] << 8) | rxBuf[3];
+  return ((uint16_t)irq[0] << 8) | irq[1];
 }
 
 bool E28Radio::writeTxBuffer(uint8_t *data, uint8_t len) {
-  if (!waitBusy()) // gone before, or BUSY timed out just now — abort the TX
-    return false;
-  digitalWrite(_pinNSS, LOW);
-  if (len > 0) {
-    // ⚡ Bolt: Fast-path for small payloads (covers the 9-byte tally frame)
-    // to avoid the 260-byte stack alloc/memcpy overhead
-    if (len <= 12) {
-      uint8_t txBuf[14];
-      uint32_t totalLen = len + 2;
-      txBuf[0] = SX1280_CMD_WRITE_BUFFER;
-      txBuf[1] = 0x00; // Offset
-      // ⚡ Bolt: Rely on compiler intrinsics for memory copies instead of manual loops
-      memcpy(&txBuf[2], data, len);
-      SPI.writeBytes(txBuf, totalLen);
-    } else {
-      // ⚡ Bolt: Coalesce command, offset and payload into a single SPI transfer
-      uint8_t txBuf[260];
-      uint32_t totalLen = len + 2;
-      txBuf[0] = SX1280_CMD_WRITE_BUFFER;
-      txBuf[1] = 0x00; // Offset
-      memcpy(&txBuf[2], data, len);
-      SPI.writeBytes(txBuf, totalLen);
-    }
-  } else {
-    SPI.transfer(SX1280_CMD_WRITE_BUFFER);
-    SPI.transfer(0x00); // Offset
-  }
-  digitalWrite(_pinNSS, HIGH);
-  return true;
+  uint8_t hdr[2] = {SX1280_CMD_WRITE_BUFFER, 0x00}; // Offset
+  return spiFrame(hdr, 2, data, nullptr, len);
 }
 
 bool E28Radio::send(uint8_t *data, uint8_t len) {
@@ -709,66 +632,22 @@ uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
   if (!_connected)
     return 0;
 
-  // Wait for SX1280 to finish internal processing
-  if (!waitBusy()) // BUSY timed out — don't clock a wedged module
+  uint8_t statusHdr[2] = {SX1280_CMD_GET_RX_BUFFER_STATUS, 0x00}; // NOP
+  uint8_t bufStatus[2] = {0};
+  if (!spiFrame(statusHdr, 2, nullptr, bufStatus, 2))
     return 0;
 
-  // ⚡ Bolt: Inline GET_RX_BUFFER_STATUS to bypass readCommand wrapper overhead and redundant waitBusy() on hot RX path
-  digitalWrite(_pinNSS, LOW);
-  uint8_t txBufStatus[4] = {SX1280_CMD_GET_RX_BUFFER_STATUS, 0x00, 0x00, 0x00};
-  uint8_t rxBufStatus[4] = {0};
-  SPI.transferBytes(txBufStatus, rxBufStatus, 4);
-  digitalWrite(_pinNSS, HIGH);
-
-  uint8_t payloadLen = rxBufStatus[2];
-  uint8_t bufferOffset = rxBufStatus[3];
+  uint8_t payloadLen = bufStatus[0];
+  uint8_t bufferOffset = bufStatus[1];
 
   if (payloadLen > maxLen) {
     payloadLen = maxLen;
   }
 
   // Read data from buffer
-  if (!waitBusy())
+  uint8_t readHdr[3] = {SX1280_CMD_READ_BUFFER, bufferOffset, 0x00}; // NOP
+  if (!spiFrame(readHdr, 3, nullptr, buffer, payloadLen))
     return 0;
-  digitalWrite(_pinNSS, LOW);
-  if (payloadLen > 0) {
-    // ⚡ Bolt: Fast-path for small payloads (covers the 9-byte tally frame)
-    // to avoid the 260-byte stack alloc/memset/memcpy overhead
-    if (payloadLen <= 12) {
-        uint8_t txBuf[15] = {0};
-        uint8_t rxBuf[15] = {0};
-        uint32_t totalLen = payloadLen + 3;
-
-        txBuf[0] = SX1280_CMD_READ_BUFFER;
-        txBuf[1] = bufferOffset;
-        txBuf[2] = 0x00; // NOP
-
-        SPI.transferBytes(txBuf, rxBuf, totalLen);
-
-        // ⚡ Bolt: Rely on compiler intrinsics for memory copies instead of manual loops
-        memcpy(buffer, &rxBuf[3], payloadLen);
-    } else {
-        // ⚡ Bolt: Coalesce command, offset, NOP and read dummy bytes into a single SPI transfer
-        // Use fixed stack buffer
-        uint8_t txBuf[260];
-        uint8_t rxBuf[260];
-        uint32_t totalLen = payloadLen + 3;
-
-        memset(txBuf, 0, totalLen);
-        txBuf[0] = SX1280_CMD_READ_BUFFER;
-        txBuf[1] = bufferOffset;
-        txBuf[2] = 0x00; // NOP
-
-        SPI.transferBytes(txBuf, rxBuf, totalLen);
-
-        memcpy(buffer, &rxBuf[3], payloadLen);
-    }
-  } else {
-    SPI.transfer(SX1280_CMD_READ_BUFFER);
-    SPI.transfer(bufferOffset);
-    SPI.transfer(0x00); // NOP
-  }
-  digitalWrite(_pinNSS, HIGH);
 
   // Read packet RSSI/SNR (LoRa packet status: byte0 = rssiSync, byte1 = snr)
   uint8_t pktStatus[5] = {0};
@@ -801,30 +680,11 @@ int8_t E28Radio::getRssiInst() {
   return -(int8_t)(v / 2); // same -x/2 dBm encoding as packet RSSI
 }
 
-void E28Radio::sleep() {
-  // Disable RF switch
-  if (_pinTXEN != -1)
-    digitalWrite(_pinTXEN, LOW);
-  if (_pinRXEN != -1)
-    digitalWrite(_pinRXEN, LOW);
-
-  uint8_t sleepConfig = 0x00; // Cold start
-  writeCommand(SX1280_CMD_SET_SLEEP, &sleepConfig, 1);
-}
-
 void E28Radio::standby() {
   uint8_t stdbyConfig = SX1280_STANDBY_RC;
   writeCommand(SX1280_CMD_SET_STANDBY, &stdbyConfig, 1);
 
-  // We don't disable LNA/PA here immediately because standby is often
-  // intermediate state before TX/RX. But for power saving, maybe we should?
-  // Let's assume user calls startReceive() or send() after standby.
-  // If we are just idling, sleep() is better.
-  // But to be safe, maybe disable PA?
-  // if (_pinTXEN != -1) digitalWrite(_pinTXEN, LOW);
-  // if (_pinRXEN != -1) digitalWrite(_pinRXEN, LOW);
-  // Commented out to behave like standard transceivers that keep RF switch
-  // settings? No, standard is Standby = RF Off.
+  // Standby = RF switch off
   if (_pinTXEN != -1)
     digitalWrite(_pinTXEN, LOW);
   if (_pinRXEN != -1)
@@ -852,10 +712,4 @@ uint8_t E28Radio::getChipStatus() {
 
   bool firstValid = (rxBuf[0] != 0x00 && rxBuf[0] != 0xFF);
   return firstValid ? rxBuf[0] : rxBuf[1];
-}
-
-bool E28Radio::checkConnection() {
-  uint8_t status = getChipStatus();
-  _connected = (status != 0xFF && status != 0x00);
-  return _connected;
 }

@@ -4,30 +4,6 @@
 #include <Arduino.h>
 #include <SPI.h>
 
-// Default pin configuration (override via config.h before including this
-// header)
-#ifndef E28_PIN_MISO
-#define E28_PIN_MISO 19
-#endif
-#ifndef E28_PIN_MOSI
-#define E28_PIN_MOSI 23
-#endif
-#ifndef E28_PIN_SCK
-#define E28_PIN_SCK 18
-#endif
-#ifndef E28_PIN_NSS
-#define E28_PIN_NSS 5
-#endif
-#ifndef E28_PIN_BUSY
-#define E28_PIN_BUSY 4
-#endif
-#ifndef E28_PIN_DIO1
-#define E28_PIN_DIO1 2
-#endif
-#ifndef E28_PIN_RESET
-#define E28_PIN_RESET 14
-#endif
-
 // SX1280 Commands
 #define SX1280_CMD_GET_STATUS 0xC0
 #define SX1280_CMD_WRITE_REGISTER 0x18
@@ -106,9 +82,6 @@ public:
              int8_t dio1, int8_t reset = -1, int8_t rxen = -1,
              int8_t txen = -1);
 
-  // Initialize radio using E28_PIN_* build_flags
-  bool begin();
-
   // Configuration
   void setFrequency(uint32_t frequency); // Frequency in Hz
   void setTxPower(int8_t power);         // Power in dBm (-18 to +12)
@@ -160,10 +133,8 @@ public:
   uint32_t getRxErrors() const { return _rxErrors; }
 
   // Power management
-  void sleep();
   void standby();
   bool isConnected() { return _connected; }
-  bool checkConnection();  // Re-poll SPI to verify module
   uint8_t getChipStatus(); // Raw SX1280 status byte
 
   // Diagnostics: why the last begin() failed
@@ -210,6 +181,11 @@ private:
   // call site had to remember to repeat.
   bool waitBusy();
   bool waitBusyFor(uint32_t timeoutMs); // bounded variant for probe paths
+  // One NSS-framed SPI transfer: header byte(s), then `len` body bytes —
+  // from txData (write), or zeros while RX is captured into rxData (read).
+  // false = the BUSY wait failed; nothing was clocked, caller must bail.
+  bool spiFrame(const uint8_t *header, uint8_t headerLen,
+                const uint8_t *txData, uint8_t *rxData, uint8_t len);
   void writeCommand(uint8_t cmd, uint8_t *data, uint8_t len);
   void readCommand(uint8_t cmd, uint8_t *data, uint8_t len);
   // Shared TX-FIFO fill (WRITE_BUFFER at offset 0) for send()/startSend() —

@@ -1,8 +1,5 @@
 #include "TallyProtocol.h"
 
-TallyProtocol::TallyProtocol() {
-}
-
 static TallyPacket makeFrame(uint8_t code, uint8_t aux, uint8_t p0, uint8_t p1,
                              uint8_t p2, uint8_t p3) {
     TallyPacket packet;

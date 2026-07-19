@@ -3,6 +3,7 @@
 
 #include "E28_SX1280.h"
 #include "TallyConfig.h"
+#include "TallyLink.h"
 #include "TallyProtocol.h"
 
 // Apply the shared tally RF profile. begin() resets the radio to its 2.4 GHz /
@@ -49,6 +50,34 @@ static inline void tallyTelemetryTick(E28Radio &radio, uint8_t camId,
   TallyProtocol::serialize(t, buf);
   radio.send(buf, TALLY_PACKET_SIZE); // blocking, ~one packet airtime
   radio.restartReceive();             // back to listening
+}
+
+// Slave radio recovery, shared by v1 and v2: if a runtime fault (stuck BUSY)
+// latched the radio disconnected, re-init at most every 10s so a transient
+// glitch can't leave the receiver permanently deaf. afterInit runs on a
+// successful re-init, before noteAlive() — that's where a firmware restores
+// its runtime radio state (power/channel overrides) and re-arms RX.
+static inline void tallyRadioRecover(E28Radio &radio, TallyLink &link,
+                                     int8_t sck, int8_t miso, int8_t mosi,
+                                     int8_t nss, int8_t busy, int8_t dio1,
+                                     int8_t rst, int8_t rxen, int8_t txen,
+                                     void (*afterInit)()) {
+  static uint32_t lastTry = 0;
+  if (radio.isConnected())
+    return;
+  if (millis() - lastTry < 10000)
+    return;
+  lastTry = millis();
+  Serial.println("[LoRa] Recovering...");
+  if (radio.begin(sck, miso, mosi, nss, busy, dio1, rst, rxen, txen)) {
+    tallyApplyRadioProfile(radio);
+    if (afterInit)
+      afterInit();
+    link.noteAlive();
+    Serial.println("[LoRa] Recovered");
+  } else {
+    Serial.printf("[LoRa] Recovery failed: %s\n", radio.initErrorStr());
+  }
 }
 
 #endif // TALLY_RADIO_H

@@ -41,7 +41,6 @@ public:
     // still fires the state callback.
     void forceState(TallyState s) { _state = s; }
 
-    uint8_t cameraId() const { return _cameraId; }
     TallyState state() const { return _state; }
     bool signalLost() const { return _signalLost; }
     bool sourceStale() const { return _sourceStale; }

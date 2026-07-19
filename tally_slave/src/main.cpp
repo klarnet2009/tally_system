@@ -150,24 +150,17 @@ void setup() {
         radio.startReceive();
 }
 
+// Post-recovery hook for the shared tallyRadioRecover() (TallyRadio.h): v1
+// has no runtime power/channel overrides — just re-arm continuous RX.
+static void onRadioRecovered() { radio.startReceive(); }
+
 // Re-init the radio if a runtime fault (stuck BUSY) latched it disconnected,
 // so a transient glitch can't leave the receiver permanently deaf.
 void tryRadioRecover() {
-    static uint32_t lastTry = 0;
-    if (radio.isConnected()) return;
-    if (millis() - lastTry < 10000) return;
-    lastTry = millis();
-    Serial.println("[LoRa] Recovering...");
-    if (radio.begin(SLAVE_PIN_SCK, SLAVE_PIN_MISO, SLAVE_PIN_MOSI,
-                    SLAVE_PIN_NSS, SLAVE_PIN_BUSY, SLAVE_PIN_DIO1,
-                    SLAVE_PIN_RESET, SLAVE_PIN_RXEN, SLAVE_PIN_TXEN)) {
-        tallyApplyRadioProfile(radio);
-        radio.startReceive();
-        tallyLink.noteAlive();
-        Serial.println("[LoRa] Recovered");
-    } else {
-        Serial.printf("[LoRa] Recovery failed: %s\n", radio.initErrorStr());
-    }
+    tallyRadioRecover(radio, tallyLink, SLAVE_PIN_SCK, SLAVE_PIN_MISO,
+                      SLAVE_PIN_MOSI, SLAVE_PIN_NSS, SLAVE_PIN_BUSY,
+                      SLAVE_PIN_DIO1, SLAVE_PIN_RESET, SLAVE_PIN_RXEN,
+                      SLAVE_PIN_TXEN, onRadioRecovered);
 }
 
 void loop() {
