@@ -586,11 +586,12 @@ void loop() {
   if (millis() - lastHeartbeat > 10000) {
     lastHeartbeat = millis();
     slogf("[STATUS] Up:%lus State:%d Ch:%u LastRX:%lus ago RX:%lu "
-          "Fail:%lu RxErr:%lu\n",
+          "Fail:%lu RxErr:%lu Pwr:%d%%\n",
           (unsigned long)(millis() / 1000), (int)tallyLink.state(), g_chanIdx,
           (unsigned long)(tallyLink.msSinceLastRx() / 1000),
           (unsigned long)rxCount, (unsigned long)rxFails,
-          (unsigned long)radio.getRxErrors());
+          (unsigned long)radio.getRxErrors(),
+          (int)((g_txPower + 18) * 100 / 30));
     rxCount = 0;
     rxFails = 0;
   }

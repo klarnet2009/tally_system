@@ -291,6 +291,9 @@ static void drawLoRaIcon(int x, int y, bool connected) {
   }
 }
 
+// TX power as % of the chip range (-18..+12 dBm): 100% = full power.
+static uint8_t pwrPercent(int8_t p) { return (uint8_t)(((int)p + 18) * 100 / 30); }
+
 void drawStatusBar(const String &ip, bool wifiOk, bool loraOk, bool atemOk) {
   display.fillRect(0, 0, 128, HDR_H, BLACK);
   display.setTextSize(1);
@@ -308,6 +311,11 @@ void drawStatusBar(const String &ip, bool wifiOk, bool loraOk, bool atemOk) {
 
   display.setCursor(25, 0);
   display.print(atemOk ? "ATEM OK" : "NO ATEM");
+
+  // TX power % (right side of row 1)
+  display.setCursor(104, 0);
+  display.print(pwrPercent(g_txPower));
+  display.print("%");
 
   // Row 2 (y=8): IP + LoRa status
   display.setCursor(1, 8);
@@ -477,12 +485,15 @@ void drawLoRaDebug() {
   display.print("SNR:");
   display.print(radio.getSNR());
 
-  // Row 2: TX / drop counters
+  // Row 2: TX / drop counters + TX power %
   display.setCursor(1, 28);
   display.print("TX:");
   display.print(g_loraTxCount);
   display.print(" Drop:");
   display.print(g_loraDropCount);
+  display.setCursor(100, 28);
+  display.print(pwrPercent(g_txPower));
+  display.print("%");
 
   // Row 3: SPI Diagnosis
   display.setCursor(1, 38);
@@ -725,11 +736,12 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
     for (uint8_t id = 1; id <= 16; id++)
       if (g_camReachable[id])
         reachMask |= (1U << (id - 1));
-    hublogf("[STATUS] up=%lus radio=%s(0x%02X) pwr=%d ch=%lu.%lu tx=%lu "
+    hublogf("[STATUS] up=%lus radio=%s(0x%02X) pwr=%d(%u%%) ch=%lu.%lu tx=%lu "
             "drop=%lu rxerr=%lu q=%u wifi=%s atem=%s auto=%s prog=0x%04X "
             "prev=0x%04X reach=0x%04X\n",
             (unsigned long)(millis() / 1000), radio.isConnected() ? "OK" : "DEAD",
-            radio.getChipStatus(), (int)g_txPower, g_chanFreq / 1000000UL,
+            radio.getChipStatus(), (int)g_txPower, (unsigned)pwrPercent(g_txPower),
+            g_chanFreq / 1000000UL,
             (g_chanFreq % 1000000UL) / 100000UL, (unsigned long)g_loraTxCount,
             (unsigned long)g_loraDropCount, (unsigned long)radio.getRxErrors(),
             qDepth, ipbuf,
