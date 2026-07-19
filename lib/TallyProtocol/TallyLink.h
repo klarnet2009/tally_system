@@ -18,6 +18,7 @@ public:
     typedef void (*LocatorCallback)();
     typedef void (*LinkCallback)(bool lost);
     typedef void (*ChannelCallback)(uint32_t freqHz, uint8_t chanIdx);
+    typedef void (*PowerCallback)(int8_t powerDbm);
 
     void begin(uint8_t cameraId, StateCallback onState,
                LocatorCallback onLocator, LinkCallback onLink);
@@ -26,6 +27,9 @@ public:
     // fired on a valid CMD_SET_CHANNEL from the hub. The callback owns the
     // radio retune; TallyLink stays presentation/radio-agnostic.
     void setChannelCallback(ChannelCallback cb) { _onChannel = cb; }
+    // Fired on a CMD_SET_POWER addressed at us (or broadcast): the hub's
+    // AutoRF assigns our telemetry TX power. RAM-only by design.
+    void setPowerCallback(PowerCallback cb) { _onPower = cb; }
 
     // Feed a raw RX buffer. Returns true for a valid packet on our network
     // (callers may count failures for diagnostics).
@@ -46,6 +50,10 @@ public:
     bool sourceStale() const { return _sourceStale; }
     // True whenever the displayed colour must not be trusted as current.
     bool trustworthy() const { return !_signalLost && !_sourceStale; }
+    // We're missing heartbeats: >=3 gaps (>2x the hub's refresh) inside a
+    // 30s counting window. Reported to the hub via TALLY_TLM_LINK_POOR so it
+    // can tell "this camera struggles" apart from "the channel is bad".
+    bool linkPoor() const { return _rxGaps >= 3; }
     uint32_t msSinceLastRx() const;
 
 private:
@@ -55,10 +63,13 @@ private:
     bool _sourceStale = false;
     uint32_t _lastRxMs = 0;
     uint32_t _lastSourceLiveMs = 0;
+    uint8_t _rxGaps = 0;          // heartbeat gaps in the current 30s window
+    uint32_t _poorWindowStart = 0;
     StateCallback _onState = nullptr;
     LocatorCallback _onLocator = nullptr;
     LinkCallback _onLink = nullptr;
     ChannelCallback _onChannel = nullptr;
+    PowerCallback _onPower = nullptr;
 };
 
 #endif // TALLY_LINK_H

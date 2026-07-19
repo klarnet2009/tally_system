@@ -25,8 +25,12 @@ bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
         return true;
     }
 
-    // Hub-originated frame (STATE_ALL / PING / SET_CHANNEL): the hub is alive.
-    _lastRxMs = millis();
+    // Hub-originated frame (STATE_ALL / PING / SET_CHANNEL / SET_POWER):
+    // the hub is alive. Count missed-heartbeat gaps for linkPoor() first.
+    uint32_t now = millis();
+    if (now - _lastRxMs > 2 * TALLY_REFRESH_MS)
+        _rxGaps++;
+    _lastRxMs = now;
     if (_signalLost) {
         _signalLost = false;
         if (_onLink) _onLink(false);
@@ -49,6 +53,9 @@ bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
     } else if (code == CMD_SET_CHANNEL) {
         if (_onChannel)
             _onChannel(TallyProtocol::channelFreq(pkt), pkt.aux);
+    } else if (code == CMD_SET_POWER) {
+        if ((pkt.aux == _cameraId || pkt.aux == TALLY_BROADCAST_ID) && _onPower)
+            _onPower(TallyProtocol::powerDbm(pkt));
     }
     return true;
 }
@@ -62,6 +69,12 @@ void TallyLink::tick() {
     // source frozen for longer than the grace window. Riding out brief ATEM
     // reconnects, this avoids flicker while still catching a real freeze.
     _sourceStale = (millis() - _lastSourceLiveMs > TALLY_SOURCE_GRACE_MS);
+    // linkPoor() window: fixed 30s buckets (a hint flag for the hub, not a
+    // measurement — boundary resets are fine under its sustained trigger).
+    if (millis() - _poorWindowStart > 30000) {
+        _poorWindowStart = millis();
+        _rxGaps = 0;
+    }
 }
 
 void TallyLink::noteAlive() {

@@ -26,11 +26,15 @@ enum TallyCmd : uint8_t {
     CMD_PING        = 0x2, // aux = target camera ID (0xFF = all)
     CMD_STATE_ALL   = 0x6, // aux = flags; payload = progLo,progHi,prevLo,prevHi
     CMD_TELEMETRY   = 0x7, // slave -> hub: aux = camId; payload = batt,rssi,flags
-    CMD_SET_CHANNEL = 0x8  // hub -> slaves: aux = channel index (informational);
+    CMD_SET_CHANNEL = 0x8, // hub -> slaves: aux = channel index (informational);
                            // payload = target frequency in Hz, little-endian.
                            // The frequency is authoritative (survives a table
                            // mismatch between builds); the index just aligns
                            // the slave's scan starting point.
+    CMD_SET_POWER   = 0x9  // hub -> slaves: aux = target camera (0xFF = all);
+                           // payload[0] = telemetry TX power, int8 chip dBm.
+                           // Backward-compatible: old firmware drops it in
+                           // validate()'s command whitelist (fail-closed).
 };
 
 // STATE_ALL aux-byte flags
@@ -38,6 +42,8 @@ enum TallyCmd : uint8_t {
 
 // TELEMETRY payload flags
 #define TALLY_TLM_NO_BATTERY    0x01 // slave has no battery-sense ADC wired
+#define TALLY_TLM_LINK_POOR     0x02 // slave is missing heartbeats (TallyLink
+                                     // counted >=3 gaps in the last 30s)
 
 // Camera states
 enum TallyState : uint8_t {
@@ -70,6 +76,9 @@ public:
                                              int8_t rssi, uint8_t flags);
     // Hub -> slaves: coordinated channel switch (AFA)
     static TallyPacket createSetChannelPacket(uint8_t chanIdx, uint32_t freqHz);
+    // Hub -> slaves: AutoRF per-camera telemetry power assignment
+    static TallyPacket createSetPowerPacket(uint8_t cameraId, int8_t powerDbm);
+    static int8_t powerDbm(const TallyPacket& p) { return (int8_t)p.payload[0]; }
     static uint32_t channelFreq(const TallyPacket& p) {
         return (uint32_t)p.payload[0] | ((uint32_t)p.payload[1] << 8) |
                ((uint32_t)p.payload[2] << 16) | ((uint32_t)p.payload[3] << 24);

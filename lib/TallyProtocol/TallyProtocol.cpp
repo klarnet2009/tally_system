@@ -41,6 +41,10 @@ TallyPacket TallyProtocol::createSetChannelPacket(uint8_t chanIdx, uint32_t freq
                      (uint8_t)((freqHz >> 24) & 0xFF));
 }
 
+TallyPacket TallyProtocol::createSetPowerPacket(uint8_t cameraId, int8_t powerDbm) {
+    return makeFrame(CMD_SET_POWER, cameraId, (uint8_t)powerDbm, 0, 0, 0);
+}
+
 TallyState TallyProtocol::stateForCamera(const TallyPacket& packet, uint8_t cameraId) {
     if (cameraId < 1 || cameraId > 16) {
         return STATE_OFF;
@@ -92,7 +96,7 @@ bool TallyProtocol::validate(const TallyPacket& packet) {
     }
     uint8_t code = TALLY_CMD_CODE(packet.command);
     if (code != CMD_PING && code != CMD_STATE_ALL && code != CMD_TELEMETRY &&
-        code != CMD_SET_CHANNEL) {
+        code != CMD_SET_CHANNEL && code != CMD_SET_POWER) {
         return false;
     }
     if (packet.crc != calculateCRC(packet)) {
