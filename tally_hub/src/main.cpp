@@ -19,10 +19,11 @@ static E28Radio radio;
 static uint32_t g_loraTxCount = 0;   // TX packet counter
 static uint32_t g_loraDropCount = 0; // Packets lost: queue overflow / radio / TX fail
 
-// Runtime TX power (serial "power N", chip dBm). Boot default is the config
-// constant; radioInit() re-applies this AFTER the shared profile so a live
-// override survives radio recovery/reinit instead of silently resetting.
-static int8_t g_txPower = TALLY_TX_POWER;
+// Runtime TX power (serial "power N", chip dBm). Boot default is the hub's
+// fixed-power constant; radioInit() re-applies this AFTER the shared profile
+// (which sets the slave-oriented TALLY_TX_POWER) so the hub value wins and a
+// live override survives radio recovery/reinit instead of silently resetting.
+static int8_t g_txPower = TALLY_HUB_TX_POWER;
 
 // AFA: current channel (survives recovery, same pattern as g_txPower) and a
 // pending switch. A "chan <i>" command enqueues CMD_SET_CHANNEL announcements

@@ -54,6 +54,18 @@
 // toward +12 (≈ +26 dBm at the antenna with this module) without (a) confirming
 // the legal EIRP for the deployment region and (b) the rail decoupling fix, or
 // the PA current spike browns out the shared 3V3 rail. Default kept low.
+// This is the slaves' TX power (also their uplink-ADR starting point).
 #define TALLY_TX_POWER 1
+
+// Hub's fixed downlink TX power (chip dBm). The hub is mains/USB powered and
+// AutoRF no longer adapts it, so it runs here always. +12 = 100% of the chip
+// range. NOTE: the E28-2G4M27S PA saturates at chip ~0 dBm (already full
+// ~27 dBm out at TALLY_TX_POWER), so +12 does NOT add range — it only draws
+// more current. On a weak 3V3 rail that extra draw can sag VCC below the 3.3 V
+// the module needs for full output, making +12 WORSE than +1. Keep at +12 only
+// with a solid supply / VCC decoupling cap; otherwise back off.
+#ifndef TALLY_HUB_TX_POWER
+#define TALLY_HUB_TX_POWER 12
+#endif
 
 #endif // TALLY_CONFIG_H
