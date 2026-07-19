@@ -788,6 +788,40 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
     }
   } else if (cmd == "noise") {
     noiseSurvey();
+  } else if (cmd == "pintest") {
+    // Wiring bring-up: drive each ESP->E28 control line HIGH alone for 8s so
+    // a multimeter on the module pad verifies the PHYSICAL mapping wire by
+    // wire — continuity beeps can't tell "the wire lands on the wrong pad"
+    // (mirrored module numbering, neighbouring header pin). Pure GPIO, works
+    // with the radio dead. pinMode() detaches the SPI pins from the
+    // peripheral, so we reboot at the end to restore a clean radio state.
+    static const struct {
+      const char *name;
+      int8_t gpio;
+      uint8_t pad;
+    } kLines[] = {
+        {"NSS ", E28_PIN_NSS, 6},  {"SCK ", E28_PIN_SCK, 5},
+        {"MOSI", E28_PIN_MOSI, 4}, {"RXEN", E28_PIN_RXEN, 8},
+        {"TXEN", E28_PIN_TXEN, 9},
+    };
+    hublogf("[PINTEST] 5 lines x 8s: the named line is 3.3V on its E28 pad, "
+            "all other lines 0V. Probe the named pad each step.\n");
+    for (auto &l : kLines) {
+      pinMode(l.gpio, OUTPUT);
+      digitalWrite(l.gpio, LOW);
+    }
+    for (auto &l : kLines) {
+      digitalWrite(l.gpio, HIGH);
+      hublogf("[PINTEST] %s HIGH -> expect 3.3V on E28 pad %u (from GPIO %d); "
+              "BUSY=%d DIO1=%d\n",
+              l.name, l.pad, (int)l.gpio, digitalRead(E28_PIN_BUSY),
+              digitalRead(E28_PIN_DIO1));
+      delay(8000);
+      digitalWrite(l.gpio, LOW);
+    }
+    hublogf("[PINTEST] done — rebooting to restore SPI state\n");
+    delay(300);
+    ESP.restart();
   } else if (cmd == "log") {
     // Field-log dump to the asking console only (up to ~512KB @115200 ≈ 45s)
     TallyLog.dump(io ? *io : Serial);
@@ -809,7 +843,7 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
       hublogf("[CAM] no telemetry received from any slave yet\n");
   } else if (cmd == "help") {
     hublogf("Commands: status, cams, ping, power [n], chan [i], noise, "
-            "log, logclear, reinit, help\n");
+            "pintest, log, logclear, reinit, help\n");
   } else if (cmd.length()) {
     hublogf("Unknown command '%s' — try 'help'\n", cmd.c_str());
   }

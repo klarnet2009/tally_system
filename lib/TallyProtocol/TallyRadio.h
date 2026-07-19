@@ -14,12 +14,16 @@ static inline void tallyApplyRadioProfile(E28Radio &radio) {
   radio.setPreambleLength(TALLY_PREAMBLE_SYMBOLS);
   radio.setTxPower(TALLY_TX_POWER); // was never applied by the hub before
   // Modulation is part of the shared profile too — never the driver default.
-  // SF7/BW406 keeps airtime short; CR 4/8 is the interference lever: double
-  // FEC redundancy lets a frame survive a WiFi/BT burst clipping part of it.
-  // Airtime cost ~23→~27ms/frame on a mostly-idle channel. The explicit LoRa
-  // header carries CR per-packet, so a mixed-CR fleet still interoperates
-  // during a rolling firmware update (SF/BW/preamble stay unchanged).
-  radio.setSpreadingFactor(LORA_SF7);
+  // SF9/BW406: field range test showed ~30-40m through building walls at SF7
+  // (RSSI hit the -108dBm SF7 floor at the edge — a genuine sensitivity
+  // limit, not an antenna fault). SF9 buys ~+6dB (floor ~-114dBm) ≈ one more
+  // wall / ~2x open-air, spent from our huge airtime budget: 9-byte frames at
+  // 2/s. Cost: ~27→~96ms/frame airtime, so worst-case tally latency ~30→~100ms
+  // (imperceptible for a light). CR 4/8 = the interference lever (double FEC).
+  // WHOLE FLEET must match SF/BW — a mismatched node simply won't hear the hub
+  // (unlike CR, which the explicit header carries per-packet). Reflash all
+  // together. If SF9 isn't enough, SF10/11 needs the preamble trimmed too.
+  radio.setSpreadingFactor(LORA_SF9);
   radio.setBandwidth(LORA_BW_0400);
   radio.setCodingRate(LORA_CR_4_8);
 }
