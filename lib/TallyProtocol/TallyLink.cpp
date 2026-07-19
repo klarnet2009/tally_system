@@ -16,14 +16,22 @@ bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
         return false;
     }
 
-    // Any valid packet from our hub proves the radio link is alive
+    uint8_t code = TallyProtocol::cmdCode(pkt);
+    if (code == CMD_TELEMETRY) {
+        // Slave->hub frame: valid, but NOT link liveness. Only hub-originated
+        // frames may refresh the link timer — counting peer telemetry masked
+        // a dead hub behind beating slaves, and >=2 slaves stranded on a
+        // wrong channel kept each other "alive" and never rescanned (livelock).
+        return true;
+    }
+
+    // Hub-originated frame (STATE_ALL / PING / SET_CHANNEL): the hub is alive.
     _lastRxMs = millis();
     if (_signalLost) {
         _signalLost = false;
         if (_onLink) _onLink(false);
     }
 
-    uint8_t code = TallyProtocol::cmdCode(pkt);
     if (code == CMD_PING) {
         if (pkt.aux == _cameraId || pkt.aux == TALLY_BROADCAST_ID) {
             if (_onLocator) _onLocator();
@@ -42,7 +50,6 @@ bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
         if (_onChannel)
             _onChannel(TallyProtocol::channelFreq(pkt), pkt.aux);
     }
-    // CMD_TELEMETRY is a slave->hub frame; a slave ignores it.
     return true;
 }
 
