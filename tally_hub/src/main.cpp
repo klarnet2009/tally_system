@@ -84,6 +84,8 @@ static bool radioInit() {
 static uint32_t g_camLastSeen[17] = {0};
 static int8_t g_camRssi[17] = {0};
 static bool g_camReachable[17] = {false};
+static int8_t g_camRxRssi[17] = {0};     // uplink: telemetry loudness at the hub
+static bool g_camLinkPoor[17] = {false}; // slave reports missing heartbeats
 // Slaves jitter their interval by camId*JITTER (worst case ~2.6s for cam 16),
 // and the hub is deaf during its own ~96ms heartbeat TX every 500ms (~19%
 // duty) — the window must cover the worst-case jittered interval with beats
@@ -184,10 +186,14 @@ static void serviceTelemetry() {
     uint8_t id = pkt.aux;
     if (id >= 1 && id <= 16) {
       g_camLastSeen[id] = millis();
-      g_camRssi[id] = TallyProtocol::telemetryRssi(pkt);
+      g_camRssi[id] = TallyProtocol::telemetryRssi(pkt); // downlink (slave-heard)
+      g_camRxRssi[id] = radio.getRSSI();                 // uplink (hub-heard)
+      g_camLinkPoor[id] = (pkt.payload[3] & TALLY_TLM_LINK_POOR) != 0;
     }
   }
 }
+
+#include "autorf.h"
 
 // Mark cameras online/offline and log only the transitions (not every beat),
 // so a dead/returning slave is visible without log spam.
@@ -199,6 +205,7 @@ static void sweepReachability() {
       g_camReachable[id] = reach;
       hublogf("[TLM] cam %u %s (rssi=%d)\n", id, reach ? "ONLINE" : "OFFLINE",
               g_camRssi[id]);
+      autoRfOnCamChange(id, reach); // AutoRF: power restore/raise/re-announce
     }
   }
 }
@@ -614,6 +621,12 @@ void setup() {
   else
     hublogf("[E28] init FAILED after 5 attempts — recovery retries every 10s\n");
 
+  // AutoRF: pick the cleanest channel to START on (~400ms; slaves boot-scan
+  // and converge as usual). Skipped when the radio is down — the recovery
+  // path starts on the config home channel.
+  if (radioOk)
+    autoRfBootSurvey();
+
   // ==== Wi-Fi ====
 #ifndef NO_WIFI
   drawCenteredMsg("Wi-Fi: connecting...", WIFI_SSID);
@@ -713,8 +726,8 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
       if (g_camReachable[id])
         reachMask |= (1U << (id - 1));
     hublogf("[STATUS] up=%lus radio=%s(0x%02X) pwr=%d ch=%lu.%lu tx=%lu "
-            "drop=%lu rxerr=%lu q=%u wifi=%s atem=%s prog=0x%04X prev=0x%04X "
-            "reach=0x%04X\n",
+            "drop=%lu rxerr=%lu q=%u wifi=%s atem=%s auto=%s prog=0x%04X "
+            "prev=0x%04X reach=0x%04X\n",
             (unsigned long)(millis() / 1000), radio.isConnected() ? "OK" : "DEAD",
             radio.getChipStatus(), (int)g_txPower, g_chanFreq / 1000000UL,
             (g_chanFreq % 1000000UL) / 100000UL, (unsigned long)g_loraTxCount,
@@ -723,7 +736,7 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
             atemPhase == ATEM_RUNNING      ? "RUNNING"
             : atemPhase == ATEM_CONNECTING ? "CONNECTING"
                                            : "IDLE",
-            g_progMask, g_prevMask, reachMask);
+            g_autoRf ? "on" : "OFF", g_progMask, g_prevMask, reachMask);
   } else if (cmd == "ping") {
     if (locatorPingsLeft == 0 && (int32_t)(millis() - locatorNextMs) >= 0) {
       hublogf("[CMD] locator ping -> cam 1\n");
@@ -752,6 +765,7 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
       if (p < -18 || p > 12) {
         hublogf("[PWR] out of range: chip is -18..12 dBm\n");
       } else {
+        autoRfManualOverride("power");
         g_txPower = (int8_t)p;
         radio.setTxPower(g_txPower);
         hublogf("[PWR] chip=%d dBm (~%d dBm EIRP)%s\n", p, p + 14,
@@ -781,6 +795,7 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
         // Announce 6x on the CURRENT channel (residual loss ~p^6), then the
         // queue-drain hook retunes the hub. Slaves that miss every copy find
         // us again via their signal-lost channel scan within ~6s.
+        autoRfManualOverride("chan");
         TallyPacket pkt =
             TallyProtocol::createSetChannelPacket(i, g_chanList[i]);
         for (int k = 0; k < 6; k++)
@@ -841,15 +856,28 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
       if (g_camLastSeen[id] == 0)
         continue;
       any = true;
-      hublogf("[CAM %2u] %s rssi=%4d dBm  last seen %lus ago\n", id,
+      hublogf("[CAM %2u] %s rssi=%4d dBm pwr=%d  last seen %lus ago\n", id,
               g_camReachable[id] ? "ONLINE " : "OFFLINE", (int)g_camRssi[id],
+              (int)g_camPower[id],
               (unsigned long)((millis() - g_camLastSeen[id]) / 1000));
     }
     if (!any)
       hublogf("[CAM] no telemetry received from any slave yet\n");
+  } else if (cmd.startsWith("auto")) {
+    String arg = cmd.substring(4);
+    arg.trim();
+    if (arg == "on") {
+      g_autoRf = true;
+      hublogf("[AUTO] on — resuming automatic channel/power control\n");
+    } else if (arg == "off") {
+      g_autoRf = false;
+      hublogf("[AUTO] off — manual chan/power only\n");
+    } else {
+      autoRfReport();
+    }
   } else if (cmd == "help") {
-    hublogf("Commands: status, cams, ping, power [n], chan [i], noise, "
-            "pintest, log, logclear, reinit, help\n");
+    hublogf("Commands: status, cams, ping, power [n], chan [i], auto [on|off], "
+            "noise, pintest, log, logclear, reinit, help\n");
   } else if (cmd.length()) {
     hublogf("Unknown command '%s' — try 'help'\n", cmd.c_str());
   }
@@ -882,6 +910,7 @@ void loop() {
   processLoraQueue();
   serviceTelemetry();  // receive slave telemetry in idle windows
   sweepReachability(); // log cameras going online/offline
+  autoRfTick();        // AutoRF: channel scoring, switch + power decisions
   TallyLog.tick();     // periodic flash-log flush
 
   // Radio recovery: re-init every 10s while disconnected (begin() bails out
