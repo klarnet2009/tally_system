@@ -34,15 +34,18 @@ E28Radio radio;
 TallyLink tallyLink;
 uint32_t lastHeartbeat = 0;
 
-// AFA: follow the hub's CMD_SET_CHANNEL, and scan this list when the link is
-// lost (same behaviour as v2). The announced frequency is authoritative —
-// recovery and scan hops track it here, not a fixed table entry.
+// AFA: follow the switch plan carried inside the hub's heartbeat, and scan
+// this list if we missed it entirely (same behaviour as v2).
 static const uint32_t kChanList[] = TALLY_CHAN_LIST;
+static uint8_t g_chanIdx = 0;
 static uint32_t g_chanFreq = TALLY_RF_FREQ_HZ;
+static bool g_switchPending = false;
+static uint8_t g_switchToIdx = 0;
+static uint32_t g_switchAtMs = 0;
 
-// Telemetry TX power. Boot default; the hub's AutoRF tunes it live via
-// CMD_SET_POWER (RAM-only, re-applied after every radio recovery).
-static int8_t g_txPower = TALLY_TX_POWER;
+// Telemetry TX power, fixed: uplink ADR was deleted with the v4 architecture
+// (ARCHITECTURE_RF_V4.md §9). Re-applied after every radio recovery.
+static int8_t g_txPower = TALLY_SLAVE_TX_POWER;
 
 // ⚡ Bolt: State tracking for non-blocking LED updates
 uint32_t locatorStartTime = 0;
@@ -120,30 +123,36 @@ void onLinkChange(bool lost) {
     Serial.println(lost ? "[LINK] Signal lost!" : "[LINK] Signal restored");
 }
 
-// Hub announced a coordinated channel switch (AFA) — follow it, same as v2.
-// Without this a "chan N" on the hub stranded every v1 unit on the old
-// channel until the hub came back.
-void onChannelChange(uint32_t freqHz, uint8_t chanIdx) {
-    (void)chanIdx; // v1's scan walks the list from wherever it is
-    if (freqHz < 2400300000UL || freqHz > 2483300000UL)
-        return; // sanity: stay inside the 2.4 GHz ISM band
-    g_chanFreq = freqHz; // remember for radio recovery — it is authoritative
-    Serial.printf("[CHAN] hub -> %lu.%lu MHz\n",
-                  (unsigned long)(freqHz / 1000000UL),
-                  (unsigned long)((freqHz % 1000000UL) / 100000UL));
-    radio.setFrequency(freqHz);
-    radio.restartReceive();
+// A heartbeat carried a channel-switch countdown: record it, retune in loop()
+// so the radio is never reconfigured from inside packet handling. Every
+// announcing frame refines the instant, so losing any subset still works.
+void onChannelPlan(uint8_t chanIdx, uint32_t atMs) {
+    if (chanIdx >= TALLY_CHAN_COUNT)
+        return;
+    if (chanIdx == g_chanIdx && !g_switchPending)
+        return; // already where the hub wants us (e.g. an old-channel beacon)
+    bool first = !g_switchPending || g_switchToIdx != chanIdx;
+    g_switchPending = true;
+    g_switchToIdx = chanIdx;
+    g_switchAtMs = atMs;
+    if (first)
+        Serial.printf("[CHAN] plan: -> ch%u in %lums\n", chanIdx,
+                      (unsigned long)(atMs - millis()));
 }
 
-// Hub's AutoRF assigned our telemetry power (CMD_SET_POWER). Clamp to the
-// chip range; the value lives in RAM, so a reboot falls back to the config
-// default until the hub re-announces (hub re-sends on every ONLINE event).
-void onPowerChange(int8_t dbm) {
-    if (dbm < -18) dbm = -18;
-    if (dbm > 12) dbm = 12;
-    g_txPower = dbm;
-    radio.setTxPower(dbm);
-    Serial.printf("[PWR] hub set telemetry power: %d dBm\n", (int)dbm);
+static void channelPlanTick() {
+    if (!g_switchPending)
+        return;
+    if ((int32_t)(millis() - g_switchAtMs) < 0)
+        return;
+    g_switchPending = false;
+    g_chanIdx = g_switchToIdx;
+    g_chanFreq = kChanList[g_chanIdx];
+    radio.setFrequency(g_chanFreq);
+    radio.restartReceive();
+    Serial.printf("[CHAN] now on ch%u (%lu.%lu MHz)\n", g_chanIdx,
+                  (unsigned long)(g_chanFreq / 1000000UL),
+                  (unsigned long)((g_chanFreq % 1000000UL) / 100000UL));
 }
 
 void setup() {
@@ -171,7 +180,7 @@ void setup() {
         Serial.println("OK");
         // Blink LED to confirm init
         for(int i=0; i<3; i++) { digitalWrite(PIN_LED, LED_ON); delay(100); digitalWrite(PIN_LED, LED_OFF); delay(100); }
-        tallyApplyRadioProfile(radio);
+        tallyApplyRadioProfile(radio, g_txPower);
     } else {
         // Non-terminal: fall through to loop() so tryRadioRecover() re-inits
         // every 10s instead of trapping in a forever-blink (the old while(1))
@@ -180,8 +189,7 @@ void setup() {
     }
 
     tallyLink.begin(SLAVE_CAM_ID, onTallyState, onLocatorPing, onLinkChange);
-    tallyLink.setChannelCallback(onChannelChange); // follow AFA switches
-    tallyLink.setPowerCallback(onPowerChange);     // follow AutoRF power
+    tallyLink.setChannelCallback(onChannelPlan); // follow AFA switches
 
     // Set to RX mode
     if (ok)
@@ -251,35 +259,38 @@ void loop() {
         radio.restartReceive();
     }
 
-    // AFA channel scan (same as v2): link lost -> maybe the hub escaped a
-    // jammed channel (or we rebooted while the fleet runs elsewhere). Walk
-    // the list, ~2s per channel, full first dwell on the current one.
+    // Coordinated switch announced in the heartbeat
+    channelPlanTick();
+
+    // AFA channel scan, last resort (same as v2): only if we missed EVERY
+    // announcement and the hub's old-channel beacon. A slave that never heard
+    // the hub starts hopping at once — no deaf spell to sit through.
     static uint32_t lastScanHop = 0;
     static bool scanning = false;
-    static uint8_t scanIdx = 0;
     if (!tallyLink.signalLost()) {
         scanning = false;
-    } else if (radio.isConnected()) {
+    } else if (radio.isConnected() && !g_switchPending) {
         if (!scanning) {
             scanning = true;
+            lastScanHop = tallyLink.everHeard()
+                              ? millis()
+                              : millis() - TALLY_SCAN_DWELL_MS;
+        } else if (millis() - lastScanHop > TALLY_SCAN_DWELL_MS) {
             lastScanHop = millis();
-        } else if (millis() - lastScanHop > 2000) {
-            lastScanHop = millis();
-            scanIdx = (scanIdx + 1) % TALLY_CHAN_COUNT;
-            g_chanFreq = kChanList[scanIdx]; // where we're listening now
+            g_chanIdx = (uint8_t)((g_chanIdx + 1) % TALLY_CHAN_COUNT);
+            g_chanFreq = kChanList[g_chanIdx]; // where we're listening now
             radio.setFrequency(g_chanFreq);
             radio.restartReceive();
-            Serial.printf("[SCAN] listening on %lu.%lu MHz\n",
+            Serial.printf("[SCAN] listening on ch%u (%lu.%lu MHz)\n", g_chanIdx,
                           (unsigned long)(g_chanFreq / 1000000UL),
                           (unsigned long)((g_chanFreq % 1000000UL) / 100000UL));
         }
     }
 
-    // Telemetry (slave -> hub): without it the hub's reachability table
-    // reports v1-based cameras OFFLINE forever. Shared beat (TallyRadio.h) —
-    // deferred while the locator owns the LED, same as v2.
-    tallyTelemetryTick(radio, SLAVE_CAM_ID, locatorStartTime == 0,
-                       tallyLink.linkPoor());
+    // Telemetry (slave -> hub), slotted off the heartbeat cycle counter so it
+    // is collision-free by construction. Deferred while the locator owns the
+    // LED, same as v2.
+    tallyTelemetryTick(radio, tallyLink, SLAVE_CAM_ID, locatorStartTime == 0);
 
     // Heartbeat debug every 5s
     if (millis() - lastHeartbeat > 5000) {

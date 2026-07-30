@@ -3,11 +3,12 @@
 //  Hardware: WS2812B (GPIO 7), Buzzer (GPIO 8)
 //  Pinout verified per HARDWARE_GUIDE.md (2026-02-10), see pins.h
 //
-//  RX is interrupt-driven (DIO1) and, with -DPOWER_SAVE, duty-cycled:
-//  the radio sleeps ~70% of the time and still catches every packet
-//  thanks to the hub's 40-symbol preamble (see TallyConfig.h).
-//  Protocol dispatch + link supervision live in TallyLink (shared with
-//  slave v1); this file only renders states on the LED/buzzer.
+//  RX is interrupt-driven (DIO1) and CONTINUOUS. Duty-cycled RX was removed
+//  with the v4 architecture: it has an irreducible deaf window, and it was the
+//  only reason the fleet needed a 40-symbol (55.8 ms) preamble. Reliability
+//  outranks battery life here — see ARCHITECTURE_RF_V4.md §4.
+//  Protocol dispatch + link supervision live in TallyLink; this file only
+//  renders states on the LED/buzzer.
 // ============================================================
 
 #include <Adafruit_NeoPixel.h>
@@ -46,18 +47,23 @@ static void slogf(const char *fmt, ...) {
 static uint8_t g_camId = SLAVE_CAM_ID;
 
 // Runtime TX power (serial "power N", chip dBm; the 12SX has no external PA).
-// Re-applied after every radio recovery so a live override sticks.
-static int8_t g_txPower = TALLY_TX_POWER;
+// Re-applied after every radio recovery so a live override sticks. The hub no
+// longer assigns this — uplink ADR was deleted (ARCHITECTURE_RF_V4.md §9).
+static int8_t g_txPower = TALLY_SLAVE_TX_POWER;
 
-// AFA: current channel. Normally follows the hub's CMD_SET_CHANNEL; if we
-// lose the link (missed announcement, reboot while the fleet runs on an
-// escape channel), the scan in loop() walks this list until the hub is found.
+// AFA: current channel. Normally follows the switch plan carried inside the
+// hub's heartbeat; if we lose the link anyway (missed every announcement,
+// rebooted while the fleet runs on an escape channel), the scan in loop()
+// walks this list until the hub is found.
 static const uint32_t kChanList[] = TALLY_CHAN_LIST;
 static uint8_t g_chanIdx = 0;
-// The hub-announced frequency is authoritative (the packet carries it so a
-// hub/slave channel-table mismatch still works); the index only aligns the
-// scan start. Recovery must restore THIS, not a table entry.
 static uint32_t g_chanFreq = TALLY_RF_FREQ_HZ;
+// Pending coordinated switch: the heartbeat's countdown resolved to an instant.
+// Every announcing frame refines it, so losing any subset still leaves a
+// usable estimate — that is the whole point of announcing in the heartbeat.
+static bool g_switchPending = false;
+static uint8_t g_switchToIdx = 0;
+static uint32_t g_switchAtMs = 0;
 
 // ===== COLORS =====
 #define COLOR_OFF 0x000000
@@ -128,15 +134,8 @@ void applyTallyColor() {
   }
 }
 
-// Arm the receiver in the mode this build uses; after this, the driver's
-// rearmAfterIrq()/restartReceive() remember and re-issue the right thing.
-void armReceive() {
-#ifdef POWER_SAVE
-  radio.startReceiveDutyCycle(TALLY_DC_RX_MS, TALLY_DC_SLEEP_MS);
-#else
-  radio.startReceive();
-#endif
-}
+// Arm the receiver. Continuous RX only (see the file header).
+void armReceive() { radio.startReceive(); }
 
 // Buzzer policy: never sound while the camera is ON AIR — a live mic would
 // capture the tone. Visual indications always fire.
@@ -213,30 +212,38 @@ void onLocatorPing() {
   startLocator();
 }
 
-// Hub announced a coordinated channel switch (AFA). The packet's frequency is
-// authoritative; the index only aligns our scan starting point.
-void onChannelChange(uint32_t freqHz, uint8_t chanIdx) {
-  if (freqHz < 2400300000UL || freqHz > 2483300000UL)
-    return; // sanity: stay inside the 2.4 GHz ISM band whatever the packet says
-  if (chanIdx < TALLY_CHAN_COUNT)
-    g_chanIdx = chanIdx;
-  g_chanFreq = freqHz; // remember for radio recovery — it is authoritative
-  slogf("[CHAN] hub -> %lu.%lu MHz (ch%u)\n",
-        (unsigned long)(freqHz / 1000000UL),
-        (unsigned long)((freqHz % 1000000UL) / 100000UL), chanIdx);
-  radio.setFrequency(freqHz);
-  radio.restartReceive();
+// A heartbeat carried a channel-switch countdown. Record the target and the
+// instant; the retune itself happens in loop() so it can never run from inside
+// packet handling. Called on every announcing frame — later ones (smaller
+// countdown) refine the estimate, and re-announcing the same target is a no-op.
+void onChannelPlan(uint8_t chanIdx, uint32_t atMs) {
+  if (chanIdx >= TALLY_CHAN_COUNT)
+    return;
+  if (chanIdx == g_chanIdx && !g_switchPending)
+    return; // already where the hub wants us (e.g. an old-channel beacon)
+  bool first = !g_switchPending || g_switchToIdx != chanIdx;
+  g_switchPending = true;
+  g_switchToIdx = chanIdx;
+  g_switchAtMs = atMs;
+  if (first)
+    slogf("[CHAN] plan: -> ch%u in %lums\n", chanIdx,
+          (unsigned long)(atMs - millis()));
 }
 
-// Hub's AutoRF assigned our telemetry power (CMD_SET_POWER). Clamp to the
-// chip range; the value lives in RAM, so a reboot falls back to the config
-// default until the hub re-announces (hub re-sends on every ONLINE event).
-void onPowerChange(int8_t dbm) {
-  if (dbm < -18) dbm = -18;
-  if (dbm > 12) dbm = 12;
-  g_txPower = dbm;
-  radio.setTxPower(dbm);
-  slogf("[PWR] hub set telemetry power: %d dBm\n", (int)dbm);
+// Perform the planned retune once its instant arrives.
+static void channelPlanTick() {
+  if (!g_switchPending)
+    return;
+  if ((int32_t)(millis() - g_switchAtMs) < 0)
+    return;
+  g_switchPending = false;
+  g_chanIdx = g_switchToIdx;
+  g_chanFreq = kChanList[g_chanIdx];
+  radio.setFrequency(g_chanFreq);
+  radio.restartReceive();
+  slogf("[CHAN] now on ch%u (%lu.%lu MHz)\n", g_chanIdx,
+        (unsigned long)(g_chanFreq / 1000000UL),
+        (unsigned long)((g_chanFreq % 1000000UL) / 100000UL));
 }
 
 // ===== Camera ID provisioning (NVS) =====
@@ -333,8 +340,8 @@ void onLinkChange(bool lost) {
 // Post-recovery hook for the shared tallyRadioRecover() (TallyRadio.h):
 // restore v2's runtime radio state, then re-arm RX.
 static void onRadioRecovered() {
-  radio.setTxPower(g_txPower); // keep any live "power N" override
-  radio.setFrequency(g_chanFreq); // the hub-announced channel, not our table
+  radio.setTxPower(g_txPower);    // keep any live "power N" override
+  radio.setFrequency(g_chanFreq); // the channel we are actually on
   armReceive();
 }
 
@@ -350,15 +357,6 @@ void tryRadioRecover() {
 
 // ===== SETUP =====
 void setup() {
-#ifdef POWER_SAVE
-  // 80 MHz is the floor: USB-Serial-JTAG needs >=80 MHz. Light sleep is
-  // deliberately NOT used — it powers down the USB-Serial-JTAG peripheral
-  // (host drops the port) and the prebuilt Arduino core has CONFIG_PM_ENABLE
-  // off, so automatic light sleep is unavailable anyway. The savings come
-  // from the radio duty cycle + lower CPU clock + FreeRTOS idle.
-  setCpuFrequencyMhz(80);
-#endif
-
   Serial.begin(115200);
   // Field units run on battery with NO USB host: HWCDC's default 100ms TX
   // timeout would otherwise stall every log line once the FIFO fills — and
@@ -408,19 +406,12 @@ void setup() {
 
   Serial.println("\n=============================");
   Serial.println("  SUFIDE Tally Slave v2");
-  Serial.printf("  Camera ID: %d  NetID: 0x%02X\n", g_camId, TALLY_NET_ID);
-#ifdef POWER_SAVE
-  Serial.println("  RX: duty-cycle (POWER_SAVE)");
-#else
+  Serial.printf("  Camera ID: %d  NetID: 0x%X  proto v%d\n", g_camId,
+                TALLY_NET_ID, TALLY_PROTOCOL_VERSION);
   Serial.println("  RX: continuous");
-#endif
   Serial.println("=============================");
-  slogf("[BOOT] camId=%d netId=0x%02X rx=%s log=%s\n", g_camId, TALLY_NET_ID,
-#ifdef POWER_SAVE
-        "duty-cycle",
-#else
-        "continuous",
-#endif
+  slogf("[BOOT] camId=%d netId=0x%X proto=v%d rx=continuous log=%s\n", g_camId,
+        TALLY_NET_ID, TALLY_PROTOCOL_VERSION,
         TallyLog.ok() ? "OK" : "UNAVAILABLE");
 
   Serial.print("[LoRa] Init... ");
@@ -432,7 +423,7 @@ void setup() {
     slogf("[LoRa] init OK\n");
     flashColor(COLOR_INIT_OK, 3, 150, 100);
     beep(1000, 100);
-    tallyApplyRadioProfile(radio);
+    tallyApplyRadioProfile(radio, g_txPower);
   } else {
     // Non-terminal: instead of trapping the operator on a forever-blink that
     // needs a manual power-cycle, fall through to loop() — tryRadioRecover()
@@ -445,8 +436,7 @@ void setup() {
   }
 
   tallyLink.begin(g_camId, onTallyState, onLocatorPing, onLinkChange);
-  tallyLink.setChannelCallback(onChannelChange);
-  tallyLink.setPowerCallback(onPowerChange); // follow AutoRF power
+  tallyLink.setChannelCallback(onChannelPlan);
 
   // ISR only sets a flag, harmless even if the radio is down; if recovery
   // brings it up later RX still works (the loop also polls DIO1 level).
@@ -462,8 +452,8 @@ void loop() {
   updateLocator();
   TallyLog.tick(); // periodic flash-log flush
 
-  // === RX: interrupt-driven (no SPI polling — under POWER_SAVE any NSS
-  // activity during the radio's sleep phase would silently kill the cycle)
+  // === RX: interrupt-driven. Continuous RX, so a stray SPI read between
+  // events is harmless (that constraint died with duty-cycle RX).
   if (g_dio1Flag || digitalRead(PIN_LORA_DIO1) == HIGH) {
     // Clear the flag FIRST: an ISR firing during the drain/re-arm below sets
     // it again, so we re-enter next loop (a harmless duplicate pass gated by
@@ -550,21 +540,30 @@ void loop() {
     radio.restartReceive();
   }
 
-  // === AFA CHANNEL SCAN: link lost -> maybe the hub escaped a jammed
-  // channel (or we rebooted while the fleet runs elsewhere). Walk the list,
-  // ~2s per channel (>=3 hub heartbeats each). Any valid packet ends the
-  // scan by clearing signalLost; the current channel stays where we heard it.
+  // === Coordinated channel switch announced in the heartbeat ===
+  channelPlanTick();
+
+  // === AFA CHANNEL SCAN (last resort) ===
+  // Reached only if we missed EVERY in-heartbeat announcement AND the hub's
+  // old-channel beacon: walk the list, TALLY_SCAN_DWELL_MS per channel (>=2
+  // hub heartbeats each). Any valid frame ends the scan by clearing
+  // signalLost, and we stay on whichever channel we heard it.
   static uint32_t lastScanHop = 0;
   static bool scanning = false;
   if (!tallyLink.signalLost()) {
     scanning = false;
-  } else if (radio.isConnected()) {
+  } else if (radio.isConnected() && !g_switchPending) {
     if (!scanning) {
-      // Full first dwell on the current channel: a spurious deaf spell must
-      // not hop away instantly — the hub may still be right here.
       scanning = true;
-      lastScanHop = millis();
-    } else if (millis() - lastScanHop > 2000) {
+      // A slave that has NEVER heard the hub (fresh boot, battery swap while
+      // the fleet runs on an escape channel) starts hopping immediately: there
+      // is no "spurious deaf spell" to sit through, and every extra second is
+      // a second of dark camera. Once we've had a link, take the full dwell
+      // first — the hub may still be right here.
+      lastScanHop = tallyLink.everHeard()
+                        ? millis()
+                        : millis() - TALLY_SCAN_DWELL_MS;
+    } else if (millis() - lastScanHop > TALLY_SCAN_DWELL_MS) {
       lastScanHop = millis();
       g_chanIdx = (uint8_t)((g_chanIdx + 1) % TALLY_CHAN_COUNT);
       g_chanFreq = kChanList[g_chanIdx]; // where we're listening now
@@ -576,11 +575,11 @@ void loop() {
     }
   }
 
-  // === TELEMETRY (slave -> hub): periodic so the hub knows this camera is
-  // reachable. Shared beat (TallyRadio.h, one copy for v1/v2) — deferred
-  // while the locator owns the LED. (Not collision-free — a real fix would
-  // add CAD/LBT; fine for a small fleet at this rate.)
-  tallyTelemetryTick(radio, g_camId, !locatorActive, tallyLink.linkPoor());
+  // === TELEMETRY (slave -> hub) ===
+  // Slotted off the heartbeat's cycle counter, so it is collision-free by
+  // construction rather than thinned by jitter (TallyRadio.h). Deferred while
+  // the locator owns the LED so a blocking send can't stutter the pattern.
+  tallyTelemetryTick(radio, tallyLink, g_camId, !locatorActive);
 
   // Heartbeat: status log every 10 seconds
   if (millis() - lastHeartbeat > 10000) {
@@ -592,6 +591,9 @@ void loop() {
           (unsigned long)rxCount, (unsigned long)rxFails,
           (unsigned long)radio.getRxErrors(),
           (int)((g_txPower + 18) * 100 / 30));
+    if (tallyLink.missedBeats())
+      slogf("[STATUS] missed heartbeats this window: %u\n",
+            tallyLink.missedBeats());
     rxCount = 0;
     rxFails = 0;
   }
@@ -668,8 +670,7 @@ void loop() {
     }
   }
 
-  // FreeRTOS idle -> CPU clock-gating between events. Kept outside the
-  // POWER_SAVE ifdef: RX is DIO1-driven either way, so a non-power-save
-  // build gains nothing from spinning at 100% CPU.
+  // FreeRTOS idle -> CPU clock-gating between events. RX is DIO1-driven, so
+  // spinning at 100% CPU would buy nothing.
   delay(5);
 }

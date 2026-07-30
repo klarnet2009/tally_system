@@ -59,7 +59,7 @@ void setup() {
                         E28_PIN_BUSY, E28_PIN_DIO1, E28_PIN_RESET, E28_PIN_RXEN,
                         E28_PIN_TXEN);
   if (ok)
-    tallyApplyRadioProfile(radio); // same air interface as production
+    tallyApplyRadioProfile(radio, TALLY_HUB_TX_POWER); // production air interface
 
   display.clearDisplay();
   display.setTextSize(1);

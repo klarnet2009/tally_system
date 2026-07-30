@@ -41,7 +41,7 @@ void setup() {
                         PIN_LORA_NRESET, PIN_LORA_RXEN, PIN_LORA_TXEN);
 
   if (ok) {
-    tallyApplyRadioProfile(radio); // same air interface as production
+    tallyApplyRadioProfile(radio, TALLY_SLAVE_TX_POWER); // production air interface
     Serial.printf("OK (SPI:0x%02X)\n", radio.getChipStatus());
   } else {
     Serial.printf("FAILED (SPI:0x%02X)\n", radio.getChipStatus());
