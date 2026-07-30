@@ -33,13 +33,16 @@ TallyPacket TallyProtocol::createPingPacket(uint8_t cameraId) {
 
 TallyPacket TallyProtocol::createTelemetryPacket(uint8_t cameraId, int8_t rssi,
                                                  uint8_t missedBeats,
-                                                 uint16_t battMv,
-                                                 bool noBattery) {
+                                                 uint16_t battMv, bool noBattery,
+                                                 TallyState shown,
+                                                 uint8_t deviceTag) {
   uint8_t flags = noBattery ? TALLY_FLAG_NO_BATTERY : 0;
+  flags |= (uint8_t)(((uint8_t)shown << TALLY_TLM_STATE_SHIFT) &
+                     TALLY_TLM_STATE_MASK);
   if (missedBeats > 15)
     missedBeats = 15; // a hint for the hub, not a measurement — clamp it
   return makeFrame(CMD_TELEMETRY, flags, cameraId, (uint8_t)rssi, missedBeats,
-                   (uint8_t)(battMv & 0xFF), (uint8_t)(battMv >> 8), 0);
+                   (uint8_t)(battMv & 0xFF), (uint8_t)(battMv >> 8), deviceTag);
 }
 
 TallyState TallyProtocol::stateForCamera(const TallyPacket &p,

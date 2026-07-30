@@ -50,4 +50,12 @@ public:
 };
 extern SerialMock Serial;
 
+// Minimal ESP-class stub (real one lives in the ESP32 core's Esp.h)
+class EspMock {
+public:
+    unsigned long long getEfuseMac() { return 0; }
+    void restart() {}
+};
+extern EspMock ESP;
+
 #endif

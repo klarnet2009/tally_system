@@ -48,6 +48,8 @@ enum TallyCmd : uint8_t {
 #define TALLY_FLAG_SOURCE_LIVE 0x1 // hub's tally source (ATEM) is fresh
 // TELEMETRY flag nibble
 #define TALLY_FLAG_NO_BATTERY 0x1 // slave has no battery-sense divider wired
+#define TALLY_TLM_STATE_SHIFT 1   // bits 1-2: the state the slave is displaying
+#define TALLY_TLM_STATE_MASK 0x6
 
 // Camera states
 enum TallyState : uint8_t {
@@ -65,6 +67,11 @@ enum TallyState : uint8_t {
 //  PING:      [0]=target camera id (0xFF = all)
 //  TELEMETRY: [0]=camId [1]=rssi(int8) [2]=missed heartbeats (0..15)
 //             [3]=batt_lo [4]=batt_hi
+//             [5]=device tag (MAC-derived, never 0) — lets the hub notice TWO
+//                devices claiming the same camera ID, which NVS provisioning
+//                makes easy to do by accident and was otherwise invisible.
+//             flags bits 1-2 = the tally state this slave is actually DISPLAYING,
+//                so the hub can verify what the fleet shows rather than assume.
 #pragma pack(push, 1)
 struct TallyPacket {
   uint8_t verNet;
@@ -85,7 +92,8 @@ public:
   // ---- Build (slave -> hub) ----
   static TallyPacket createTelemetryPacket(uint8_t cameraId, int8_t rssi,
                                            uint8_t missedBeats, uint16_t battMv,
-                                           bool noBattery);
+                                           bool noBattery, TallyState shown,
+                                           uint8_t deviceTag);
 
   // ---- Read ----
   static uint8_t cmd(const TallyPacket &p) { return (uint8_t)(p.cmdFlags >> 4); }
@@ -121,6 +129,12 @@ public:
   static bool telemetryNoBattery(const TallyPacket &p) {
     return (p.cmdFlags & TALLY_FLAG_NO_BATTERY) != 0;
   }
+  // What the slave says it is actually displaying (not what we told it to).
+  static TallyState telemetryShown(const TallyPacket &p) {
+    return (TallyState)((p.cmdFlags & TALLY_TLM_STATE_MASK) >>
+                        TALLY_TLM_STATE_SHIFT);
+  }
+  static uint8_t telemetryTag(const TallyPacket &p) { return p.data[5]; }
 
   // ---- Wire ----
   static void serialize(const TallyPacket &p, uint8_t *buffer);

@@ -40,6 +40,11 @@ static inline void tallyApplyRadioProfile(E28Radio &radio, int8_t txPowerDbm) {
 // correct: its telemetry would be stale, and the hub marking it unreachable IS
 // the signal we want.
 //
+// The frame reports the state this slave is actually DISPLAYING plus a
+// MAC-derived device tag, so the hub can verify the fleet rather than assume it
+// — and can notice two devices claiming the same camera ID (easy to do by
+// accident now that the ID lives in NVS, and previously invisible).
+//
 // `allowNow` lets a firmware defer around UI-critical sections (the locator
 // blink, where a blocking ~43ms send would stutter the pattern). battMv=0 +
 // noBattery until a VBAT divider is wired.
@@ -80,8 +85,17 @@ static inline void tallyTelemetryTick(E28Radio &radio, TallyLink &link,
   lastSentHb = hb;
   haveSent = true;
 
+  // Fold the eFuse MAC into one byte; 0 is reserved for "no tag".
+  static uint8_t tag = 0;
+  if (tag == 0) {
+    uint64_t mac = ESP.getEfuseMac();
+    for (int i = 0; i < 8; i++)
+      tag ^= (uint8_t)(mac >> (8 * i));
+    if (tag == 0)
+      tag = 1;
+  }
   TallyPacket t = TallyProtocol::createTelemetryPacket(
-      camId, radio.getRSSI(), link.missedBeats(), 0, true);
+      camId, radio.getRSSI(), link.missedBeats(), 0, true, link.state(), tag);
   uint8_t buf[TALLY_PACKET_SIZE];
   TallyProtocol::serialize(t, buf);
   radio.send(buf, TALLY_PACKET_SIZE); // blocking, ~43ms of airtime

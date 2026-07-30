@@ -40,9 +40,22 @@
 // one long interference burst cannot take all of them. The scheduler always
 // serializes the LATEST state at transmit time, so a copy can never carry an
 // already-superseded state.
-#define TALLY_BURST_COPIES 4
+// Copy count NEVER drops below MIN — an adaptive scheme that can reduce margin
+// is a scheme where a wrong measurement costs a wrong light. Degradation can
+// only ADD copies.
+#define TALLY_BURST_COPIES_MIN 4
+#define TALLY_BURST_COPIES_MAX 6
 #define TALLY_BURST_OFFSETS_MS                                                \
-  { 0, 60, 160, 330 }
+  { 0, 60, 160, 330, 520, 740 }
+
+// ===== Listen-before-talk =====
+// Transmitting into an already-active interferer is a guaranteed loss; slipping
+// the frame a few ms is free. Applied to every frame EXCEPT the first copy of a
+// change burst, which must not be delayed for latency reasons. Bounded: after
+// the cap we transmit regardless, because a permanently busy channel must not
+// silence the link.
+#define TALLY_LBT_MARGIN_DB 15    // busy = this many dB above the noise floor
+#define TALLY_LBT_MAX_DEFER_MS 12 // then send anyway
 
 // ===== PHY profile =====
 // SF9/BW406.25k/CR4/6 with a 10-symbol preamble = 43.2 ms per 8-byte frame
