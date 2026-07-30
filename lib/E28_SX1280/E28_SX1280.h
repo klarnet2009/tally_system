@@ -25,7 +25,6 @@
 #define SX1280_CMD_GET_RX_BUFFER_STATUS 0x17
 #define SX1280_CMD_GET_PACKET_STATUS 0x1D
 #define SX1280_CMD_GET_RSSI_INST 0x1F
-#define SX1280_CMD_SET_RX_DUTY_CYCLE 0x94
 #define SX1280_CMD_CLR_IRQ_STATUS 0x97
 #define SX1280_CMD_SET_DIO_IRQ_PARAMS 0x8D
 #define SX1280_CMD_GET_IRQ_STATUS 0x15
@@ -103,21 +102,16 @@ public:
   bool txActive() { return _txActive; }
   bool txSucceeded() const { return _txSuccess; }
 
-  // Reception
+  // Reception. Continuous RX only: duty-cycled RX was removed with the v4
+  // architecture — it has an irreducible deaf window, and it was the sole
+  // reason the fleet needed a 40-symbol (55.8 ms!) preamble. Reliability
+  // outranks slave battery life here; see ARCHITECTURE_RF_V4.md §4.
   void startReceive();
-  // Duty-cycled RX: radio autonomously alternates RX/sleep, DIO1 fires on
-  // RxDone. periodBase 0x02 = 1ms units, so counts are milliseconds.
-  // Caller MUST re-arm after every DIO1 event (chip exits the cycle on any
-  // RxDone, even CRC errors) and avoid SPI polling between events (any NSS
-  // edge during the sleep phase silently kills the cycle).
-  void startReceiveDutyCycle(uint16_t rxCount, uint16_t sleepCount,
-                             uint8_t periodBase = 0x02);
-  // Re-arm using whichever RX mode was last started, so callers don't need
-  // their own mode bookkeeping:
-  //  - rearmAfterIrq(): after a DIO1 event. Cheap IRQ-clear for continuous
-  //    RX; full re-issue for duty cycle (mandatory there).
-  //  - restartReceive(): safety net / recovery. Full re-issue of the last
-  //    mode, restoring RX no matter what state the chip fell into.
+  // Two re-arm flavours; both no-op until startReceive() has armed RX once:
+  //  - rearmAfterIrq(): after a DIO1 event. Cheap — IRQ clear + SET_RX, no
+  //    standby bounce, so it can't cut a frame already arriving.
+  //  - restartReceive(): safety net / recovery. Full re-arm, restoring RX no
+  //    matter what state the chip fell into.
   void rearmAfterIrq();
   void restartReceive();
   void clearRxIrq(); // Lightweight: just clear IRQ, stay in continuous RX
@@ -161,12 +155,9 @@ private:
   uint32_t _txStartMs;
   uint8_t _txLen;         // payload length of the async TX in flight
 
-  // Last-started RX mode, so rearmAfterIrq()/restartReceive() can re-issue it
-  enum RxMode : uint8_t { RX_NONE, RX_CONTINUOUS, RX_DUTY_CYCLE };
-  RxMode _rxMode;
-  uint16_t _dcRxCount;
-  uint16_t _dcSleepCount;
-  uint8_t _dcPeriodBase;
+  // Has RX ever been armed? The re-arm helpers must stay no-ops before that,
+  // so a stray DIO1 edge can't put an unconfigured chip into receive.
+  bool _rxArmed;
 
   uint16_t _lastPktLen; // setPacketParams cache (0xFFFF = invalid)
   uint32_t _rxErrors;   // CRC/header-corrupted receptions since boot

@@ -8,6 +8,7 @@ void TallyLink::begin(uint8_t cameraId, StateCallback onState,
     _onLink = onLink;
     _lastRxMs = millis();
     _lastSourceLiveMs = millis();
+    _poorWindowStart = millis();
 }
 
 bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
@@ -16,7 +17,8 @@ bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
         return false;
     }
 
-    uint8_t code = TallyProtocol::cmdCode(pkt);
+    uint8_t code = TallyProtocol::cmd(pkt);
+
     if (code == CMD_TELEMETRY) {
         // Slave->hub frame: valid, but NOT link liveness. Only hub-originated
         // frames may refresh the link timer — counting peer telemetry masked
@@ -25,37 +27,55 @@ bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
         return true;
     }
 
-    // Hub-originated frame (STATE_ALL / PING / SET_CHANNEL / SET_POWER):
-    // the hub is alive. Count missed-heartbeat gaps for linkPoor() first.
+    // Hub-originated frame: the hub is alive. Count missed-heartbeat gaps for
+    // the degradation gradient FIRST, while _lastRxMs still holds the old time.
+    // Gated on _everHeard so the boot-to-first-packet interval isn't counted as
+    // a gap (it would report a healthy link as degraded for the first 30s).
     uint32_t now = millis();
-    if (now - _lastRxMs > 2 * TALLY_REFRESH_MS)
+    if (_everHeard && now - _lastRxMs > 2 * TALLY_REFRESH_MS)
         _rxGaps++;
     _lastRxMs = now;
+    _everHeard = true;
     if (_signalLost) {
         _signalLost = false;
         if (_onLink) _onLink(false);
     }
 
     if (code == CMD_PING) {
-        if (pkt.aux == _cameraId || pkt.aux == TALLY_BROADCAST_ID) {
+        uint8_t target = TallyProtocol::pingTarget(pkt);
+        if (target == _cameraId || target == TALLY_BROADCAST_ID) {
             if (_onLocator) _onLocator();
         }
-    } else if (code == CMD_STATE_ALL) {
-        // Track the hub's tally-source freshness (set in tick()'s grace timer)
-        if (TallyProtocol::sourceLive(pkt))
-            _lastSourceLiveMs = millis();
+        return true;
+    }
 
-        TallyState ts = TallyProtocol::stateForCamera(pkt, _cameraId);
-        if (ts != _state) {
-            _state = ts;
-            if (_onState) _onState(ts);
-        }
-    } else if (code == CMD_SET_CHANNEL) {
-        if (_onChannel)
-            _onChannel(TallyProtocol::channelFreq(pkt), pkt.aux);
-    } else if (code == CMD_SET_POWER) {
-        if ((pkt.aux == _cameraId || pkt.aux == TALLY_BROADCAST_ID) && _onPower)
-            _onPower(TallyProtocol::powerDbm(pkt));
+    if (code != CMD_STATE_ALL)
+        return true;
+
+    // ---- STATE_ALL: tally state, source freshness, channel plan, time base --
+    _lastHbCount = TallyProtocol::hbCount(pkt);
+    _lastHbAtMs = now;
+    _hbSeen = true;
+
+    if (TallyProtocol::sourceLive(pkt))
+        _lastSourceLiveMs = now;
+
+    // Channel plan: the countdown is in heartbeats. Convert to an absolute
+    // instant and add a margin so clock skew makes us switch slightly LATE
+    // (still covered by the hub's old-channel beacon) rather than early, which
+    // would cost us the remaining announcements. Every announcing frame
+    // refines the estimate, so losing any subset still leaves a usable one.
+    uint8_t cd = TallyProtocol::chanCountdown(pkt);
+    if (cd > 0 && _onChannel) {
+        uint32_t at = now + (uint32_t)cd * TALLY_REFRESH_MS +
+                      TALLY_CHAN_SWITCH_MARGIN_MS;
+        _onChannel(TallyProtocol::chanIdx(pkt), at);
+    }
+
+    TallyState ts = TallyProtocol::stateForCamera(pkt, _cameraId);
+    if (ts != _state) {
+        _state = ts;
+        if (_onState) _onState(ts);
     }
     return true;
 }
@@ -69,7 +89,7 @@ void TallyLink::tick() {
     // source frozen for longer than the grace window. Riding out brief ATEM
     // reconnects, this avoids flicker while still catching a real freeze.
     _sourceStale = (millis() - _lastSourceLiveMs > TALLY_SOURCE_GRACE_MS);
-    // linkPoor() window: fixed 30s buckets (a hint flag for the hub, not a
+    // Gradient window: fixed 30s buckets (a hint for the hub, not a
     // measurement — boundary resets are fine under its sustained trigger).
     if (millis() - _poorWindowStart > 30000) {
         _poorWindowStart = millis();

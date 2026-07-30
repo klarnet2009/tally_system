@@ -16,22 +16,36 @@
 #include "config.h"
 
 static E28Radio radio;
-static uint32_t g_loraTxCount = 0;   // TX packet counter
-static uint32_t g_loraDropCount = 0; // Packets lost: queue overflow / radio / TX fail
+static uint32_t g_loraTxCount = 0;   // frames actually transmitted
+static uint32_t g_loraDropCount = 0; // frames lost: radio down / TX failure
 
-// Runtime TX power (serial "power N", chip dBm). Boot default is the hub's
-// fixed-power constant; radioInit() re-applies this AFTER the shared profile
-// (which sets the slave-oriented TALLY_TX_POWER) so the hub value wins and a
-// live override survives radio recovery/reinit instead of silently resetting.
+// Runtime TX power (serial "power N", chip dBm). radioInit() re-applies this
+// after the shared profile so a live override survives radio recovery.
+// NOTE: the hub module's PA saturates at chip 0 dBm — raising this adds current
+// draw, not range, and the extra draw sags the rail (see TallyConfig.h).
 static int8_t g_txPower = TALLY_HUB_TX_POWER;
 
-// AFA: current channel (survives recovery, same pattern as g_txPower) and a
-// pending switch. A "chan <i>" command enqueues CMD_SET_CHANNEL announcements
-// on the CURRENT channel; the hub itself retunes only when the TX queue has
-// fully drained, so every announcement leaves on the old frequency first.
+// ===== Channel state (AFA) =====
 static const uint32_t g_chanList[] = TALLY_CHAN_LIST;
+static uint8_t g_chanIdx = 0;
 static uint32_t g_chanFreq = TALLY_RF_FREQ_HZ;
-static uint32_t g_pendingChanFreq = 0; // 0 = no switch pending
+
+// Coordinated switch. The plan rides inside the heartbeat (chanIdx + a
+// countdown in beats), so ~10 decorrelated frames carry it instead of a burst
+// of back-to-back announcements that share one interference burst. The hub
+// retunes only once the countdown-1 frame has actually left the air.
+static bool g_switchPending = false;
+static uint8_t g_switchToIdx = 0;
+static uint8_t g_switchCountdown = 0;
+
+// After switching, beacon the new channel on the OLD one for a while: a slave
+// that missed every announcement is recovered immediately instead of scanning.
+static uint32_t g_oldChanFreq = 0; // 0 = not beaconing
+static uint32_t g_beaconUntilMs = 0;
+static uint32_t g_beaconNextMs = 0;
+
+// Heartbeat cycle counter — the fleet's shared time base for telemetry slots.
+static uint8_t g_hbCount = 0;
 
 // ===== Debug logging =====
 // The S3 has two consoles: Serial = native USB-Serial-JTAG (GPIO19/20),
@@ -64,17 +78,27 @@ static uint16_t g_prevMask = 0;
 enum AtemPhase : uint8_t { ATEM_IDLE, ATEM_CONNECTING, ATEM_RUNNING };
 static AtemPhase atemPhase = ATEM_IDLE;
 
-// begin() resets the chip to its 2.4 GHz default frequency, so the shared RF
-// profile must be reapplied on every (re)init — including in-field recovery
+// sourceLive: in production true only while ATEM is actually connected, so a
+// frozen mask set is flagged stale and slaves show "don't trust" instead of a
+// confident wrong colour. In test mode the generated stream is always live.
+static inline bool sourceLiveNow() {
+#ifdef LORA_TEST_MODE
+  return true;
+#else
+  return atemPhase == ATEM_RUNNING;
+#endif
+}
+
+// begin() resets the chip to its defaults, so the shared RF profile must be
+// reapplied on every (re)init — including in-field recovery.
 static bool radioInit() {
   bool ok = radio.begin(E28_PIN_SCK, E28_PIN_MISO, E28_PIN_MOSI, E28_PIN_NSS,
                         E28_PIN_BUSY, E28_PIN_DIO1, E28_PIN_RESET, E28_PIN_RXEN,
                         E28_PIN_TXEN);
   if (ok) {
-    tallyApplyRadioProfile(radio);
-    radio.setTxPower(g_txPower);     // keep any live "power N" override
-    radio.setFrequency(g_chanFreq);  // keep the current AFA channel too
-    radio.startReceive(); // listen for slave telemetry between TX bursts
+    tallyApplyRadioProfile(radio, g_txPower);
+    radio.setFrequency(g_chanFreq); // keep the current AFA channel
+    radio.startReceive(); // listen for slave telemetry between our frames
   }
   return ok;
 }
@@ -83,91 +107,193 @@ static bool radioInit() {
 // The hub is otherwise blind to whether a slave is actually lit; this closes
 // the loop. Indexed by camera ID 1..16.
 static uint32_t g_camLastSeen[17] = {0};
-static int8_t g_camRssi[17] = {0};
+static int8_t g_camRssi[17] = {0};   // downlink: how loudly the slave hears us
+static int8_t g_camRxRssi[17] = {0}; // uplink: telemetry loudness at the hub
+static uint8_t g_camMissed[17] = {0}; // slave's missed-heartbeat gradient (0-15)
 static bool g_camReachable[17] = {false};
-static int8_t g_camRxRssi[17] = {0};     // uplink: telemetry loudness at the hub
-static bool g_camLinkPoor[17] = {false}; // slave reports missing heartbeats
-// Slaves jitter their interval by camId*JITTER (worst case ~2.6s for cam 16),
-// and the hub is deaf during its own ~96ms heartbeat TX every 500ms (~19%
-// duty) — the window must cover the worst-case jittered interval with beats
-// to spare, or a few lost uplinks flap a high-ID camera OFFLINE/ONLINE.
-#define CAM_REACHABLE_MS (4 * (TALLY_TELEMETRY_MS + 16 * TALLY_TELEMETRY_JITTER_MS))
-
-// ⚡ Bolt: Non-blocking transmission queue to prevent delay() stalls in main loop
-#define LORA_QUEUE_SIZE 16
-static TallyPacket g_loraQueue[LORA_QUEUE_SIZE];
-static uint8_t g_loraQueueHead = 0;
-static uint8_t g_loraQueueTail = 0;
-
-static void enqueueLora(const TallyPacket &pkt) {
-  uint8_t nextHead = (g_loraQueueHead + 1) % LORA_QUEUE_SIZE;
-  if (nextHead != g_loraQueueTail) { // Queue not full
-    g_loraQueue[g_loraQueueHead] = pkt;
-    g_loraQueueHead = nextHead;
-  } else {
-    g_loraDropCount++;
-  }
+// Telemetry is slotted now, so the period is exact (TALLY_TELEMETRY_MS) rather
+// than jittered. 3 missed slots is a real signal; a single frame lost to a
+// collision with a change burst must NOT flap the camera offline.
+#define CAM_REACHABLE_MS (3 * TALLY_TELEMETRY_MS)
+// A camera reporting this many missed heartbeats is struggling on the DOWNLINK
+// — the direction that matters. This, not the hub's own RX error count, is the
+// channel-quality signal (hub RX errors measure the uplink and are polluted by
+// foreign energy).
+#define CAM_POOR_MISSED 3
+static inline bool camPoor(uint8_t id) {
+  return !g_camReachable[id] || g_camMissed[id] >= CAM_POOR_MISSED;
 }
 
-static void processLoraQueue() {
-  static uint32_t lastTxDoneTime = 0;
+// ===== Transmit scheduler: ALWAYS the latest state =====
+// v3 used a packet FIFO and could transmit an already-superseded state: a
+// second cut 50 ms after the first left copies of the OLD masks queued ahead of
+// the new ones, so a slave showed the previous colour for up to ~290 ms — a
+// visibly wrong light. The scheduler now holds only a repeat COUNT; every copy
+// is serialized from the live masks at transmit time, so a stale state can
+// never reach the air.
+static const uint16_t kBurstOffsets[TALLY_BURST_COPIES] = TALLY_BURST_OFFSETS_MS;
+static uint8_t g_burstIdx = 0;    // next copy to send
+static uint8_t g_burstCopies = 0; // total copies in this group (1 = heartbeat)
+static uint32_t g_burstStartMs = 0;
+static uint32_t g_stateNextAtMs = 0;
 
-  // Finish the in-flight transmission first (checkTxDone tears down PA/IRQ);
-  // the loop never blocks on TX airtime (~96ms at SF9 with the long preamble)
+// One-shot frames (locator ping, old-channel beacon) are events rather than
+// state, so they keep a tiny FIFO. freqHz != 0 transmits on that frequency
+// instead of the current channel — that is the beacon's whole purpose.
+struct OneShot {
+  TallyPacket pkt;
+  uint32_t freqHz;
+};
+#define ONESHOT_QUEUE_SIZE 8
+static OneShot g_oneShot[ONESHOT_QUEUE_SIZE];
+static uint8_t g_osHead = 0, g_osTail = 0;
+static bool g_txOffChannel = false; // last frame went out on another frequency
+// AutoRF borrows the radio to measure another channel. processTx() runs BEFORE
+// autoRfTick() in loop(), so without this the transmitter could start a frame
+// while the radio is parked on the scout's frequency — the frame would go out
+// on the wrong channel and the whole fleet would miss it. Transmitting always
+// wins: processTx() reclaims the radio and the scout discards its partial visit.
+static bool g_scoutActive = false;
+
+static void enqueueOneShot(const TallyPacket &pkt, uint32_t freqHz = 0) {
+  uint8_t next = (uint8_t)((g_osHead + 1) % ONESHOT_QUEUE_SIZE);
+  if (next == g_osTail) {
+    g_loraDropCount++;
+    return;
+  }
+  g_oneShot[g_osHead].pkt = pkt;
+  g_oneShot[g_osHead].freqHz = freqHz;
+  g_osHead = next;
+}
+
+static inline bool txIdle() {
+  return !radio.txActive() && g_burstIdx >= g_burstCopies && g_osHead == g_osTail;
+}
+
+// Serialized fresh on every copy — this is what makes a stale state impossible.
+static TallyPacket buildStateFrame() {
+  return TallyProtocol::createStateAllPacket(
+      g_progMask, g_prevMask, sourceLiveNow(), g_hbCount,
+      g_switchPending ? g_switchToIdx : 0,
+      g_switchPending ? g_switchCountdown : 0);
+}
+
+static void applyChannelSwitch() {
+  g_oldChanFreq = g_chanFreq; // beacon target
+  g_chanIdx = g_switchToIdx;
+  g_chanFreq = g_chanList[g_chanIdx];
+  g_switchPending = false;
+  radio.setFrequency(g_chanFreq);
+  radio.startReceive();
+  uint32_t now = millis();
+  g_beaconUntilMs = now + TALLY_OLD_BEACON_FOR_MS;
+  g_beaconNextMs = now + TALLY_OLD_BEACON_EVERY_MS;
+  hublogf("[CHAN] hub now on ch%u (%lu.%lu MHz), beaconing old for %lus\n",
+          g_chanIdx, (unsigned long)(g_chanFreq / 1000000UL),
+          (unsigned long)((g_chanFreq % 1000000UL) / 100000UL),
+          (unsigned long)(TALLY_OLD_BEACON_FOR_MS / 1000));
+}
+
+// Start announcing a coordinated switch. Idempotent-ish: a new request while
+// one is pending simply retargets it.
+static void requestChannelSwitch(uint8_t idx, const char *reason) {
+  if (idx >= TALLY_CHAN_COUNT || idx == g_chanIdx)
+    return;
+  g_switchToIdx = idx;
+  g_switchCountdown = TALLY_CHAN_ANNOUNCE_BEATS;
+  g_switchPending = true;
+  hublogf("[CHAN] announcing switch to ch%u in %u beats: %s\n", idx,
+          TALLY_CHAN_ANNOUNCE_BEATS, reason);
+}
+
+static void processTx() {
+  static uint32_t lastTxDoneMs = 0;
+
+  // Finish the in-flight frame first; the loop never blocks on airtime (~43ms).
   if (radio.txActive()) {
     if (radio.checkTxDone()) {
-      // A 100ms timeout (stuck PA/antenna fault) counts as a drop, not a TX,
-      // so the OLED drop counter surfaces a failing radio instead of hiding it
+      // A TX that timed out (stuck PA / antenna fault) is a drop, not a send,
+      // so the counters surface a failing radio instead of hiding it.
       if (radio.txSucceeded())
         g_loraTxCount++;
       else
         g_loraDropCount++;
-      lastTxDoneTime = millis();
-      // Back to listening when the queue is drained (TX pulls us out of RX)
-      if (g_loraQueueHead == g_loraQueueTail) {
-        // Pending AFA switch: every announcement has now left on the old
-        // channel — retune before re-arming RX
-        if (g_pendingChanFreq) {
-          g_chanFreq = g_pendingChanFreq;
-          g_pendingChanFreq = 0;
-          radio.setFrequency(g_chanFreq);
-          hublogf("[CHAN] hub now on %lu.%lu MHz\n", g_chanFreq / 1000000UL,
-                  (g_chanFreq % 1000000UL) / 100000UL);
-        }
-        radio.startReceive();
+      lastTxDoneMs = millis();
+      if (g_txOffChannel) { // beacon finished — back to the working channel
+        radio.setFrequency(g_chanFreq);
+        g_txOffChannel = false;
       }
+      radio.startReceive(); // back to listening for telemetry
+      // The countdown-1 frame is now on air: it is safe to retune.
+      if (g_switchPending && g_switchCountdown == 0 && txIdle())
+        applyChannelSwitch();
     }
     return;
   }
 
-  if (g_loraQueueHead != g_loraQueueTail) {
-    // Radio down: drain the packet as a drop instead of stalling on SPI
-    if (!radio.isConnected()) {
+  // Radio down: account for what can't go out instead of stalling on SPI.
+  if (!radio.isConnected()) {
+    if (g_burstIdx < g_burstCopies) {
       g_loraDropCount++;
-      g_loraQueueTail = (g_loraQueueTail + 1) % LORA_QUEUE_SIZE;
-      // Announcements undeliverable, but honour the operator's intent: the
-      // driver remembers the frequency and recovery re-applies it
-      if (g_loraQueueHead == g_loraQueueTail && g_pendingChanFreq) {
-        g_chanFreq = g_pendingChanFreq;
-        g_pendingChanFreq = 0;
-        radio.setFrequency(g_chanFreq);
-      }
-      return;
+      g_burstIdx = g_burstCopies;
     }
-    // Minimum 2ms gap between packets, enforced non-blockingly
-    if (millis() - lastTxDoneTime >= 2) {
-      uint8_t buf[TALLY_PACKET_SIZE];
-      TallyProtocol::serialize(g_loraQueue[g_loraQueueTail], buf);
-      if (radio.startSend(buf, TALLY_PACKET_SIZE)) {
-        g_loraQueueTail = (g_loraQueueTail + 1) % LORA_QUEUE_SIZE;
-      }
+    while (g_osHead != g_osTail) {
+      g_loraDropCount++;
+      g_osTail = (uint8_t)((g_osTail + 1) % ONESHOT_QUEUE_SIZE);
+    }
+    return;
+  }
+
+  if (g_switchPending && g_switchCountdown == 0 && txIdle()) {
+    applyChannelSwitch();
+    return;
+  }
+
+  if (millis() - lastTxDoneMs < 2) // minimum inter-frame gap
+    return;
+
+  // Anything to transmit? Reclaim the radio from an in-progress scout visit
+  // first — measuring a channel is opportunistic, sending tally is not.
+  if (g_scoutActive && (g_osHead != g_osTail || g_burstIdx < g_burstCopies)) {
+    radio.setFrequency(g_chanFreq);
+    radio.startReceive();
+    g_scoutActive = false; // the scout sees this and drops its partial visit
+  }
+
+  // One-shots first: the locator is a human-triggered, time-sensitive event,
+  // and a beacon that waits for a burst to finish may miss its window.
+  if (g_osHead != g_osTail) {
+    OneShot &os = g_oneShot[g_osTail];
+    uint8_t buf[TALLY_PACKET_SIZE];
+    TallyProtocol::serialize(os.pkt, buf);
+    bool offChannel = (os.freqHz != 0 && os.freqHz != g_chanFreq);
+    if (offChannel)
+      radio.setFrequency(os.freqHz);
+    if (radio.startSend(buf, TALLY_PACKET_SIZE)) {
+      g_txOffChannel = offChannel;
+      g_osTail = (uint8_t)((g_osTail + 1) % ONESHOT_QUEUE_SIZE);
+    } else if (offChannel) {
+      radio.setFrequency(g_chanFreq); // never leave the radio parked off-channel
+    }
+    return;
+  }
+
+  // State copies on the burst schedule.
+  if (g_burstIdx < g_burstCopies &&
+      (int32_t)(millis() - g_stateNextAtMs) >= 0) {
+    TallyPacket pkt = buildStateFrame();
+    uint8_t buf[TALLY_PACKET_SIZE];
+    TallyProtocol::serialize(pkt, buf);
+    if (radio.startSend(buf, TALLY_PACKET_SIZE)) {
+      g_burstIdx++;
+      if (g_burstIdx < g_burstCopies)
+        g_stateNextAtMs = g_burstStartMs + kBurstOffsets[g_burstIdx];
     }
   }
 }
 
 // Receive slave telemetry during idle (non-TX) windows and update the
-// reachability table. Cheap: one available() check per loop, a receive only
-// when a frame is waiting.
+// reachability table.
 static void serviceTelemetry() {
   if (radio.txActive() || !radio.isConnected())
     return;
@@ -175,23 +301,23 @@ static void serviceTelemetry() {
     return;
   uint8_t buf[TALLY_PACKET_SIZE];
   uint8_t len = radio.receive(buf, TALLY_PACKET_SIZE);
-  // Cheap re-arm (IRQ clear + SET_RX): the full startReceive() would bounce
-  // through standby and could cut a frame already mid-air in continuous RX
+  // Cheap re-arm (IRQ clear + SET_RX): a full startReceive() would bounce
+  // through standby and could cut a frame already arriving.
   radio.rearmAfterIrq();
   if (len == 0)
     return;
   TallyPacket pkt;
   if (!TallyProtocol::deserialize(buf, len, pkt))
     return;
-  if (TallyProtocol::cmdCode(pkt) == CMD_TELEMETRY) {
-    uint8_t id = pkt.aux;
-    if (id >= 1 && id <= 16) {
-      g_camLastSeen[id] = millis();
-      g_camRssi[id] = TallyProtocol::telemetryRssi(pkt); // downlink (slave-heard)
-      g_camRxRssi[id] = radio.getRSSI();                 // uplink (hub-heard)
-      g_camLinkPoor[id] = (pkt.payload[3] & TALLY_TLM_LINK_POOR) != 0;
-    }
-  }
+  if (TallyProtocol::cmd(pkt) != CMD_TELEMETRY)
+    return;
+  uint8_t id = TallyProtocol::telemetryCamId(pkt);
+  if (id < 1 || id > 16)
+    return;
+  g_camLastSeen[id] = millis();
+  g_camRssi[id] = TallyProtocol::telemetryRssi(pkt); // downlink (slave-heard)
+  g_camRxRssi[id] = radio.getRSSI();                 // uplink (hub-heard)
+  g_camMissed[id] = TallyProtocol::telemetryMissed(pkt);
 }
 
 #include "autorf.h"
@@ -204,48 +330,72 @@ static void sweepReachability() {
                  (millis() - g_camLastSeen[id] < CAM_REACHABLE_MS);
     if (reach != g_camReachable[id]) {
       g_camReachable[id] = reach;
-      hublogf("[TLM] cam %u %s (rssi=%d)\n", id, reach ? "ONLINE" : "OFFLINE",
-              g_camRssi[id]);
-      autoRfOnCamChange(id, reach); // AutoRF: power restore/raise/re-announce
+      hublogf("[TLM] cam %u %s (dl=%d dBm missed=%u)\n", id,
+              reach ? "ONLINE" : "OFFLINE", g_camRssi[id], g_camMissed[id]);
     }
   }
 }
 
-// === STATE_ALL broadcast: on change + every TALLY_REFRESH_MS (heartbeat).
+// === STATE_ALL: change burst + periodic heartbeat.
 // Runs even with ATEM down — losing the switcher must not look like a dead
-// radio link to the slaves; they keep showing the last known masks.
-// Extracted from loop() so the log-dump pump can keep beating mid-dump.
+// radio link to the slaves; they keep the last known masks, flagged stale.
 static void heartbeatTick() {
-  static uint32_t lastStateSend = 0;
-  static uint16_t lastSentProg = 0xFFFF;
-  static uint16_t lastSentPrev = 0xFFFF;
-  bool masksChanged = (g_progMask != lastSentProg) || (g_prevMask != lastSentPrev);
-  if (masksChanged || millis() - lastStateSend >= TALLY_REFRESH_MS) {
-    lastSentProg = g_progMask;
-    lastSentPrev = g_prevMask;
-    lastStateSend = millis();
-    // sourceLive: in production, true only while ATEM is actually connected
-    // (frozen masks after an ATEM drop are flagged stale so slaves can warn);
-    // in test mode the generated stream is always "live".
-#ifdef LORA_TEST_MODE
-    bool sourceLive = true;
-#else
-    bool sourceLive = (atemPhase == ATEM_RUNNING);
-#endif
-    TallyPacket pkt =
-        TallyProtocol::createStateAllPacket(g_progMask, g_prevMask, sourceLive);
-    // Burst-on-change: a tally transition ("camera goes ON AIR") is otherwise a
-    // single fire-and-forget packet; one RF collision would show the wrong
-    // light until the next heartbeat (up to TALLY_REFRESH_MS). Sending the
-    // change 3x (queued, ~2ms apart) drops the residual loss from p to ~p^3 and
-    // cuts worst-case wrong-light latency from ~500ms to tens of ms. Heartbeats
-    // (no change) send once — slaves act on STATE_ALL idempotently.
-    enqueueLora(pkt);
-    if (masksChanged) {
-      enqueueLora(pkt);
-      enqueueLora(pkt);
-    }
+  static uint32_t lastHbMs = 0;
+  static uint16_t lastProg = 0xFFFF;
+  static uint16_t lastPrev = 0xFFFF;
+  uint32_t now = millis();
+
+  if (g_progMask != lastProg || g_prevMask != lastPrev) {
+    lastProg = g_progMask;
+    lastPrev = g_prevMask;
+    // A cut supersedes any copies still pending: restart the burst. Because
+    // every copy re-reads the live masks, the ones already sent were correct
+    // and the ones not yet sent now carry the new state.
+    g_burstIdx = 0;
+    g_burstCopies = TALLY_BURST_COPIES;
+    g_burstStartMs = now;
+    g_stateNextAtMs = now;
+    return; // the burst covers this interval; heartbeat timer untouched
   }
+
+  if (now - lastHbMs < TALLY_REFRESH_MS)
+    return;
+  lastHbMs = now;
+  g_hbCount++; // advances the fleet's telemetry-slot cycle
+
+  // The countdown is what slaves count, so it advances per heartbeat. It is
+  // decremented AFTER this beat's frame is scheduled, so a frame carrying
+  // countdown=1 always reaches the air before the hub retunes.
+  if (g_burstIdx >= g_burstCopies) { // never interrupt a burst in progress
+    g_burstIdx = 0;
+    g_burstCopies = 1;
+    g_burstStartMs = now;
+    g_stateNextAtMs = now;
+  }
+  if (g_switchPending && g_switchCountdown > 0)
+    g_switchCountdown--;
+}
+
+// Beacon the current channel on the OLD one after a switch, so a slave that
+// missed every in-heartbeat announcement is recovered at once. It is a normal
+// STATE_ALL (correct tally!) carrying countdown=1, so the stranded slave gets
+// both the right colour and the retune instruction.
+static void beaconTick() {
+  if (!g_oldChanFreq)
+    return;
+  uint32_t now = millis();
+  if ((int32_t)(now - g_beaconUntilMs) >= 0) {
+    g_oldChanFreq = 0;
+    return;
+  }
+  if ((int32_t)(now - g_beaconNextMs) < 0)
+    return;
+  if (!txIdle()) // never take the air from a state burst
+    return;
+  g_beaconNextMs = now + TALLY_OLD_BEACON_EVERY_MS;
+  TallyPacket pkt = TallyProtocol::createStateAllPacket(
+      g_progMask, g_prevMask, sourceLiveNow(), g_hbCount, g_chanIdx, 1);
+  enqueueOneShot(pkt, g_oldChanFreq);
 }
 
 // ===== OLED / ATEM =====
@@ -605,7 +755,7 @@ void setup() {
   hublogf("[BOOT] reset_reason=%d\n", (int)esp_reset_reason());
   hublogf("[CFG] netId=0x%02X freq=%lu preamble=%d power=%d refresh=%dms\n",
           TALLY_NET_ID, (unsigned long)TALLY_RF_FREQ_HZ,
-          TALLY_PREAMBLE_SYMBOLS, TALLY_TX_POWER, TALLY_REFRESH_MS);
+          TALLY_PREAMBLE_SYMBOLS, TALLY_HUB_TX_POWER, TALLY_REFRESH_MS);
 #ifdef LORA_TEST_MODE
   hublogf("[CFG] LORA_TEST_MODE active — ATEM disabled, cam1 toggle stream\n");
 #endif
@@ -633,12 +783,6 @@ void setup() {
   else
     hublogf("[E28] init FAILED after 5 attempts — recovery retries every 10s\n");
 
-  // AutoRF: pick the cleanest channel to START on (~400ms; slaves boot-scan
-  // and converge as usual). Skipped when the radio is down — the recovery
-  // path starts on the config home channel.
-  if (radioOk)
-    autoRfBootSurvey();
-
   // ==== Wi-Fi ====
 #ifndef NO_WIFI
   drawCenteredMsg("Wi-Fi: connecting...", WIFI_SSID);
@@ -664,6 +808,13 @@ void setup() {
   drawCenteredMsg("Wi-Fi: OFF", "radio debug build");
 #endif
 
+  // AutoRF: pick the cleanest channel to START on (~150ms). Runs AFTER WiFi
+  // on purpose — measuring the band with the hub's own WiFi radio still off
+  // biased the baseline, which was half of audit finding 2. Skipped when the
+  // radio is down; recovery then starts on the config home channel.
+  if (radioOk)
+    autoRfBootSurvey();
+
   // Show LoRa debug screen for 3 seconds
   drawLoRaDebug();
   delay(3000);
@@ -686,25 +837,36 @@ static void noiseSurvey() {
     radio.setFrequency(g_chanList[i]);
     radio.startReceive();
     delay(25); // PLL settle + RSSI integration
-    int32_t sum = 0;
-    int8_t peak = -127; // loudest (closest to 0) sample = worst interferer
-    const int N = 16;
+    // Floor + busy share, NOT a mean of dBm: averaging dBm is a geometric mean
+    // of power and barely sees the bursts that actually erase frames (a 37 dB
+    // error in the worst case — audit finding 3).
+    int8_t floorDbm = 127;
+    int8_t peak = -127; // loudest sample = worst interferer
+    const int N = 32;
+    int8_t samp[32];
     for (int k = 0; k < N; k++) {
       int8_t r = radio.getRssiInst();
-      sum += r;
+      samp[k] = r;
+      if (r < floorDbm)
+        floorDbm = r;
       if (r > peak)
         peak = r;
-      delay(6);
+      delay(3);
     }
-    hublogf("[NOISE] ch%u %lu.%lu MHz: avg=%ld dBm peak=%d dBm%s\n", i,
+    int busy = 0;
+    for (int k = 0; k < N; k++)
+      if (samp[k] > floorDbm + AUTORF_BUSY_ABOVE_FLOOR)
+        busy++;
+    hublogf("[NOISE] ch%u %lu.%lu MHz: floor=%d dBm busy=%d%% peak=%d dBm%s\n", i,
             g_chanList[i] / 1000000UL, (g_chanList[i] % 1000000UL) / 100000UL,
-            (long)(sum / N), (int)peak,
+            (int)floorDbm, busy * 100 / N, (int)peak,
             g_chanList[i] == g_chanFreq ? "  <- current" : "");
   }
   // Back to the working channel
   radio.setFrequency(g_chanFreq);
   radio.startReceive();
-  hublogf("[NOISE] quieter than -100 = clean; louder than -85 = busy\n");
+  hublogf("[NOISE] floor below -100 = clean; busy%% is what breaks frames — a\n"
+          "[NOISE] high floor with busy~0 is harmless, LoRa decodes below noise\n");
 }
 
 // The log dump streams up to ~512KB at 115200 ≈ 45s; without a pump the loop
@@ -712,7 +874,7 @@ static void noiseSurvey() {
 // + AFA channel scans), a dropped ATEM connection, a stalled TX queue. The
 // dump calls this after every 256B chunk, keeping the fleet alive mid-dump.
 static void logDumpPump() {
-  processLoraQueue();
+  processTx();
   serviceTelemetry();
   heartbeatTick();
 #ifndef LORA_TEST_MODE
@@ -725,8 +887,13 @@ static void logDumpPump() {
 // for internally-generated commands (the 10s status heartbeat).
 static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
   if (cmd == "status") {
-    uint8_t qDepth =
-        (g_loraQueueHead + LORA_QUEUE_SIZE - g_loraQueueTail) % LORA_QUEUE_SIZE;
+    // "q" is now the transmit scheduler's state: copies of the CURRENT state
+    // still to send, plus any queued one-shots (locator / old-channel beacon).
+    uint8_t qDepth = (uint8_t)((g_burstCopies > g_burstIdx
+                                    ? g_burstCopies - g_burstIdx
+                                    : 0) +
+                               ((g_osHead + ONESHOT_QUEUE_SIZE - g_osTail) %
+                                ONESHOT_QUEUE_SIZE));
     char ipbuf[20];
     if (WiFi.status() == WL_CONNECTED)
       snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", WiFi.localIP()[0],
@@ -769,8 +936,9 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
     String arg = cmd.substring(5);
     arg.trim();
     if (!arg.length()) {
-      hublogf("[PWR] chip=%d dBm (~%d dBm EIRP with 27S PA). Set: power <-18..12>\n",
-              (int)g_txPower, (int)g_txPower + 14);
+      hublogf("[PWR] chip=%d dBm (%u%%). The 27S PA SATURATES at chip 0 dBm —\n"
+              "[PWR] above 0 adds current, not range. Set: power <-18..12>\n",
+              (int)g_txPower, (unsigned)pwrPercent(g_txPower));
     } else if (arg[0] != '-' && (arg[0] < '0' || arg[0] > '9')) {
       hublogf("[PWR] usage: power <-18..12>\n");
     } else {
@@ -781,9 +949,9 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
         autoRfManualOverride("power");
         g_txPower = (int8_t)p;
         radio.setTxPower(g_txPower);
-        hublogf("[PWR] chip=%d dBm (~%d dBm EIRP)%s\n", p, p + 14,
-                p > 4 ? " — WARNING: >4 risks 3V3 brownout until the rail fix;"
-                        " EU EIRP cap is ~chip +6"
+        hublogf("[PWR] chip=%d dBm (%u%%)%s\n", p, (unsigned)pwrPercent(g_txPower),
+                p > 0 ? " — WARNING: the PA is already saturated at 0 dBm, so"
+                        " this only draws more current and sags the rail"
                       : "");
       }
     }
@@ -802,21 +970,15 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
       uint8_t i = (uint8_t)arg.toInt();
       if (i >= TALLY_CHAN_COUNT) {
         hublogf("[CHAN] no such channel (0..%u)\n", TALLY_CHAN_COUNT - 1);
-      } else if (g_chanList[i] == g_chanFreq) {
+      } else if (i == g_chanIdx) {
         hublogf("[CHAN] already on ch%u\n", i);
+      } else if (g_switchPending || g_oldChanFreq) {
+        hublogf("[CHAN] a switch is already in progress — wait for it\n");
       } else {
-        // Announce 6x on the CURRENT channel (residual loss ~p^6), then the
-        // queue-drain hook retunes the hub. Slaves that miss every copy find
-        // us again via their signal-lost channel scan within ~6s.
+        // The plan rides in the next ~10 heartbeats (decorrelated by 500ms),
+        // then the hub retunes and beacons the new channel on the old one.
         autoRfManualOverride("chan");
-        TallyPacket pkt =
-            TallyProtocol::createSetChannelPacket(i, g_chanList[i]);
-        for (int k = 0; k < 6; k++)
-          enqueueLora(pkt);
-        g_pendingChanFreq = g_chanList[i];
-        hublogf("[CHAN] announcing switch to ch%u (%lu.%lu MHz)...\n", i,
-                g_chanList[i] / 1000000UL,
-                (g_chanList[i] % 1000000UL) / 100000UL);
+        requestChannelSwitch(i, "manual");
       }
     }
   } else if (cmd == "noise") {
@@ -869,9 +1031,11 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
       if (g_camLastSeen[id] == 0)
         continue;
       any = true;
-      hublogf("[CAM %2u] %s rssi=%4d dBm pwr=%d  last seen %lus ago\n", id,
-              g_camReachable[id] ? "ONLINE " : "OFFLINE", (int)g_camRssi[id],
-              (int)g_camPower[id],
+      // dl = how loudly the SLAVE hears us (the safety-critical direction),
+      // ul = how loudly we hear the slave, missed = its heartbeat gradient.
+      hublogf("[CAM %2u] %s dl=%4d ul=%4d dBm missed=%-2u last seen %lus ago\n",
+              id, g_camReachable[id] ? "ONLINE " : "OFFLINE",
+              (int)g_camRssi[id], (int)g_camRxRssi[id], g_camMissed[id],
               (unsigned long)((millis() - g_camLastSeen[id]) / 1000));
     }
     if (!any)
@@ -881,10 +1045,10 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
     arg.trim();
     if (arg == "on") {
       g_autoRf = true;
-      hublogf("[AUTO] on — resuming automatic channel/power control\n");
+      hublogf("[AUTO] on — resuming automatic channel selection\n");
     } else if (arg == "off") {
       g_autoRf = false;
-      hublogf("[AUTO] off — manual chan/power only\n");
+      hublogf("[AUTO] off — manual chan only\n");
     } else {
       autoRfReport();
     }
@@ -920,10 +1084,11 @@ static void pollSerialCommands() {
 }
 
 void loop() {
-  processLoraQueue();
+  processTx();
   serviceTelemetry();  // receive slave telemetry in idle windows
   sweepReachability(); // log cameras going online/offline
-  autoRfTick();        // AutoRF: channel scoring, switch + power decisions
+  beaconTick();        // after a switch: recover slaves left on the old channel
+  autoRfTick();        // channel measurement + switch decisions
   TallyLog.tick();     // periodic flash-log flush
 
   // Radio recovery: re-init every 10s while disconnected (begin() bails out
@@ -1007,7 +1172,7 @@ void loop() {
 
   if (locatorPingsLeft > 0 && (int32_t)(millis() - locatorNextMs) >= 0) {
     TallyPacket pkt = TallyProtocol::createPingPacket(1);
-    enqueueLora(pkt);
+    enqueueOneShot(pkt);
     locatorPingsLeft--;
     // 100ms to the next ping; after the 3rd, a ~2s cooldown gates retrigger
     locatorNextMs = millis() + (locatorPingsLeft ? 100 : 2000);
@@ -1054,7 +1219,7 @@ void loop() {
 
   // Second queue pass: with one pass per ~10ms loop, TxDone detection (and
   // PA-off) lagged the ~96ms airtime by up to a full tick; this halves it
-  processLoraQueue();
+  processTx();
 
   delay(10);
 }

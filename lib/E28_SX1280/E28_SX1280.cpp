@@ -13,10 +13,7 @@ E28Radio::E28Radio() {
   _txActive = false;
   _txSuccess = false;
   _txStartMs = 0;
-  _rxMode = RX_NONE;
-  _dcRxCount = 0;
-  _dcSleepCount = 0;
-  _dcPeriodBase = 0x02;
+  _rxArmed = false;
   _lastPktLen = 0xFFFF;
   _rxErrors = 0;
   _initError = E28_OK;
@@ -68,7 +65,7 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
   // (CPOL=0/CPHA=0); assert it explicitly instead of relying on the Arduino
   // default. The bus is dedicated to the radio, so configuring it once here
   // (the HW retains mode/bitorder/clock until changed) is sufficient.
-  // 4 MHz, deliberately far below the chip's 18 MHz max: our frames are 9
+  // 4 MHz, deliberately far below the chip's 18 MHz max: our frames are 8
   // bytes so SPI speed is irrelevant, while jumper-wire/module-socket wiring
   // plus GPIO-matrix routing erode setup/hold margin at 8 MHz+ — marginal
   // timing there shows up as exactly the "init sometimes fails" flakiness.
@@ -83,7 +80,7 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
   delay(10);
   _connected = true; // assume present; bounded wait clears this on stuck BUSY
   _txActive = false; // a re-init (e.g. field recovery) abandons any in-flight TX
-  _rxMode = RX_NONE;     // chip reset forgets its RX state
+  _rxArmed = false;      // chip reset forgets its RX state
   _lastPktLen = 0xFFFF;  // and its packet params
   _initError = E28_OK;
 
@@ -144,9 +141,9 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
 
   // Configure DIO1 for TX/RX done + corrupted-reception interrupts.
   // HeaderError (bit5) matters under interference: a reception aborted on a
-  // damaged header raises no RxDone, and a duty-cycled receiver that doesn't
-  // see DIO1 would sit deaf until the timed safety net. Routing it to DIO1
-  // makes the slave's unconditional rearmAfterIrq() heal the cycle instantly.
+  // damaged header raises no RxDone, so without this the receiver would sit
+  // deaf until the timed safety net. Routing it to DIO1 makes the slave's
+  // unconditional rearmAfterIrq() restore RX instantly.
   uint8_t irqParams[8] = {
       0x00, 0x63, // IRQ mask: TxDone | RxDone | HeaderError | CrcError
       0x00, 0x63, // DIO1 mask
@@ -200,7 +197,7 @@ void E28Radio::reset() {
   } else {
     // No reset line (hub wiring): a warm ESP32 reboot (flashing, EN button,
     // brownout restart) does NOT power-cycle the module, so the SX1280 may
-    // still be in sleep/duty-cycle/TX from the previous run — historically
+    // still be in sleep/RX/TX from the previous run — historically
     // seen as "module not connected" right after reflashing. An NSS falling
     // edge wakes the chip from sleep (BUSY goes low when it's ready).
     digitalWrite(_pinNSS, LOW);
@@ -563,67 +560,21 @@ void E28Radio::startReceive() {
   uint8_t rxParams[3] = {0xFF, 0xFF, 0xFF}; // Continuous RX
   writeCommand(SX1280_CMD_SET_RX, rxParams, 3);
 
-  if (!_connected) // SET_RX never reached the chip — don't record a mode
-    return;        // the chip isn't actually in (rearmAfterIrq trusts it)
-  _rxMode = RX_CONTINUOUS;
-}
-
-void E28Radio::startReceiveDutyCycle(uint16_t rxCount, uint16_t sleepCount,
-                                     uint8_t periodBase) {
-  if (!_connected)
-    return;
-
-  _txActive = false; // same contract as startReceive(): RX arm aborts TX
-
-  standby();
-  setPacketParams(E28_MAX_PACKET_SIZE);
-  clearIrqStatus();
-
-  // Enable LNA
-  if (_pinTXEN != -1)
-    digitalWrite(_pinTXEN, LOW);
-  if (_pinRXEN != -1)
-    digitalWrite(_pinRXEN, HIGH);
-  delayMicroseconds(50);
-
-  uint8_t params[5] = {periodBase, (uint8_t)(rxCount >> 8),
-                       (uint8_t)(rxCount & 0xFF), (uint8_t)(sleepCount >> 8),
-                       (uint8_t)(sleepCount & 0xFF)};
-  writeCommand(SX1280_CMD_SET_RX_DUTY_CYCLE, params, 5);
-
-  if (!_connected) // command swallowed — keep the bookkeeping truthful
-    return;
-  _rxMode = RX_DUTY_CYCLE;
-  _dcRxCount = rxCount;
-  _dcSleepCount = sleepCount;
-  _dcPeriodBase = periodBase;
+  if (!_connected) // SET_RX never reached the chip — don't claim RX is armed
+    return;        // (the re-arm helpers trust this flag)
+  _rxArmed = true;
 }
 
 void E28Radio::rearmAfterIrq() {
-  switch (_rxMode) {
-  case RX_DUTY_CYCLE:
-    // Mandatory full re-issue: any RxDone (even a CRC error) ends the cycle
-    startReceiveDutyCycle(_dcRxCount, _dcSleepCount, _dcPeriodBase);
-    break;
-  case RX_CONTINUOUS:
-    clearRxIrq(); // cheap: IRQ clear + SET_RX, no standby
-    break;
-  case RX_NONE:
-    break;
-  }
+  if (!_rxArmed)
+    return;
+  clearRxIrq(); // cheap: IRQ clear + SET_RX, no standby bounce
 }
 
 void E28Radio::restartReceive() {
-  switch (_rxMode) {
-  case RX_DUTY_CYCLE:
-    startReceiveDutyCycle(_dcRxCount, _dcSleepCount, _dcPeriodBase);
-    break;
-  case RX_CONTINUOUS:
-    startReceive();
-    break;
-  case RX_NONE:
-    break;
-  }
+  if (!_rxArmed)
+    return;
+  startReceive();
 }
 
 void E28Radio::clearRxIrq() {
