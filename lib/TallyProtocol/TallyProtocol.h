@@ -51,6 +51,11 @@ enum TallyCmd : uint8_t {
 
 // STATE_ALL flag nibble
 #define TALLY_FLAG_SOURCE_LIVE 0x1 // hub's tally source (ATEM) is fresh
+// This frame is a copy of a CHANGE BURST, not a lone heartbeat. A receiver needs
+// to know, because it must not transmit telemetry into a burst — and it cannot
+// infer it from the cycle counter without coupling two unrelated jobs into one
+// field, which deadlocked the counter when bursts overlapped every heartbeat.
+#define TALLY_FLAG_BURST 0x2
 // TELEMETRY flag nibble
 #define TALLY_FLAG_NO_BATTERY 0x1 // slave has no battery-sense divider wired
 #define TALLY_TLM_STATE_SHIFT 1   // bits 1-2: the state the slave is displaying
@@ -68,7 +73,9 @@ enum TallyState : uint8_t {
 //
 //  STATE_ALL: [0]=prog_lo [1]=prog_hi [2]=prev_lo [3]=prev_hi
 //             [4]=[chanIdx:4][countdown:4]  (countdown 0 = no switch pending)
-//             [5]=heartbeat counter (mod 256)
+//             [5]=heartbeat counter (mod 256) — advances on the heartbeat TIMER,
+//                unconditionally, so it is a steady shared clock
+//             flags bit1 = this is a burst copy (see TALLY_FLAG_BURST)
 //  PING:      [0]=target camera id (0xFF = all)
 //  TELEMETRY: [0]=camId [1]=rssi(int8) [2]=missed heartbeats (0..15)
 //             [3]=batt_lo [4]=batt_hi
@@ -93,7 +100,8 @@ public:
   static TallyPacket createStateAllPacket(uint16_t progMask, uint16_t prevMask,
                                           bool sourceLive, uint8_t hbCount,
                                           uint8_t chanIdx = 0,
-                                          uint8_t chanCountdown = 0);
+                                          uint8_t chanCountdown = 0,
+                                          bool burstCopy = false);
   static TallyPacket createPingPacket(uint8_t cameraId);
   // ---- Build (slave -> hub) ----
   static TallyPacket createTelemetryPacket(uint8_t cameraId, int8_t rssi,
@@ -110,6 +118,9 @@ public:
   static TallyState stateForCamera(const TallyPacket &p, uint8_t cameraId);
   static bool sourceLive(const TallyPacket &p) {
     return (p.cmdFlags & TALLY_FLAG_SOURCE_LIVE) != 0;
+  }
+  static bool isBurstCopy(const TallyPacket &p) {
+    return (p.cmdFlags & TALLY_FLAG_BURST) != 0;
   }
   static uint16_t progMask(const TallyPacket &p) {
     return (uint16_t)p.data[0] | ((uint16_t)p.data[1] << 8);

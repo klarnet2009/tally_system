@@ -74,14 +74,13 @@ static inline void tallyTelemetryTick(E28Radio &radio, TallyLink &link,
   // this cycle rather than transmit late into the next bank's slot.
   if (millis() - dueAt > TALLY_TLM_LATE_MS)
     return;
-  // NEVER transmit into a change burst. More than one frame carrying this cycle
-  // number means the hub is repeating a cut, and the copies are spaced 60-210 ms
-  // apart — far beyond any "time since last frame" guard, which is why the
-  // previous 50 ms check failed: a slave that received copy 2 would fire its
-  // 51 ms uplink squarely on top of copy 3, miss that copy itself, AND radiate
-  // over it for every other camera in range. Telemetry is observability; the
-  // burst is the primary reliability mechanism. Yield unconditionally.
-  if (link.framesThisCycle() > 1)
+  // NEVER transmit into a change burst. The hub flags its copies, because a
+  // receiver cannot otherwise tell them from a heartbeat and no "time since last
+  // frame" guard can work: the copies are 60-210 ms apart, so a slave that
+  // received copy 2 would fire its 51 ms uplink squarely onto copy 3 — missing
+  // that copy itself AND radiating over it for every other camera in range.
+  // Telemetry is observability; the burst is the primary reliability mechanism.
+  if (link.burstInFlight())
     return;
 
   lastSentHb = hb;
@@ -100,7 +99,7 @@ static inline void tallyTelemetryTick(E28Radio &radio, TallyLink &link,
       camId, radio.getRSSI(), link.missedBeats(), 0, true, link.state(), tag);
   uint8_t buf[TALLY_PACKET_SIZE];
   TallyProtocol::serialize(t, buf);
-  radio.send(buf, TALLY_PACKET_SIZE); // blocking, ~43ms of airtime
+  radio.send(buf, TALLY_PACKET_SIZE); // blocking, ~51ms of airtime
   radio.restartReceive();             // back to listening
 }
 

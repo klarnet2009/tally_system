@@ -38,6 +38,12 @@
 // down, and "severe" is also exactly the condition allowed to override the
 // on-air guard — one threshold, one meaning, no second constant to drift.
 #define ESC_SEVERE_FRAC 0.65f
+// ...but severe ALSO needs at least two cameras agreeing. With one camera the
+// fraction is trivially 1.0, so a single unit behind a wall or at the range edge
+// would reach the one tier that overrides the on-air guard and migrate the whole
+// fleet every 90 s. One complaining camera is a camera problem until a second
+// camera corroborates it; it still raises DEGRADED, which respects the guard.
+#define ESC_SEVERE_MIN_CAMS 2
 #define ESC_BLACKOUT_BUSY 0.25f    // corroboration for "everyone went silent"
 
 #define ESC_DEGRADED_SUSTAIN_MS 30000UL // partial: do not spend an outage on a blip
@@ -96,10 +102,18 @@ public:
   };
 
   void begin(uint32_t now) {
-    // Pre-age the dwell clock so the FIRST switch is allowed after
-    // ESC_FIRST_SWITCH_MS rather than a full dwell. Unsigned modular arithmetic
-    // makes the apparent underflow behave correctly.
-    _lastSwitch = now - (ESC_DWELL_MS - ESC_FIRST_SWITCH_MS);
+    // Two independent gates, because one cannot express the intent:
+    //  - _earliestSwitch is an ABSOLUTE floor. Encoding the floor as a pre-aged
+    //    dwell alone was wrong: pre-aging by (ESC_DWELL_MS - ESC_FIRST_SWITCH_MS)
+    //    = 540 s already exceeded the 90 s severe dwell, so the severe tier was
+    //    exempt from the floor entirely and could migrate the fleet ~10 s after a
+    //    power-cycle — on telemetry whose missed-beat window still held gaps from
+    //    that very reboot.
+    //  - _lastSwitch is aged by a FULL dwell so the dwell never blocks the first
+    //    switch; the floor above is what governs it. Unsigned modular arithmetic
+    //    makes the apparent underflow behave correctly.
+    _earliestSwitch = now + ESC_FIRST_SWITCH_MS;
+    _lastSwitch = now - ESC_DWELL_MS;
     _hourStart = now;
     _switchesThisHour = 0;
     _tierSince = 0;
@@ -131,11 +145,12 @@ public:
 
     float frac = v.talking ? (float)v.complaining / (float)v.talking : 0.0f;
     EscTier tier = ESC_NONE;
-    if (v.talking >= 1 && frac >= ESC_SEVERE_FRAC) {
+    if (v.complaining >= ESC_SEVERE_MIN_CAMS && frac >= ESC_SEVERE_FRAC) {
       tier = ESC_SEVERE;
-    } else if (v.complaining >= 2 ||
-               (v.talking >= 3 && frac >= ESC_DEGRADED_FRAC) ||
-               (v.talking == 1 && v.complaining == 1)) {
+    } else if (v.talking >= 1 && frac >= ESC_DEGRADED_FRAC) {
+      // No minimum fleet size: the old `talking >= 3` gate meant a two-camera rig
+      // at 50% downlink failure got no tier at all — not even the extra burst
+      // copies — while the documentation promised a trigger at 30%.
       tier = ESC_DEGRADED;
     } else if (v.talking == 0 && v.silent >= 1 && in.busyValid &&
                in.busyFrac >= ESC_BLACKOUT_BUSY) {
@@ -188,6 +203,10 @@ public:
       return v;
     }
 
+    if ((int32_t)(in.now - _earliestSwitch) < 0) {
+      v.blocked = "settling after boot";
+      return v;
+    }
     uint32_t dwell = (tier == ESC_SEVERE) ? ESC_DWELL_SEVERE_MS : ESC_DWELL_MS;
     if (in.now - _lastSwitch < dwell) {
       v.blocked = "min-dwell";
@@ -253,6 +272,7 @@ private:
   uint32_t _penaltyAt[TALLY_CHAN_COUNT] = {0};
   uint16_t _triedMask = 0; // channels tried in the CURRENT degradation episode
   uint32_t _lastSwitch = 0;
+  uint32_t _earliestSwitch = 0;
   uint32_t _hourStart = 0;
   uint32_t _tierSince = 0;
   EscTier _tier = ESC_NONE;

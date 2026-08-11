@@ -73,6 +73,55 @@ int main() {
     CHECK(v.target != 0);
   }
 
+  CASE("DEFECT: ONE complaining camera must not reach the severe tier");
+  {
+    // frac is trivially 1.0 with a single camera, which reached the one tier
+    // allowed to override the on-air guard — so a single unit behind a wall
+    // migrated the whole fleet every 90s. It must be DEGRADED: slower sustain,
+    // and it respects the guard.
+    TallyEscape e; e.begin(0);
+    clearCams(); complaining(1);
+    TallyEscape::Verdict v = hold(e, T0, ESC_SEVERE_SUSTAIN_MS + 1000);
+    CHECK_EQ(v.tier, ESC_DEGRADED);
+    CHECK(!v.wantSwitch); // 6s is not enough for the degraded tier
+    // ...and it must not push past a live camera
+    TallyEscape e2; e2.begin(0);
+    v = hold(e2, T0, ESC_DEGRADED_SUSTAIN_MS + 2000, true, 0.0f);
+    CHECK(!v.wantSwitch);
+    CHECK(v.blocked != nullptr);
+  }
+
+  CASE("DEFECT: a two-camera fleet at 50% failure must still raise a tier");
+  {
+    // The old `talking >= 3` gate on the fraction branch left a 2-camera rig with
+    // NO tier at all: no extra burst copies, no log line, no escape — while the
+    // docs promised a trigger at 30%.
+    TallyEscape e; e.begin(0);
+    clearCams(); complaining(1); healthy(2);
+    TallyEscape::Verdict v = e.evaluate(in(T0), cams);
+    CHECK_EQ(v.tier, ESC_DEGRADED);
+    CHECK(v.degraded);
+    v = hold(e, T0, ESC_DEGRADED_SUSTAIN_MS + 2000);
+    CHECK(v.wantSwitch);
+  }
+
+  CASE("DEFECT: no switch at all inside the post-boot settling window");
+  {
+    // The floor used to be a pre-aged dwell of 540s, which already exceeded the
+    // 90s severe dwell — so the severe tier was exempt and could migrate the
+    // fleet ~10s after a power-cycle, on telemetry whose missed-beat window still
+    // held gaps from that very reboot.
+    TallyEscape e; e.begin(0);
+    clearCams(); complaining(1); complaining(2); complaining(3);
+    TallyEscape::Verdict v = hold(e, 1000, ESC_SEVERE_SUSTAIN_MS + 3000);
+    CHECK_EQ(v.tier, ESC_SEVERE);
+    CHECK(!v.wantSwitch);
+    CHECK(v.blocked != nullptr);
+    // ...and allowed once the window has passed
+    v = hold(e, ESC_FIRST_SWITCH_MS + 2000, ESC_SEVERE_SUSTAIN_MS + 2000);
+    CHECK(v.wantSwitch);
+  }
+
   CASE("3 of 4 complaining is severe: one healthy camera does not hold us back");
   {
     TallyEscape e; e.begin(0);
@@ -230,7 +279,7 @@ int main() {
   CASE("the degraded flag is published for every tier (extra burst copies)");
   {
     TallyEscape e; e.begin(0);
-    clearCams(); complaining(1); // 1 of 1 talking -> severe, and degraded
+    clearCams(); complaining(1); // 1 of 1 talking -> degraded (not severe)
     TallyEscape::Verdict v = e.evaluate(in(T0), cams);
     CHECK(v.degraded); // immediately, without waiting for any sustain
     CHECK(!v.wantSwitch);

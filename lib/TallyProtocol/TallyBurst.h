@@ -48,6 +48,10 @@ public:
   }
 
   bool idle() const { return _idx >= _copies; }
+  // A multi-copy group is a change burst; a single copy is a heartbeat. The hub
+  // puts this on the wire (TALLY_FLAG_BURST) so receivers can hold telemetry off
+  // without having to infer it from the cycle counter.
+  bool isBurst() const { return _copies > 1; }
   uint8_t pending() const { return idle() ? 0 : (uint8_t)(_copies - _idx); }
 
   // A copy is due for transmission now.
@@ -71,20 +75,9 @@ public:
   void abandon() { _idx = _copies; }
 
 private:
-  static const uint16_t *kOffsets() {
-    static const uint16_t offs[] = TALLY_BURST_OFFSETS_MS;
-    // Sized from the initializer, then checked — declaring it
-    // [TALLY_BURST_COPIES_MAX] instead let C++ zero-fill any missing entries, so
-    // raising the copy count without extending the list gave the extra copies
-    // offset 0: they fired back-to-back, one interference burst erased both, and
-    // the time diversity the class exists for vanished with no compile error and
-    // no runtime symptom.
-    static_assert(sizeof(offs) / sizeof(offs[0]) == TALLY_BURST_COPIES_MAX,
-                  "TALLY_BURST_OFFSETS_MS must have TALLY_BURST_COPIES_MAX entries");
-    static_assert(TALLY_BURST_OFFSETS_FIRST_IS_ZERO,
-                  "the first burst copy must be due immediately");
-    return offs;
-  }
+  // Table and its invariants live in TallyConfig.h next to the values, where the
+  // static_asserts check the ARRAY rather than a hand-maintained #define.
+  static const uint16_t *kOffsets() { return kTallyBurstOffsets; }
   uint8_t _idx = 0;
   uint8_t _copies = 0;
   uint32_t _startMs = 0;

@@ -63,9 +63,15 @@
 #define TALLY_BURST_COPIES_MAX 6
 #define TALLY_BURST_OFFSETS_MS                                                \
   { 0, 60, 160, 330, 520, 740 }
-// onChange()/scheduleHeartbeat() make the first copy due immediately, which is
-// only correct if the table agrees.
-#define TALLY_BURST_OFFSETS_FIRST_IS_ZERO 1
+// Checked, not asserted-by-hand: the previous guard static_asserted a #define
+// that a human had to remember to update, so editing the table to start at 20 ms
+// left the assert passing while every latency-critical first copy went out late.
+constexpr uint16_t kTallyBurstOffsets[] = TALLY_BURST_OFFSETS_MS;
+static_assert(sizeof(kTallyBurstOffsets) / sizeof(kTallyBurstOffsets[0]) ==
+                  TALLY_BURST_COPIES_MAX,
+              "TALLY_BURST_OFFSETS_MS must have TALLY_BURST_COPIES_MAX entries");
+static_assert(kTallyBurstOffsets[0] == 0,
+              "the first burst copy is scheduled for 'now', so offset 0 must be 0");
 
 // ===== Listen-before-talk =====
 // Transmitting into an already-active interferer is a guaranteed loss; slipping
@@ -77,8 +83,8 @@
 #define TALLY_LBT_MAX_DEFER_MS 12 // then send anyway
 
 // ===== PHY profile =====
-// SF9/BW406.25k/CR4/6 with a 10-symbol preamble = 43.2 ms per 8-byte frame
-// (8.6% duty at the 500ms heartbeat). SF9 is kept for range: a field test hit
+// SF9/BW406.25k/CR4/6 with a 10-symbol preamble = 50.7 ms per 9-byte frame
+// (10.1% duty at the 500ms heartbeat). SF9 is kept for range: a field test hit
 // the SF7 sensitivity floor at 30-40 m through walls, and SF9's ~-114 dBm
 // floor buys ~6 dB. Preamble was 40 symbols ONLY to cover a duty-cycled
 // receiver's RX window; duty-cycle RX is gone (it has an irreducible deaf
@@ -86,8 +92,10 @@
 // back. CR 4/8 -> 4/6 because FEC fights random bit errors while a WiFi burst
 // erases the whole frame — repetition is the stronger lever, and the freed
 // airtime pays for it.
-// Payload note: 4..8 bytes all cost the same 43.2 ms (the payload symbol count
-// quantizes); 9 bytes costs 50.7 ms. The frame is 8 bytes to use that for free.
+// Payload note: the payload symbol count quantizes, so 4..8 bytes all cost
+// 43.2 ms and 9..12 bytes all cost 50.7 ms. The frame is 9 bytes because the app
+// CRC has to be there (integrity is not authenticity — see TallyProtocol.h), and
+// having paid for the step there are 3 spare bytes before the next one.
 #define TALLY_PREAMBLE_SYMBOLS 10
 
 // SX1280 *chip* TX power in dBm (-18..+12).
@@ -114,12 +122,14 @@
 // eliminated by construction rather than thinned by jitter.
 #define TALLY_TLM_CYCLES 8
 #define TALLY_TLM_OFFSET_MS 60 // after heartbeat arrival (frame is ~51ms)
-#define TALLY_TLM_BANK_MS 100  // extra offset for cameras 9..16
+#define TALLY_TLM_BANK_MS 130  // extra offset for cameras 9..16
 // How late a slot may still be used. It must stay BELOW bank separation minus
 // one frame time, or a late bank-0 transmission runs straight through bank-1's
 // slot — the collisions the slotting exists to eliminate. It was equal to
 // TALLY_TLM_BANK_MS, which allowed exactly that.
-#define TALLY_TLM_LATE_MS 40
+// 70 ms of slack: a slave loop pass can exceed 40 ms (NeoPixel writes, serial,
+// a debounce path), and missing the window costs a WHOLE telemetry period.
+#define TALLY_TLM_LATE_MS 70
 // Resulting per-camera telemetry period; the hub's reachability window derives
 // from it.
 #define TALLY_TELEMETRY_MS (TALLY_TLM_CYCLES * TALLY_REFRESH_MS)
@@ -146,5 +156,11 @@ static_assert(TALLY_NET_ID <= 0x0F,
 static_assert(TALLY_BURST_COPIES_MIN <= TALLY_BURST_COPIES_MAX,
               "burst copy floor above the ceiling");
 static_assert(TALLY_TLM_CYCLES >= 2, "telemetry needs at least two cycles");
+// A late bank-0 frame must not be able to run through bank-1's slot. ~51 ms is
+// one frame at the current profile.
+static_assert(TALLY_TLM_LATE_MS + 51 <= TALLY_TLM_BANK_MS,
+              "late-slot tolerance would let bank 0 overlap bank 1");
+static_assert(TALLY_TLM_OFFSET_MS + TALLY_TLM_BANK_MS + 51 < TALLY_REFRESH_MS,
+              "telemetry slots must fit inside one heartbeat cycle");
 
 #endif // TALLY_CONFIG_H

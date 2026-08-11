@@ -184,22 +184,33 @@ int main() {
     CHECK_EQ(l.lastHbAtMs(), at);
   }
 
-  CASE("frames-per-cycle distinguishes a burst from a lone heartbeat");
+  CASE("the burst FLAG marks a burst, and only a heartbeat anchors the slot");
   {
-    // The slave's ONLY way to know a change burst is in flight — and therefore
-    // that it must not transmit telemetry into it.
+    // A receiver must know a burst is in flight (so it holds telemetry off) and
+    // must not let burst copies drag its telemetry slot: they land at arbitrary
+    // offsets from a cut, so anchoring on them aimed the uplink at the hub's
+    // next copy. Both facts now come from the wire flag, not from counting
+    // frames per cycle — which coupled this to a counter that could freeze.
     TallyLink l; primed(l);
     feed(l, TallyProtocol::createStateAllPacket(0, 0, true, 10));
-    CHECK_EQ(l.framesThisCycle(), 1); // lone heartbeat
+    CHECK(!l.burstInFlight());
+    uint32_t anchor = l.lastHbAtMs();
+
     testAdvance(60);
-    feed(l, TallyProtocol::createStateAllPacket(1, 0, true, 10)); // copy 2
-    CHECK_EQ(l.framesThisCycle(), 2);
+    feed(l, TallyProtocol::createStateAllPacket(1, 0, true, 11, 0, 0, true));
+    CHECK(l.burstInFlight());
+    CHECK_EQ(l.lastHbAtMs(), anchor); // burst copy must NOT move the anchor
+    CHECK_EQ(l.lastHbCount(), 11);    // but the cycle number still tracks
+
     testAdvance(100);
-    feed(l, TallyProtocol::createStateAllPacket(1, 0, true, 10)); // copy 3
-    CHECK_EQ(l.framesThisCycle(), 3);
-    testAdvance(500);
-    feed(l, TallyProtocol::createStateAllPacket(1, 0, true, 11)); // next cycle
-    CHECK_EQ(l.framesThisCycle(), 1);
+    feed(l, TallyProtocol::createStateAllPacket(1, 0, true, 11, 0, 0, true));
+    CHECK(l.burstInFlight());
+    CHECK_EQ(l.lastHbAtMs(), anchor);
+
+    testAdvance(340);
+    feed(l, TallyProtocol::createStateAllPacket(1, 0, true, 12)); // heartbeat
+    CHECK(!l.burstInFlight()); // cleared, telemetry may resume
+    CHECK(l.lastHbAtMs() != anchor);
   }
 
   CASE("a corrupted frame is rejected (authenticity, not just integrity)");

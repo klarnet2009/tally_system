@@ -140,10 +140,11 @@ static bool g_camReachable[17] = {false};
 static uint8_t g_camTag[17] = {0};    // MAC-derived device tag (0 = unknown)
 static TallyState g_camShown[17] = {STATE_OFF}; // what the slave says it shows
 static uint32_t g_camMismatchSince[17] = {0};   // shown != commanded since when
-// Telemetry is slotted now, so the period is exact (TALLY_TELEMETRY_MS) rather
-// than jittered. 3 missed slots is a real signal; a single frame lost to a
-// collision with a change burst must NOT flap the camera offline.
-#define CAM_REACHABLE_MS (3 * TALLY_TELEMETRY_MS)
+// Telemetry is slotted, so the period is exact (TALLY_TELEMETRY_MS) rather than
+// jittered — but a slave deliberately SKIPS its slot while a change burst is in
+// flight, so during fast cutting several periods in a row can be missed. 4 gives
+// margin for that; a camera that is merely quiet must never flap offline.
+#define CAM_REACHABLE_MS (4 * TALLY_TELEMETRY_MS)
 // A camera that is TALKING to us and reporting missed heartbeats is struggling on
 // the DOWNLINK — the direction that matters, and unambiguous evidence about the
 // channel. "Unreachable" is deliberately NOT folded in here: a silent camera may
@@ -294,7 +295,7 @@ static TallyPacket buildStateFrame() {
   return TallyProtocol::createStateAllPacket(
       g_progMask, g_prevMask, sourceLiveNow(), g_hbCount,
       g_chanSwitch.pending() ? g_chanSwitch.target() : 0,
-      g_chanSwitch.countdown(g_hbCount));
+      g_chanSwitch.countdown(g_hbCount), g_burst.isBurst());
 }
 
 static void applyChannelSwitch() {
@@ -303,10 +304,7 @@ static void applyChannelSwitch() {
   // taken on the OLD channel, and committing them after the retune folded them
   // into the NEW channel's stats — which then became the listen-before-talk
   // reference for a frequency they were never measured on.
-  chanCommit(g_chan[g_chanIdx]);
-  g_accMin = 127;
-  g_accN = 0;
-  g_accBusy = 0;
+  chanCommit(g_chan[g_chanIdx]); // also resets the accumulators
   g_escape.noteSwitching(millis(), g_chanIdx);
   g_chanIdx = g_chanSwitch.target();
   g_chanFreq = g_chanList[g_chanIdx];
@@ -334,7 +332,11 @@ static void requestChannelSwitch(uint8_t idx, const char *reason,
   // loss, 9 announcements miss with p~0.2% while 3 miss with p~12.5%, and a
   // stranded slave is dark for ~8s. Faster escape comes from the shorter
   // SUSTAIN, not from a shorter announcement.
-  g_chanSwitch.request(idx, g_hbCount, beats);
+  // +1 because the frame for the CURRENT cycle has already been transmitted by
+  // the time this runs (processTx precedes autoRfTick in loop()). Requesting
+  // against g_hbCount produced beats-1 announcements — the same N-vs-N-1 loss the
+  // derived countdown was introduced to eliminate, one layer up.
+  g_chanSwitch.request(idx, (uint8_t)(g_hbCount + 1), beats);
   hublogf("[CHAN] announcing switch to ch%u over %u beats: %s\n", idx, beats,
           reason);
 }
@@ -419,12 +421,15 @@ static void processTx() {
   // immediately — its latency is the whole point; later copies and heartbeats
   // yield briefly to an active interferer.
   if (g_burst.dueNow(millis())) {
-    // Short-circuit on purpose: channelBusyNow() is a blocking SPI read, and the
-    // first copy of a cut must never pay for a measurement whose result it
-    // ignores. Passing it as an argument evaluated it eagerly on exactly that path.
-    if (!g_burst.latencyCritical() &&
-        !g_lbtState.clear(millis(), false, channelBusyNow()))
+    // Short-circuit the MEASUREMENT (a blocking SPI read the first copy of a cut
+    // must never pay for), but still clear the deferral clock — skipping the call
+    // entirely left _deferSince set from an earlier deferral, so the NEXT copy saw
+    // its patience already spent and fired straight into the interferer.
+    if (g_burst.latencyCritical()) {
+      g_lbtState.reset();
+    } else if (!g_lbtState.clear(millis(), false, channelBusyNow())) {
       return;
+    }
     TallyPacket pkt = buildStateFrame();
     uint8_t buf[TALLY_PACKET_SIZE];
     TallyProtocol::serialize(pkt, buf);
@@ -538,14 +543,16 @@ static void heartbeatTick() {
 
   // Nothing to decrement: TallyChanSwitch derives the countdown from g_hbCount,
   // so the value a frame carries cannot depend on when it was scheduled.
-  // Advance the cycle only when a heartbeat frame is actually scheduled. When a
-  // burst is in progress scheduleHeartbeat() no-ops, and incrementing anyway
-  // consumed a cycle number that never reached the air (a camera whose slot
-  // matched it simply skipped a telemetry period) AND let copies of one burst
-  // straddle the increment, so slaves anchored their slots on frames up to
-  // ~700ms apart.
-  if (g_burst.scheduleHeartbeat(now))
-    g_hbCount++;
+  // The cycle counter is a STEADY shared clock: it advances on this timer,
+  // unconditionally. Gating it on "a heartbeat frame was actually scheduled" was
+  // a regression — a tick landing inside a burst consumed the beat without
+  // incrementing, so frequent cuts froze the counter, which froze the derived
+  // channel countdown, which deadlocked every switch and (via the old
+  // frames-per-cycle heuristic) silenced the whole fleet's telemetry.
+  // Burst copies are identified by TALLY_FLAG_BURST instead, so nothing depends
+  // on this counter standing still.
+  g_hbCount++;
+  g_burst.scheduleHeartbeat(now); // no-op while a burst is in progress
 }
 
 // Beacon the current channel on the OLD one after a switch, so a slave that
@@ -1009,6 +1016,27 @@ void setup() {
 #define SURVEY_LO_HZ 2400000000UL
 #define SURVEY_HI_HZ 2483000000UL
 #define SURVEY_SAMPLES 24
+// The sweep is ~9 s of blocking, which is longer than TALLY_SIGNAL_LOST_MS (3 s)
+// and TX_WATCHDOG_MS (5 s): left alone it made every camera declare signal-lost
+// and start channel-scanning, and ended in a false "no successful TX" alarm plus
+// a forced re-init — a diagnostic that broke the thing it was diagnosing. So the
+// sweep returns to the working channel periodically and sends one heartbeat.
+#define SURVEY_PUMP_MS 350
+
+// Return to the working channel, put one heartbeat on air, go back. Keeps the
+// fleet's link timers fed (and the TX watchdog satisfied) across a long sweep.
+static void surveyPump() {
+  radio.setFrequency(g_chanFreq);
+  radio.startReceive();
+  g_hbCount++;
+  g_burst.reset(millis());
+  g_burst.scheduleHeartbeat(millis());
+  uint32_t guard = millis();
+  while (!g_burst.idle() && millis() - guard < 300)
+    processTx();
+  while (radio.txActive() && millis() - guard < 300)
+    processTx();
+}
 
 static void bandSurvey(Stream *io) {
   if (!radio.isConnected()) {
@@ -1019,14 +1047,17 @@ static void bandSurvey(Stream *io) {
     hublogf("[SURVEY] TX in flight — try again in a moment\n");
     return;
   }
-  Stream &out = io ? *io : Serial;
+  (void)io; // the report goes to hublogf: both consoles AND the flash log
   uint32_t steps = (SURVEY_HI_HZ - SURVEY_LO_HZ) / (SURVEY_STEP_KHZ * 1000UL) + 1;
-  out.printf("[SURVEY] sweeping %lu.%lu-%lu.%lu MHz in %u kHz steps "
-             "(~%lus, fleet will be deaf)\n",
-             SURVEY_LO_HZ / 1000000UL, (SURVEY_LO_HZ % 1000000UL) / 100000UL,
-             SURVEY_HI_HZ / 1000000UL, (SURVEY_HI_HZ % 1000000UL) / 100000UL,
-             (unsigned)SURVEY_STEP_KHZ,
-             (unsigned long)(steps * (6 + SURVEY_SAMPLES * 2) / 1000));
+  // TWO passes (a floor pass, then a busy pass against that floor), plus the
+  // heartbeat pump. The old estimate counted one pass and understated by half.
+  uint32_t perStep = 6 + SURVEY_SAMPLES * 2;
+  hublogf("[SURVEY] sweeping %lu.%lu-%lu.%lu MHz in %u kHz steps, 2 passes "
+          "(~%lus; heartbeat keeps beating)\n",
+          SURVEY_LO_HZ / 1000000UL, (SURVEY_LO_HZ % 1000000UL) / 100000UL,
+          SURVEY_HI_HZ / 1000000UL, (SURVEY_HI_HZ % 1000000UL) / 100000UL,
+          (unsigned)SURVEY_STEP_KHZ,
+          (unsigned long)(steps * perStep * 2 / 1000 + steps * perStep * 2 / SURVEY_PUMP_MS / 10));
 
   // Two passes: the first establishes each step's floor, the second counts how
   // often energy sits well above it. One pass cannot do both — busy-ness is only
@@ -1036,8 +1067,13 @@ static void bandSurvey(Stream *io) {
   static uint8_t busyPct[128];
   if (steps > 128)
     steps = 128;
+  uint32_t lastPump = millis();
   for (uint8_t pass = 0; pass < 2; pass++) {
     for (uint32_t i = 0; i < steps; i++) {
+      if (millis() - lastPump > SURVEY_PUMP_MS) {
+        surveyPump();
+        lastPump = millis();
+      }
       uint32_t f = SURVEY_LO_HZ + i * SURVEY_STEP_KHZ * 1000UL;
       radio.setFrequency(f);
       radio.startReceive();
@@ -1066,7 +1102,7 @@ static void bandSurvey(Stream *io) {
   radio.setFrequency(g_chanFreq);
   radio.startReceive();
 
-  out.println(F("[SURVEY]  MHz   floor  busy  bar (busy% over the floor)"));
+  hublogf("[SURVEY]  MHz   floor  busy  bar (busy%% over the floor)\n");
   for (uint32_t i = 0; i < steps; i++) {
     uint32_t f = SURVEY_LO_HZ + i * SURVEY_STEP_KHZ * 1000UL;
     char bar[21];
@@ -1080,9 +1116,8 @@ static void bandSurvey(Stream *io) {
     for (uint8_t c = 0; c < TALLY_CHAN_COUNT; c++)
       if (f / 500000UL == g_chanList[c] / 500000UL)
         mark = (c == g_chanIdx) ? "<*" : "<c";
-    out.printf("[SURVEY] %4lu.%lu %5d %4u%%  %s %s\n", f / 1000000UL,
-               (f % 1000000UL) / 100000UL, (int)floorDbm[i], busyPct[i], bar,
-               mark);
+    hublogf("[SURVEY] %4lu.%lu %5d %4u%%  %s %s\n", f / 1000000UL,
+            (f % 1000000UL) / 100000UL, (int)floorDbm[i], busyPct[i], bar, mark);
   }
 
   // Recommend a set: quietest steps first, spaced so two picks cannot sit inside
@@ -1090,7 +1125,7 @@ static void bandSurvey(Stream *io) {
   // bandwidth. This is a RECOMMENDATION for TALLY_CHAN_LIST, not an action —
   // hub and slaves must agree on the table, so changing it is a deliberate
   // reflash of the whole fleet, never something a survey does behind your back.
-  out.println(F("[SURVEY] --- recommended TALLY_CHAN_LIST for this room ---"));
+  hublogf("[SURVEY] --- recommended TALLY_CHAN_LIST for this room ---\n");
   uint8_t picked[TALLY_CHAN_COUNT];
   uint8_t nPicked = 0;
   for (uint8_t want = 0; want < TALLY_CHAN_COUNT; want++) {
@@ -1109,8 +1144,11 @@ static void bandSurvey(Stream *io) {
       }
       if (tooClose)
         continue;
-      // Same weighting the runtime uses: busy-ness dominates, floor breaks ties.
-      int cost = (int)floorDbm[i] + (int)busyPct[i];
+      // Busy-ness dominates, floor breaks ties. The two must be SCALED: floors
+      // span ~50 dB while busy spans 0-100, so summing them raw made the ranking
+      // arbitrary and could hand back a deep-floor but heavily occupied step —
+      // and put it at index 0, the channel every slave boots on.
+      int cost = (int)floorDbm[i] * 10 + (int)busyPct[i] * 6;
       if (cost < bestCost) {
         bestCost = cost;
         bestI = i;
@@ -1122,13 +1160,13 @@ static void bandSurvey(Stream *io) {
   }
   for (uint8_t p = 0; p < nPicked; p++) {
     uint32_t f = SURVEY_LO_HZ + picked[p] * SURVEY_STEP_KHZ * 1000UL;
-    out.printf("[SURVEY]   %luUL,   // %lu.%lu MHz  floor=%d busy=%u%%\n",
-               (unsigned long)f, f / 1000000UL, (f % 1000000UL) / 100000UL,
-               (int)floorDbm[picked[p]], busyPct[picked[p]]);
+    hublogf("[SURVEY]   %luUL,   // %lu.%lu MHz  floor=%d busy=%u%%\n",
+            (unsigned long)f, f / 1000000UL, (f % 1000000UL) / 100000UL,
+            (int)floorDbm[picked[p]], busyPct[picked[p]]);
   }
-  out.println(F("[SURVEY] index 0 is the home channel: every slave boots there,"));
-  out.println(F("[SURVEY] so put the quietest pick first. Reflash hub AND all"));
-  out.println(F("[SURVEY] cameras together — a mismatched table strands them."));
+  hublogf("[SURVEY] index 0 is the home channel: every slave boots there, so put\n"
+          "[SURVEY] the quietest pick first. Reflash hub AND all cameras\n"
+          "[SURVEY] together — a mismatched table strands them.\n");
 }
 
 // AFA site survey: sample the ambient noise floor on every candidate channel

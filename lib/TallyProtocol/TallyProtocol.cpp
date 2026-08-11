@@ -20,8 +20,11 @@ TallyPacket TallyProtocol::createStateAllPacket(uint16_t progMask,
                                                 bool sourceLive,
                                                 uint8_t hbCount,
                                                 uint8_t chanIdx,
-                                                uint8_t chanCountdown) {
+                                                uint8_t chanCountdown,
+                                                bool burstCopy) {
   uint8_t flags = sourceLive ? TALLY_FLAG_SOURCE_LIVE : 0;
+  if (burstCopy)
+    flags |= TALLY_FLAG_BURST;
   uint8_t chanByte = (uint8_t)(((chanIdx & 0x0F) << 4) | (chanCountdown & 0x0F));
   return makeFrame(CMD_STATE_ALL, flags, (uint8_t)(progMask & 0xFF),
                    (uint8_t)(progMask >> 8), (uint8_t)(prevMask & 0xFF),
