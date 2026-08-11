@@ -20,9 +20,17 @@
 // a slave that still misses it is picked up by the old-channel beacon, and
 // only then falls back to scanning. Keep the list SHORT — scan time on a deaf
 // slave grows with every entry.
-#define TALLY_CHAN_COUNT 3
+// ch3 (2483.0 MHz) is the important one for EU. WiFi channels 1-13 tile
+// 2402-2482 contiguously, so ch13 (2462-2482) covers our home frequency and a
+// single 40 MHz AP can cover both mid-band escapes. Above 2482 there is no legal
+// EU WiFi channel at all, and with BW 406.25 kHz a 2483.0 centre occupies
+// 2482.8-2483.2 — inside the 2483.5 band edge with ~300 kHz to spare. It is the
+// ONLY WiFi-immune spot in the band, so it is the last-resort escape.
+// (Band-edge operation deserves a spectrum check before a paid show; see
+// documentation/ARCHITECTURE_RF_V4.md §12.)
+#define TALLY_CHAN_COUNT 4
 #define TALLY_CHAN_LIST                                                       \
-  { TALLY_RF_FREQ_HZ, 2449500000UL, 2424500000UL }
+  { TALLY_RF_FREQ_HZ, 2449500000UL, 2424500000UL, 2483000000UL }
 
 // ===== Timing =====
 #define TALLY_REFRESH_MS 500 // Periodic STATE_ALL re-send = link heartbeat

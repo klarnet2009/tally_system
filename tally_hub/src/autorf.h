@@ -41,7 +41,15 @@
 // turns this off until `auto on`.
 
 #define AUTORF_EVAL_MS 10000UL            // decision cadence
-#define AUTORF_DEGRADE_SUSTAIN_MS 30000UL // trigger must hold this long
+// Two-tier escape. Partial degradation waits 30s: a switch costs a brief outage
+// and must not be spent on a transient. But when almost the whole fleet is down
+// we are already failing, so waiting is pure loss — escape after 10s and cut the
+// announcement short too, because slaves that cannot hear us gain nothing from a
+// longer countdown (the old-channel beacon and their scan cover them).
+#define AUTORF_DEGRADE_SUSTAIN_MS 30000UL // partial degradation
+#define AUTORF_SEVERE_SUSTAIN_MS 10000UL  // most of the fleet down
+#define AUTORF_SEVERE_FRAC 0.80f
+#define AUTORF_SEVERE_BEATS 4 // shortened announcement when severe
 #define AUTORF_POOR_COUNT_TRIG 2          // cameras missing heartbeats
 #define AUTORF_POOR_FRAC_TRIG 0.30f       // ...or this share of a bigger fleet
 #define AUTORF_ONAIR_OVERRIDE_FRAC 0.60f  // switch even on-air past this
@@ -103,7 +111,7 @@ static uint8_t autoRfPickTarget() {
   return best;
 }
 
-static void autoRfTrySwitch(uint8_t idx, const char *reason) {
+static void autoRfTrySwitch(uint8_t idx, const char *reason, bool severe) {
   uint32_t now = millis();
   const char *block = nullptr;
   if (now - g_lastAutoSwitch < AUTORF_MIN_DWELL_MS)
@@ -124,7 +132,8 @@ static void autoRfTrySwitch(uint8_t idx, const char *reason) {
   g_lastAutoSwitch = now;
   g_switchesThisHour++;
   g_degradeSince = 0;
-  requestChannelSwitch(idx, reason);
+  requestChannelSwitch(idx, reason,
+                       severe ? AUTORF_SEVERE_BEATS : TALLY_CHAN_ANNOUNCE_BEATS);
 }
 
 static void autoRfTick() {
@@ -158,6 +167,8 @@ static void autoRfTick() {
   bool degraded = (poor >= AUTORF_POOR_COUNT_TRIG) ||
                   (seen >= 3 && poorFrac >= AUTORF_POOR_FRAC_TRIG) ||
                   (seen == 1 && poor == 1);
+  // Severe = almost nobody is hearing us. Escapes on the fast tier.
+  bool severe = seen >= 1 && poorFrac >= AUTORF_SEVERE_FRAC;
   // Published for the transmit scheduler: while degraded a change is sent with
   // more copies. Useful even with automatic switching turned off.
   g_linkDegraded = degraded;
@@ -173,7 +184,9 @@ static void autoRfTick() {
     return; // manual mode: measurement and the degraded flag still run
   if (g_switchPending || g_oldChanFreq)
     return; // a switch is already in flight
-  if (!g_degradeSince || now - g_degradeSince < AUTORF_DEGRADE_SUSTAIN_MS)
+  uint32_t needSustain =
+      severe ? AUTORF_SEVERE_SUSTAIN_MS : AUTORF_DEGRADE_SUSTAIN_MS;
+  if (!g_degradeSince || now - g_degradeSince < needSustain)
     return;
 
   uint8_t target = autoRfPickTarget();
@@ -197,7 +210,8 @@ static void autoRfTick() {
     }
     return;
   }
-  autoRfTrySwitch(target, "downlink degraded");
+  autoRfTrySwitch(target, severe ? "downlink SEVERE" : "downlink degraded",
+                  severe);
 }
 
 static void autoRfManualOverride(const char *what) {

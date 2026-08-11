@@ -10,6 +10,7 @@
 #include <esp_system.h> // esp_reset_reason()
 
 #include "E28_SX1280.h"
+#include "TallyBurst.h"
 #include "TallyLog.h"
 #include "TallyProtocol.h"
 #include "TallyRadio.h"
@@ -134,11 +135,14 @@ static inline bool camPoor(uint8_t id) {
 // visibly wrong light. The scheduler now holds only a repeat COUNT; every copy
 // is serialized from the live masks at transmit time, so a stale state can
 // never reach the air.
-static const uint16_t kBurstOffsets[TALLY_BURST_COPIES_MAX] = TALLY_BURST_OFFSETS_MS;
-static uint8_t g_burstIdx = 0;    // next copy to send
-static uint8_t g_burstCopies = 0; // total copies in this group (1 = heartbeat)
-static uint32_t g_burstStartMs = 0;
-static uint32_t g_stateNextAtMs = 0;
+// Scheduling arithmetic lives in TallyBurst (lib/TallyProtocol/TallyBurst.h) so
+// it can be exercised on the host with a controllable clock — see tests/.
+static TallyBurst g_burst;
+// One LBT gate PER TRANSMIT CLASS. A single shared deferral clock let a beacon
+// that had been waiting consume the burst's patience, pushing a tally copy
+// straight into a busy channel; separate instances make that impossible.
+static TallyLbt g_lbtState;
+static TallyLbt g_lbtOneShot;
 
 // One-shot frames (locator ping, old-channel beacon) are events rather than
 // state, so they keep a tiny FIFO. freqHz != 0 transmits on that frequency
@@ -228,8 +232,6 @@ static void chanMeasureTick() {
 // Sending into an already-active interferer is a guaranteed loss; slipping the
 // frame a few ms is free. Bounded, and never applied to the first copy of a
 // change burst — tally latency outranks collision avoidance.
-static uint32_t g_lbtDeferSince = 0;
-
 static bool channelBusyNow() {
   const ChanStat &cs = g_chan[g_chanIdx < TALLY_CHAN_COUNT ? g_chanIdx : 0];
   if (!cs.valid)
@@ -240,23 +242,6 @@ static bool channelBusyNow() {
   return r > cs.floorDbm + TALLY_LBT_MARGIN_DB;
 }
 
-// true = go ahead. Defers at most TALLY_LBT_MAX_DEFER_MS, because a
-// permanently busy channel must not silence the link.
-static bool lbtClear(bool latencyCritical) {
-  if (latencyCritical || !channelBusyNow()) {
-    g_lbtDeferSince = 0;
-    return true;
-  }
-  uint32_t now = millis();
-  if (g_lbtDeferSince == 0)
-    g_lbtDeferSince = now;
-  if (now - g_lbtDeferSince >= TALLY_LBT_MAX_DEFER_MS) {
-    g_lbtDeferSince = 0;
-    return true; // out of patience: send anyway
-  }
-  return false;
-}
-
 // Set by autoRfTick(); heartbeatTick() adds burst copies when the fleet is
 // struggling. Copies are only ever ADDED, never removed.
 static bool g_linkDegraded = false;
@@ -265,6 +250,9 @@ static bool g_linkDegraded = false;
 // radio (isConnected false) but NOT a radio that reports fine while every send
 // silently fails — heartbeats would simply stop and only the slaves would
 // notice. Cheap insurance: no successful TX for this long -> full re-init.
+// ARMED AT THE END OF setup(), not on the first success: keying it off the first
+// successful transmit meant an antenna/PA fault present from power-on left the
+// watchdog permanently inert — precisely the case it was written for.
 static uint32_t g_lastTxOkMs = 0;
 #define TX_WATCHDOG_MS 5000
 
@@ -280,7 +268,7 @@ static void enqueueOneShot(const TallyPacket &pkt, uint32_t freqHz = 0) {
 }
 
 static inline bool txIdle() {
-  return !radio.txActive() && g_burstIdx >= g_burstCopies && g_osHead == g_osTail;
+  return !radio.txActive() && g_burst.idle() && g_osHead == g_osTail;
 }
 
 // Serialized fresh on every copy — this is what makes a stale state impossible.
@@ -309,14 +297,19 @@ static void applyChannelSwitch() {
 
 // Start announcing a coordinated switch. Idempotent-ish: a new request while
 // one is pending simply retargets it.
-static void requestChannelSwitch(uint8_t idx, const char *reason) {
+static void requestChannelSwitch(uint8_t idx, const char *reason,
+                                 uint8_t beats = TALLY_CHAN_ANNOUNCE_BEATS) {
   if (idx >= TALLY_CHAN_COUNT || idx == g_chanIdx)
     return;
+  if (beats < 1)
+    beats = 1;
+  if (beats > 15)
+    beats = 15; // the countdown is a 4-bit wire field
   g_switchToIdx = idx;
-  g_switchCountdown = TALLY_CHAN_ANNOUNCE_BEATS;
+  g_switchCountdown = beats;
   g_switchPending = true;
-  hublogf("[CHAN] announcing switch to ch%u in %u beats: %s\n", idx,
-          TALLY_CHAN_ANNOUNCE_BEATS, reason);
+  hublogf("[CHAN] announcing switch to ch%u in %u beats: %s\n", idx, beats,
+          reason);
 }
 
 static void processTx() {
@@ -347,9 +340,9 @@ static void processTx() {
 
   // Radio down: account for what can't go out instead of stalling on SPI.
   if (!radio.isConnected()) {
-    if (g_burstIdx < g_burstCopies) {
+    if (!g_burst.idle()) {
       g_loraDropCount++;
-      g_burstIdx = g_burstCopies;
+      g_burst.abandon();
     }
     while (g_osHead != g_osTail) {
       g_loraDropCount++;
@@ -369,7 +362,7 @@ static void processTx() {
   // One-shots first: the locator is a human-triggered, time-sensitive event,
   // and a beacon that waits for a burst to finish may miss its window.
   if (g_osHead != g_osTail) {
-    if (!lbtClear(false))
+    if (!g_lbtOneShot.clear(millis(), false, channelBusyNow()))
       return;
     OneShot &os = g_oneShot[g_osTail];
     uint8_t buf[TALLY_PACKET_SIZE];
@@ -389,19 +382,14 @@ static void processTx() {
   // State copies on the burst schedule. The FIRST copy of a change goes out
   // immediately — its latency is the whole point; later copies and heartbeats
   // yield briefly to an active interferer.
-  if (g_burstIdx < g_burstCopies &&
-      (int32_t)(millis() - g_stateNextAtMs) >= 0) {
-    bool latencyCritical = (g_burstIdx == 0 && g_burstCopies > 1);
-    if (!lbtClear(latencyCritical))
+  if (g_burst.dueNow(millis())) {
+    if (!g_lbtState.clear(millis(), g_burst.latencyCritical(), channelBusyNow()))
       return;
     TallyPacket pkt = buildStateFrame();
     uint8_t buf[TALLY_PACKET_SIZE];
     TallyProtocol::serialize(pkt, buf);
-    if (radio.startSend(buf, TALLY_PACKET_SIZE)) {
-      g_burstIdx++;
-      if (g_burstIdx < g_burstCopies)
-        g_stateNextAtMs = g_burstStartMs + kBurstOffsets[g_burstIdx];
-    }
+    if (radio.startSend(buf, TALLY_PACKET_SIZE))
+      g_burst.markSent(millis());
   }
 }
 
@@ -497,15 +485,10 @@ static void heartbeatTick() {
     lastProg = g_progMask;
     lastPrev = g_prevMask;
     // A cut supersedes any copies still pending: restart the burst. Because
-    // every copy re-reads the live masks, the ones already sent were correct
-    // and the ones not yet sent now carry the new state.
-    g_burstIdx = 0;
-    // More copies while the fleet is struggling, never fewer than the minimum:
-    // a measurement error must not be able to cost us margin.
-    g_burstCopies =
-        g_linkDegraded ? TALLY_BURST_COPIES_MAX : TALLY_BURST_COPIES_MIN;
-    g_burstStartMs = now;
-    g_stateNextAtMs = now;
+    // every copy re-reads the live masks at transmit time, the ones already sent
+    // were correct for their moment and the ones not yet sent carry the new
+    // state. More copies while the fleet struggles, never fewer.
+    g_burst.onChange(now, g_linkDegraded);
     return; // the burst covers this interval; heartbeat timer untouched
   }
 
@@ -517,12 +500,7 @@ static void heartbeatTick() {
   // The countdown is what slaves count, so it advances per heartbeat. It is
   // decremented AFTER this beat's frame is scheduled, so a frame carrying
   // countdown=1 always reaches the air before the hub retunes.
-  if (g_burstIdx >= g_burstCopies) { // never interrupt a burst in progress
-    g_burstIdx = 0;
-    g_burstCopies = 1;
-    g_burstStartMs = now;
-    g_stateNextAtMs = now;
-  }
+  g_burst.scheduleHeartbeat(now); // no-op while a burst is in progress
   if (g_switchPending && g_switchCountdown > 0)
     g_switchCountdown--;
 }
@@ -965,6 +943,10 @@ void setup() {
   // could start on an escape channel, which cost every slave ~5s of scanning
   // (a dark camera) at power-on for a guess made in an empty venue.
 
+  // Arm the TX watchdog now, so a radio that never manages a single successful
+  // transmit is caught too (see the note beside g_lastTxOkMs).
+  g_lastTxOkMs = millis();
+
   // Show LoRa debug screen for 3 seconds
   drawLoRaDebug();
   delay(3000);
@@ -1039,11 +1021,10 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
   if (cmd == "status") {
     // "q" is now the transmit scheduler's state: copies of the CURRENT state
     // still to send, plus any queued one-shots (locator / old-channel beacon).
-    uint8_t qDepth = (uint8_t)((g_burstCopies > g_burstIdx
-                                    ? g_burstCopies - g_burstIdx
-                                    : 0) +
-                               ((g_osHead + ONESHOT_QUEUE_SIZE - g_osTail) %
-                                ONESHOT_QUEUE_SIZE));
+    uint8_t qDepth =
+        (uint8_t)(g_burst.pending() + ((g_osHead + ONESHOT_QUEUE_SIZE -
+                                       g_osTail) %
+                                      ONESHOT_QUEUE_SIZE));
     char ipbuf[20];
     if (WiFi.status() == WL_CONNECTED)
       snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", WiFi.localIP()[0],
@@ -1244,8 +1225,7 @@ void loop() {
 
   // TX watchdog: a radio that reports connected while every send fails would
   // stop the heartbeat silently — only the slaves would alarm. Force a re-init.
-  if (radio.isConnected() && g_lastTxOkMs != 0 &&
-      millis() - g_lastTxOkMs > TX_WATCHDOG_MS) {
+  if (radio.isConnected() && millis() - g_lastTxOkMs > TX_WATCHDOG_MS) {
     hublogf("[E28] no successful TX for %lums — forcing re-init\n",
             (unsigned long)(millis() - g_lastTxOkMs));
     g_lastTxOkMs = millis(); // don't re-trigger every pass
