@@ -6,17 +6,22 @@
 #include "TallyConfig.h"
 
 // ===== Protocol v4 =====
-// 8-byte frame. Deliberately NOT 9: the LoRa payload symbol count quantizes,
-// so 4..8 bytes all cost 43.2 ms at SF9/BW406/CR4-6 while 9 bytes costs
-// 50.7 ms — the 8th byte is free, and it buys the heartbeat counter that makes
-// collision-free telemetry slotting possible.
+// 9-byte frame: 8 bytes of content plus a CRC-8.
 //
-// What v3 carried and v4 drops:
-//  - start byte:   the LoRa PHY sync word already frames the packet.
-//  - app CRC-8:    the PHY CRC-16 is computed and checked in HARDWARE, and the
-//                  driver discards CrcError receptions before they reach this
-//                  layer. A second software CRC cost airtime, not safety.
-//                  (Deliberate decision to trust the PHY CRC.)
+// The CRC was briefly removed on the argument that the PHY already checks a
+// hardware CRC-16, which is true — and beside the point. A CRC proves INTEGRITY
+// ("no bits flipped"); it says nothing about AUTHENTICITY ("this frame is ours").
+// Without an app checksum the only filter left was byte 0 plus a 3-of-16 command
+// whitelist, so roughly 1 foreign LoRa frame in 1400 — from any co-located
+// SX1280 system on the same SF/BW/sync word, including a second tally rig — would
+// be accepted as a STATE_ALL and decoded into tally colours with nothing
+// anywhere able to notice. That is the exact failure the architecture promises
+// can never happen, so the byte is worth its airtime: the frame goes 43.2 ms ->
+// 50.7 ms (+17%, heartbeat duty 8.6% -> 10.1%) and the odds go to ~1 in 350,000.
+//
+// What v3 carried and v4 still drops:
+//  - start byte:   the LoRa PHY sync word already frames the packet, and the
+//                  version+netId byte is a stronger discriminator than 0xAA.
 //  - SET_POWER:    uplink ADR is gone — it bought ~1% duty cycle and
 //                  contaminated the channel decision (ARCHITECTURE_RF_V4 §9).
 //  - SET_CHANNEL:  channel switches now ride inside the STATE_ALL heartbeat, so
@@ -26,7 +31,7 @@
 // Byte 0 pins version AND network, so a mixed-firmware fleet fails CLOSED: a v3
 // node rejects the frame and shows signal-lost rather than decoding a different
 // layout as a tally colour.
-#define TALLY_PACKET_SIZE 8
+#define TALLY_PACKET_SIZE 9
 #define TALLY_PROTOCOL_VERSION 0x4
 
 // byte 0 = [version:4][netId:4]
@@ -77,6 +82,7 @@ struct TallyPacket {
   uint8_t verNet;
   uint8_t cmdFlags;
   uint8_t data[6];
+  uint8_t crc; // CRC-8/CCITT over bytes 0..7 — authenticity, not integrity
 };
 #pragma pack(pop)
 
@@ -140,6 +146,7 @@ public:
   static void serialize(const TallyPacket &p, uint8_t *buffer);
   static bool deserialize(const uint8_t *buffer, uint8_t len, TallyPacket &p);
   static bool validate(const TallyPacket &p);
+  static uint8_t calculateCRC(const TallyPacket &p);
 };
 
 #endif // TALLY_PROTOCOL_H

@@ -184,6 +184,35 @@ int main() {
     CHECK_EQ(l.lastHbAtMs(), at);
   }
 
+  CASE("frames-per-cycle distinguishes a burst from a lone heartbeat");
+  {
+    // The slave's ONLY way to know a change burst is in flight — and therefore
+    // that it must not transmit telemetry into it.
+    TallyLink l; primed(l);
+    feed(l, TallyProtocol::createStateAllPacket(0, 0, true, 10));
+    CHECK_EQ(l.framesThisCycle(), 1); // lone heartbeat
+    testAdvance(60);
+    feed(l, TallyProtocol::createStateAllPacket(1, 0, true, 10)); // copy 2
+    CHECK_EQ(l.framesThisCycle(), 2);
+    testAdvance(100);
+    feed(l, TallyProtocol::createStateAllPacket(1, 0, true, 10)); // copy 3
+    CHECK_EQ(l.framesThisCycle(), 3);
+    testAdvance(500);
+    feed(l, TallyProtocol::createStateAllPacket(1, 0, true, 11)); // next cycle
+    CHECK_EQ(l.framesThisCycle(), 1);
+  }
+
+  CASE("a corrupted frame is rejected (authenticity, not just integrity)");
+  {
+    TallyLink l; primed(l);
+    TallyPacket p = TallyProtocol::createStateAllPacket(0xFFFF, 0, true, 3);
+    uint8_t buf[TALLY_PACKET_SIZE];
+    TallyProtocol::serialize(p, buf);
+    buf[2] ^= 0x01; // flip one payload bit, leave the header intact
+    CHECK(!l.onPacket(buf, TALLY_PACKET_SIZE));
+    CHECK_EQ(g_stateCalls, 0);
+  }
+
   CASE("garbage and foreign frames are rejected without touching the link");
   {
     TallyLink l; primed(l);

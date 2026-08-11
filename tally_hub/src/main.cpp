@@ -11,6 +11,7 @@
 
 #include "E28_SX1280.h"
 #include "TallyBurst.h"
+#include "TallyEscape.h"
 #include "TallyLog.h"
 #include "TallyProtocol.h"
 #include "TallyRadio.h"
@@ -32,12 +33,14 @@ static uint8_t g_chanIdx = 0;
 static uint32_t g_chanFreq = TALLY_RF_FREQ_HZ;
 
 // Coordinated switch. The plan rides inside the heartbeat (chanIdx + a
-// countdown in beats), so ~10 decorrelated frames carry it instead of a burst
-// of back-to-back announcements that share one interference burst. The hub
-// retunes only once the countdown-1 frame has actually left the air.
-static bool g_switchPending = false;
-static uint8_t g_switchToIdx = 0;
-static uint8_t g_switchCountdown = 0;
+// countdown in beats), so ~10 decorrelated frames carry it instead of a burst of
+// back-to-back announcements that share one interference burst.
+// The countdown is DERIVED from a target beat number (TallyChanSwitch), never
+// decremented: the previous counter was decremented in heartbeatTick() while the
+// frame carrying it is serialized later in processTx(), so N beats put only N-1
+// usable countdowns on air and beats==1 put 0 — which means "no switch pending",
+// so the hub retuned with zero announcements and abandoned the fleet.
+static TallyChanSwitch g_chanSwitch;
 
 // After switching, beacon the new channel on the OLD one for a while: a slave
 // that missed every announcement is recovered immediately instead of scanning.
@@ -90,6 +93,20 @@ static inline bool sourceLiveNow() {
 #endif
 }
 
+// True while the last frame went out on a frequency other than the working one
+// (the old-channel beacon). Gates channel measurement, so it must be cleared on
+// every path that ends an off-channel transmit — including a radio fault, which
+// previously latched it true and killed measurement for the rest of uptime.
+static bool g_txOffChannel = false;
+
+// Last frame that actually made it onto the air. The hub can detect a dead radio
+// (isConnected false) but NOT a radio that reports fine while every send silently
+// fails — heartbeats would simply stop and only the slaves would notice. Cheap
+// insurance: no successful TX for this long -> full re-init. Armed by
+// radioInit(), the single place that means "the radio is usable from now on".
+static uint32_t g_lastTxOkMs = 0;
+#define TX_WATCHDOG_MS 5000
+
 // begin() resets the chip to its defaults, so the shared RF profile must be
 // reapplied on every (re)init — including in-field recovery.
 static bool radioInit() {
@@ -100,6 +117,14 @@ static bool radioInit() {
     tallyApplyRadioProfile(radio, g_txPower);
     radio.setFrequency(g_chanFreq); // keep the current AFA channel
     radio.startReceive(); // listen for slave telemetry between our frames
+    g_txOffChannel = false;
+    // Arm the TX watchdog HERE, the one place that means "the radio is usable
+    // from now on". Arming it in setup() alone made it fire immediately after an
+    // in-field repair (the clock had been running while the module was absent),
+    // logging a false failure and forcing a redundant re-init; keying it off the
+    // first successful transmit instead left it permanently inert when the fault
+    // was present from power-on — the very case it exists for.
+    g_lastTxOkMs = millis();
   }
   return ok;
 }
@@ -119,13 +144,13 @@ static uint32_t g_camMismatchSince[17] = {0};   // shown != commanded since when
 // than jittered. 3 missed slots is a real signal; a single frame lost to a
 // collision with a change burst must NOT flap the camera offline.
 #define CAM_REACHABLE_MS (3 * TALLY_TELEMETRY_MS)
-// A camera reporting this many missed heartbeats is struggling on the DOWNLINK
-// — the direction that matters. This, not the hub's own RX error count, is the
-// channel-quality signal (hub RX errors measure the uplink and are polluted by
-// foreign energy).
-#define CAM_POOR_MISSED 3
-static inline bool camPoor(uint8_t id) {
-  return !g_camReachable[id] || g_camMissed[id] >= CAM_POOR_MISSED;
+// A camera that is TALKING to us and reporting missed heartbeats is struggling on
+// the DOWNLINK — the direction that matters, and unambiguous evidence about the
+// channel. "Unreachable" is deliberately NOT folded in here: a silent camera may
+// simply be switched off, and treating that as a bad channel migrated the whole
+// fleet during a break. The full classification lives in TallyEscape.
+static inline bool camComplaining(uint8_t id) {
+  return g_camReachable[id] && g_camMissed[id] >= ESC_POOR_MISSED;
 }
 
 // ===== Transmit scheduler: ALWAYS the latest state =====
@@ -144,6 +169,9 @@ static TallyBurst g_burst;
 static TallyLbt g_lbtState;
 static TallyLbt g_lbtOneShot;
 
+// Channel-escape policy, extracted and unit-tested (lib/TallyProtocol/TallyEscape.h).
+static TallyEscape g_escape;
+
 // One-shot frames (locator ping, old-channel beacon) are events rather than
 // state, so they keep a tiny FIFO. freqHz != 0 transmits on that frequency
 // instead of the current channel — that is the beacon's whole purpose.
@@ -154,7 +182,6 @@ struct OneShot {
 #define ONESHOT_QUEUE_SIZE 8
 static OneShot g_oneShot[ONESHOT_QUEUE_SIZE];
 static uint8_t g_osHead = 0, g_osTail = 0;
-static bool g_txOffChannel = false; // last frame went out on another frequency
 
 // ===== Channel quality measurement (DIAGNOSTIC + listen-before-talk) =====
 // Deliberately NOT in the channel-switch decision. v3 decided on measured noise
@@ -246,15 +273,6 @@ static bool channelBusyNow() {
 // struggling. Copies are only ever ADDED, never removed.
 static bool g_linkDegraded = false;
 
-// Last frame that actually made it onto the air. The hub can detect a dead
-// radio (isConnected false) but NOT a radio that reports fine while every send
-// silently fails — heartbeats would simply stop and only the slaves would
-// notice. Cheap insurance: no successful TX for this long -> full re-init.
-// ARMED AT THE END OF setup(), not on the first success: keying it off the first
-// successful transmit meant an antenna/PA fault present from power-on left the
-// watchdog permanently inert — precisely the case it was written for.
-static uint32_t g_lastTxOkMs = 0;
-#define TX_WATCHDOG_MS 5000
 
 static void enqueueOneShot(const TallyPacket &pkt, uint32_t freqHz = 0) {
   uint8_t next = (uint8_t)((g_osHead + 1) % ONESHOT_QUEUE_SIZE);
@@ -275,15 +293,24 @@ static inline bool txIdle() {
 static TallyPacket buildStateFrame() {
   return TallyProtocol::createStateAllPacket(
       g_progMask, g_prevMask, sourceLiveNow(), g_hbCount,
-      g_switchPending ? g_switchToIdx : 0,
-      g_switchPending ? g_switchCountdown : 0);
+      g_chanSwitch.pending() ? g_chanSwitch.target() : 0,
+      g_chanSwitch.countdown(g_hbCount));
 }
 
 static void applyChannelSwitch() {
   g_oldChanFreq = g_chanFreq; // beacon target
-  g_chanIdx = g_switchToIdx;
+  // Flush the measurement window BEFORE retuning: the accumulators hold samples
+  // taken on the OLD channel, and committing them after the retune folded them
+  // into the NEW channel's stats — which then became the listen-before-talk
+  // reference for a frequency they were never measured on.
+  chanCommit(g_chan[g_chanIdx]);
+  g_accMin = 127;
+  g_accN = 0;
+  g_accBusy = 0;
+  g_escape.noteSwitching(millis(), g_chanIdx);
+  g_chanIdx = g_chanSwitch.target();
   g_chanFreq = g_chanList[g_chanIdx];
-  g_switchPending = false;
+  g_chanSwitch.clear();
   radio.setFrequency(g_chanFreq);
   radio.startReceive();
   uint32_t now = millis();
@@ -301,14 +328,14 @@ static void requestChannelSwitch(uint8_t idx, const char *reason,
                                  uint8_t beats = TALLY_CHAN_ANNOUNCE_BEATS) {
   if (idx >= TALLY_CHAN_COUNT || idx == g_chanIdx)
     return;
-  if (beats < 1)
-    beats = 1;
-  if (beats > 15)
-    beats = 15; // the countdown is a 4-bit wire field
-  g_switchToIdx = idx;
-  g_switchCountdown = beats;
-  g_switchPending = true;
-  hublogf("[CHAN] announcing switch to ch%u in %u beats: %s\n", idx, beats,
+  // Announcement length is NOT shortened under severe degradation. That was
+  // backwards: the severe tier fires exactly when frame loss is high, which is
+  // when a marginal slave needs MORE chances to hear the plan, not fewer. At 50%
+  // loss, 9 announcements miss with p~0.2% while 3 miss with p~12.5%, and a
+  // stranded slave is dark for ~8s. Faster escape comes from the shorter
+  // SUSTAIN, not from a shorter announcement.
+  g_chanSwitch.request(idx, g_hbCount, beats);
+  hublogf("[CHAN] announcing switch to ch%u over %u beats: %s\n", idx, beats,
           reason);
 }
 
@@ -331,8 +358,8 @@ static void processTx() {
         g_txOffChannel = false;
       }
       radio.startReceive(); // back to listening for telemetry
-      // The countdown-1 frame is now on air: it is safe to retune.
-      if (g_switchPending && g_switchCountdown == 0 && txIdle())
+      // The last announcing frame is now on air: it is safe to retune.
+      if (g_chanSwitch.expired(g_hbCount) && txIdle())
         applyChannelSwitch();
     }
     return;
@@ -348,10 +375,16 @@ static void processTx() {
       g_loraDropCount++;
       g_osTail = (uint8_t)((g_osTail + 1) % ONESHOT_QUEUE_SIZE);
     }
+    // Stale deferral clocks would let the FIRST frame after recovery bypass LBT
+    // entirely (its patience "ran out" during the outage), and a latched
+    // off-channel flag would disable channel measurement for the rest of uptime.
+    g_lbtState.reset();
+    g_lbtOneShot.reset();
+    g_txOffChannel = false;
     return;
   }
 
-  if (g_switchPending && g_switchCountdown == 0 && txIdle()) {
+  if (g_chanSwitch.expired(g_hbCount) && txIdle()) {
     applyChannelSwitch();
     return;
   }
@@ -362,12 +395,15 @@ static void processTx() {
   // One-shots first: the locator is a human-triggered, time-sensitive event,
   // and a beacon that waits for a burst to finish may miss its window.
   if (g_osHead != g_osTail) {
-    if (!g_lbtOneShot.clear(millis(), false, channelBusyNow()))
-      return;
     OneShot &os = g_oneShot[g_osTail];
+    // An off-channel frame (the old-channel beacon) cannot be gated by a busy
+    // measurement of the CURRENT channel — that is the wrong spectrum, and we
+    // cannot measure the target without retuning. Send it; it is a rescue frame.
+    bool offChannel = (os.freqHz != 0 && os.freqHz != g_chanFreq);
+    if (!offChannel && !g_lbtOneShot.clear(millis(), false, channelBusyNow()))
+      return;
     uint8_t buf[TALLY_PACKET_SIZE];
     TallyProtocol::serialize(os.pkt, buf);
-    bool offChannel = (os.freqHz != 0 && os.freqHz != g_chanFreq);
     if (offChannel)
       radio.setFrequency(os.freqHz);
     if (radio.startSend(buf, TALLY_PACKET_SIZE)) {
@@ -383,7 +419,11 @@ static void processTx() {
   // immediately — its latency is the whole point; later copies and heartbeats
   // yield briefly to an active interferer.
   if (g_burst.dueNow(millis())) {
-    if (!g_lbtState.clear(millis(), g_burst.latencyCritical(), channelBusyNow()))
+    // Short-circuit on purpose: channelBusyNow() is a blocking SPI read, and the
+    // first copy of a cut must never pay for a measurement whose result it
+    // ignores. Passing it as an argument evaluated it eagerly on exactly that path.
+    if (!g_burst.latencyCritical() &&
+        !g_lbtState.clear(millis(), false, channelBusyNow()))
       return;
     TallyPacket pkt = buildStateFrame();
     uint8_t buf[TALLY_PACKET_SIZE];
@@ -495,14 +535,17 @@ static void heartbeatTick() {
   if (now - lastHbMs < TALLY_REFRESH_MS)
     return;
   lastHbMs = now;
-  g_hbCount++; // advances the fleet's telemetry-slot cycle
 
-  // The countdown is what slaves count, so it advances per heartbeat. It is
-  // decremented AFTER this beat's frame is scheduled, so a frame carrying
-  // countdown=1 always reaches the air before the hub retunes.
-  g_burst.scheduleHeartbeat(now); // no-op while a burst is in progress
-  if (g_switchPending && g_switchCountdown > 0)
-    g_switchCountdown--;
+  // Nothing to decrement: TallyChanSwitch derives the countdown from g_hbCount,
+  // so the value a frame carries cannot depend on when it was scheduled.
+  // Advance the cycle only when a heartbeat frame is actually scheduled. When a
+  // burst is in progress scheduleHeartbeat() no-ops, and incrementing anyway
+  // consumed a cycle number that never reached the air (a camera whose slot
+  // matched it simply skipped a telemetry period) AND let copies of one burst
+  // straddle the increment, so slaves anchored their slots on frames up to
+  // ~700ms apart.
+  if (g_burst.scheduleHeartbeat(now))
+    g_hbCount++;
 }
 
 // Beacon the current channel on the OLD one after a switch, so a slave that
@@ -943,13 +986,149 @@ void setup() {
   // could start on an escape channel, which cost every slave ~5s of scanning
   // (a dark camera) at power-on for a guess made in an empty venue.
 
-  // Arm the TX watchdog now, so a radio that never manages a single successful
-  // transmit is caught too (see the note beside g_lastTxOkMs).
-  g_lastTxOkMs = millis();
-
   // Show LoRa debug screen for 3 seconds
   drawLoRaDebug();
   delay(3000);
+}
+
+// ===== Full-band survey =====
+// Sweep the entire 2.4 GHz ISM band and print where the energy actually is, so
+// the channel set can be chosen for THIS venue instead of assumed. It exists
+// because the compiled channel plan bakes in the US 1/6/11 grid, and in EU
+// (channels 1-13, contiguous 2402-2482) that assumption can be simply wrong —
+// the home channel may sit inside an occupied AP channel with no way to know.
+//
+// Deliberately OPERATOR-TRIGGERED and blocking. This is the opposite of the
+// automatic scout that was deleted: that one retuned the radio away from the
+// working channel every few seconds DURING a show, went off-channel while the
+// fleet was live, and fed a cost function that drove automatic switching. This
+// runs before doors, at the operator's request, with nothing depending on the
+// link — so blocking is free and there is no failure mode to design around.
+// Its output informs a human decision; it never moves the fleet by itself.
+#define SURVEY_STEP_KHZ 1000
+#define SURVEY_LO_HZ 2400000000UL
+#define SURVEY_HI_HZ 2483000000UL
+#define SURVEY_SAMPLES 24
+
+static void bandSurvey(Stream *io) {
+  if (!radio.isConnected()) {
+    hublogf("[SURVEY] radio DEAD — fix the module first\n");
+    return;
+  }
+  if (radio.txActive() || !g_burst.idle()) {
+    hublogf("[SURVEY] TX in flight — try again in a moment\n");
+    return;
+  }
+  Stream &out = io ? *io : Serial;
+  uint32_t steps = (SURVEY_HI_HZ - SURVEY_LO_HZ) / (SURVEY_STEP_KHZ * 1000UL) + 1;
+  out.printf("[SURVEY] sweeping %lu.%lu-%lu.%lu MHz in %u kHz steps "
+             "(~%lus, fleet will be deaf)\n",
+             SURVEY_LO_HZ / 1000000UL, (SURVEY_LO_HZ % 1000000UL) / 100000UL,
+             SURVEY_HI_HZ / 1000000UL, (SURVEY_HI_HZ % 1000000UL) / 100000UL,
+             (unsigned)SURVEY_STEP_KHZ,
+             (unsigned long)(steps * (6 + SURVEY_SAMPLES * 2) / 1000));
+
+  // Two passes: the first establishes each step's floor, the second counts how
+  // often energy sits well above it. One pass cannot do both — busy-ness is only
+  // meaningful relative to a floor, which is why a single-pass survey reports
+  // every channel as 0% busy.
+  static int8_t floorDbm[128];
+  static uint8_t busyPct[128];
+  if (steps > 128)
+    steps = 128;
+  for (uint8_t pass = 0; pass < 2; pass++) {
+    for (uint32_t i = 0; i < steps; i++) {
+      uint32_t f = SURVEY_LO_HZ + i * SURVEY_STEP_KHZ * 1000UL;
+      radio.setFrequency(f);
+      radio.startReceive();
+      delay(6);
+      int8_t lo = 127;
+      uint8_t busy = 0;
+      for (uint8_t k = 0; k < SURVEY_SAMPLES; k++) {
+        int8_t r = radio.getRssiInst();
+        if (r != 0) {
+          if (r < lo)
+            lo = r;
+          if (pass == 1 && r > floorDbm[i] + CHAN_BUSY_ABOVE_FLOOR)
+            busy++;
+        }
+        delay(2);
+      }
+      if (pass == 0)
+        floorDbm[i] = (lo == 127) ? -100 : lo;
+      else
+        busyPct[i] = (uint8_t)((uint16_t)busy * 100 / SURVEY_SAMPLES);
+    }
+  }
+
+  // Restore the working channel BEFORE printing: the print is slow and the fleet
+  // should not stay deaf for it.
+  radio.setFrequency(g_chanFreq);
+  radio.startReceive();
+
+  out.println(F("[SURVEY]  MHz   floor  busy  bar (busy% over the floor)"));
+  for (uint32_t i = 0; i < steps; i++) {
+    uint32_t f = SURVEY_LO_HZ + i * SURVEY_STEP_KHZ * 1000UL;
+    char bar[21];
+    uint8_t n = (uint8_t)(busyPct[i] * 20 / 100);
+    for (uint8_t k = 0; k < 20; k++)
+      bar[k] = (k < n) ? '#' : ((k % 5 == 0) ? '.' : ' ');
+    bar[20] = 0;
+    // Mark the configured channels so the operator can see at a glance whether
+    // the plan matches the room.
+    const char *mark = "  ";
+    for (uint8_t c = 0; c < TALLY_CHAN_COUNT; c++)
+      if (f / 500000UL == g_chanList[c] / 500000UL)
+        mark = (c == g_chanIdx) ? "<*" : "<c";
+    out.printf("[SURVEY] %4lu.%lu %5d %4u%%  %s %s\n", f / 1000000UL,
+               (f % 1000000UL) / 100000UL, (int)floorDbm[i], busyPct[i], bar,
+               mark);
+  }
+
+  // Recommend a set: quietest steps first, spaced so two picks cannot sit inside
+  // one 20 MHz WiFi channel, and kept away from the band edges by half a
+  // bandwidth. This is a RECOMMENDATION for TALLY_CHAN_LIST, not an action —
+  // hub and slaves must agree on the table, so changing it is a deliberate
+  // reflash of the whole fleet, never something a survey does behind your back.
+  out.println(F("[SURVEY] --- recommended TALLY_CHAN_LIST for this room ---"));
+  uint8_t picked[TALLY_CHAN_COUNT];
+  uint8_t nPicked = 0;
+  for (uint8_t want = 0; want < TALLY_CHAN_COUNT; want++) {
+    uint32_t bestI = 0xFFFFFFFF;
+    int bestCost = 1 << 30;
+    for (uint32_t i = 0; i < steps; i++) {
+      uint32_t f = SURVEY_LO_HZ + i * SURVEY_STEP_KHZ * 1000UL;
+      if (f < 2400500000UL || f > 2482500000UL)
+        continue; // half-bandwidth margin from both band edges
+      bool tooClose = false;
+      for (uint8_t p = 0; p < nPicked; p++) {
+        uint32_t pf = SURVEY_LO_HZ + picked[p] * SURVEY_STEP_KHZ * 1000UL;
+        uint32_t d = (f > pf) ? (f - pf) : (pf - f);
+        if (d < 20000000UL)
+          tooClose = true; // inside one WiFi channel width of an earlier pick
+      }
+      if (tooClose)
+        continue;
+      // Same weighting the runtime uses: busy-ness dominates, floor breaks ties.
+      int cost = (int)floorDbm[i] + (int)busyPct[i];
+      if (cost < bestCost) {
+        bestCost = cost;
+        bestI = i;
+      }
+    }
+    if (bestI == 0xFFFFFFFF)
+      break;
+    picked[nPicked++] = (uint8_t)bestI;
+  }
+  for (uint8_t p = 0; p < nPicked; p++) {
+    uint32_t f = SURVEY_LO_HZ + picked[p] * SURVEY_STEP_KHZ * 1000UL;
+    out.printf("[SURVEY]   %luUL,   // %lu.%lu MHz  floor=%d busy=%u%%\n",
+               (unsigned long)f, f / 1000000UL, (f % 1000000UL) / 100000UL,
+               (int)floorDbm[picked[p]], busyPct[picked[p]]);
+  }
+  out.println(F("[SURVEY] index 0 is the home channel: every slave boots there,"));
+  out.println(F("[SURVEY] so put the quietest pick first. Reflash hub AND all"));
+  out.println(F("[SURVEY] cameras together — a mismatched table strands them."));
 }
 
 // AFA site survey: sample the ambient noise floor on every candidate channel
@@ -1103,7 +1282,7 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
         hublogf("[CHAN] no such channel (0..%u)\n", TALLY_CHAN_COUNT - 1);
       } else if (i == g_chanIdx) {
         hublogf("[CHAN] already on ch%u\n", i);
-      } else if (g_switchPending || g_oldChanFreq) {
+      } else if (g_chanSwitch.pending() || g_oldChanFreq) {
         hublogf("[CHAN] a switch is already in progress — wait for it\n");
       } else {
         // The plan rides in the next ~10 heartbeats (decorrelated by 500ms),
@@ -1114,6 +1293,8 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
     }
   } else if (cmd == "noise") {
     noiseSurvey();
+  } else if (cmd == "survey") {
+    bandSurvey(io);
   } else if (cmd == "pintest") {
     // Wiring bring-up: drive each ESP->E28 control line HIGH alone for 8s so
     // a multimeter on the module pad verifies the PHYSICAL mapping wire by
@@ -1164,8 +1345,11 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
       any = true;
       // dl = how loudly the SLAVE hears us (the safety-critical direction),
       // ul = how loudly we hear the slave, missed = its heartbeat gradient.
-      hublogf("[CAM %2u] %s dl=%4d ul=%4d dBm missed=%-2u last seen %lus ago\n",
-              id, g_camReachable[id] ? "ONLINE " : "OFFLINE",
+      hublogf("[CAM %2u] %-8s dl=%4d ul=%4d dBm missed=%-2u last seen %lus ago\n",
+              id,
+              !g_camReachable[id] ? "SILENT"
+              : camComplaining(id) ? "POOR"
+                                   : "ok",
               (int)g_camRssi[id], (int)g_camRxRssi[id], g_camMissed[id],
               (unsigned long)((millis() - g_camLastSeen[id]) / 1000));
     }
@@ -1185,7 +1369,7 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
     }
   } else if (cmd == "help") {
     hublogf("Commands: status, cams, ping, power [n], chan [i], auto [on|off], "
-            "noise, pintest, log, logclear, reinit, help\n");
+            "noise, survey, pintest, log, logclear, reinit, help\n");
   } else if (cmd.length()) {
     hublogf("Unknown command '%s' — try 'help'\n", cmd.c_str());
   }

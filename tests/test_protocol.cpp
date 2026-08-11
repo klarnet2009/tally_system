@@ -131,6 +131,44 @@ int main() {
     CHECK(!TallyProtocol::validate(p));
   }
 
+  CASE("AUTHENTICITY: a foreign frame with our header byte still fails the CRC");
+  {
+    // This is what the checksum is for. The PHY CRC proves no bits flipped; it
+    // cannot prove the frame is ours. Without this check ~1 foreign LoRa frame
+    // in 1400 would decode as a tally state.
+    uint8_t buf[TALLY_PACKET_SIZE];
+    for (uint8_t i = 0; i < TALLY_PACKET_SIZE; i++)
+      buf[i] = (uint8_t)(0x5A + i * 7);
+    buf[0] = TALLY_VERNET_BYTE;                     // right system, by chance
+    buf[1] = TALLY_CMDFLAGS_BYTE(CMD_STATE_ALL, 0); // right command, by chance
+    TallyPacket q;
+    CHECK(!TallyProtocol::deserialize(buf, sizeof(buf), q));
+  }
+
+  CASE("every single-bit flip in the frame is caught");
+  {
+    TallyPacket p = TallyProtocol::createStateAllPacket(0xA5A5, 0x5A5A, true, 7,
+                                                        2, 6);
+    for (int byteIdx = 0; byteIdx < TALLY_PACKET_SIZE; byteIdx++) {
+      for (int bit = 0; bit < 8; bit++) {
+        uint8_t buf[TALLY_PACKET_SIZE];
+        TallyProtocol::serialize(p, buf);
+        buf[byteIdx] ^= (uint8_t)(1u << bit);
+        TallyPacket q;
+        CHECK(!TallyProtocol::deserialize(buf, sizeof(buf), q));
+      }
+    }
+  }
+
+  CASE("an over-long reception is rejected: our frames are exactly one size");
+  {
+    TallyPacket p = TallyProtocol::createStateAllPacket(0, 0, true, 0);
+    uint8_t buf[TALLY_PACKET_SIZE + 4];
+    TallyProtocol::serialize(p, buf);
+    TallyPacket q;
+    CHECK(!TallyProtocol::deserialize(buf, TALLY_PACKET_SIZE + 4, q));
+  }
+
   CASE("a short buffer is rejected before it is read");
   {
     TallyPacket p = TallyProtocol::createStateAllPacket(0, 0, true, 0);

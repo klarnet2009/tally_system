@@ -7,6 +7,8 @@
 
 int main() {
   printf("== TallyBurst / TallyLbt ==\n");
+  // Anchor the shared clock before each group: the rollover case below leaves it
+  // near the wrap, and a later case that reads millis() would silently inherit it.
   static const uint16_t offs[TALLY_BURST_COPIES_MAX] = TALLY_BURST_OFFSETS_MS;
 
   CASE("offsets are strictly increasing and IRREGULAR (no aliasing comb)");
@@ -25,6 +27,7 @@ int main() {
     CHECK(offs[TALLY_BURST_COPIES_MIN - 1] > 300);
   }
 
+  testSetMillis(0);
   CASE("a change schedules MIN copies, degraded schedules MAX, never fewer");
   {
     TallyBurst b; b.reset(1000);
@@ -35,6 +38,7 @@ int main() {
     CHECK(TALLY_BURST_COPIES_MAX >= TALLY_BURST_COPIES_MIN);
   }
 
+  testSetMillis(0);
   CASE("copies come due exactly on the offset schedule");
   {
     TallyBurst b; b.reset(1000);
@@ -56,6 +60,7 @@ int main() {
     CHECK_EQ(b.pending(), 0);
   }
 
+  testSetMillis(0);
   CASE("only the FIRST copy of a burst is latency-critical");
   {
     TallyBurst b; b.reset(0);
@@ -65,6 +70,7 @@ int main() {
     CHECK(!b.latencyCritical());
   }
 
+  testSetMillis(0);
   CASE("a lone heartbeat is NOT latency-critical (it may yield to a busy air)");
   {
     TallyBurst b; b.reset(0);
@@ -73,6 +79,7 @@ int main() {
     CHECK(!b.latencyCritical());
   }
 
+  testSetMillis(0);
   CASE("a second cut mid-burst RESTARTS the schedule — the core stale-state fix");
   {
     TallyBurst b; b.reset(1000);
@@ -88,6 +95,7 @@ int main() {
     CHECK(b.latencyCritical());
   }
 
+  testSetMillis(0);
   CASE("a heartbeat never interrupts a burst in progress");
   {
     TallyBurst b; b.reset(1000);
@@ -97,6 +105,7 @@ int main() {
     CHECK_EQ(b.pending(), TALLY_BURST_COPIES_MIN - 1); // untouched
   }
 
+  testSetMillis(0);
   CASE("abandon drops the rest (radio went away) and leaves the object usable");
   {
     TallyBurst b; b.reset(0);
@@ -106,6 +115,7 @@ int main() {
     CHECK(b.scheduleHeartbeat(10));
   }
 
+  testSetMillis(0);
   CASE("millis() rollover: a burst spanning the wrap still comes due");
   {
     uint32_t nearWrap = 0xFFFFFF00u;
@@ -117,6 +127,7 @@ int main() {
     CHECK(b.dueNow(millis()));
   }
 
+  testSetMillis(0);
   CASE("LBT: a clear channel transmits immediately");
   {
     TallyLbt g;
@@ -124,6 +135,7 @@ int main() {
     CHECK(!g.deferring());
   }
 
+  testSetMillis(0);
   CASE("LBT: a busy channel defers, then sends anyway at the cap");
   {
     TallyLbt g;
@@ -135,6 +147,7 @@ int main() {
     CHECK(!g.deferring());
   }
 
+  testSetMillis(0);
   CASE("LBT: the first copy of a cut is never delayed, busy or not");
   {
     TallyLbt g;
@@ -142,6 +155,7 @@ int main() {
     CHECK(!g.deferring());
   }
 
+  testSetMillis(0);
   CASE("LBT: separate instances do not consume each other's patience");
   {
     // This is the defect the split fixes: with one shared clock, a beacon that
@@ -154,6 +168,7 @@ int main() {
     CHECK(!state.clear(millis(), false, true));  // the burst still has all of its
   }
 
+  testSetMillis(0);
   CASE("LBT: a channel that clears mid-deferral resets the patience budget");
   {
     TallyLbt g;

@@ -68,6 +68,11 @@ public:
     uint8_t lastHbCount() const { return _lastHbCount; }
     uint32_t lastHbAtMs() const { return _lastHbAtMs; }
     bool hbSeen() const { return _hbSeen; }
+    // How many hub frames carried the CURRENT cycle number. The hub advances the
+    // cycle only when it schedules a heartbeat, so >1 means a change burst is in
+    // flight — and a slave must not transmit telemetry into it. This is the only
+    // way a receiver can tell a burst from a lone heartbeat.
+    uint8_t framesThisCycle() const { return _framesThisHb; }
 
 private:
     uint8_t _cameraId = 1;
@@ -81,6 +86,7 @@ private:
     uint32_t _poorWindowStart = 0;
     uint8_t _lastHbCount = 0;
     uint32_t _lastHbAtMs = 0;
+    uint8_t _framesThisHb = 0;
     bool _hbSeen = false;
     StateCallback _onState = nullptr;
     LocatorCallback _onLocator = nullptr;

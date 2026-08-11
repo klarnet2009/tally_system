@@ -70,16 +70,18 @@ static inline void tallyTelemetryTick(E28Radio &radio, TallyLink &link,
       link.lastHbAtMs() + TALLY_TLM_OFFSET_MS + bank * TALLY_TLM_BANK_MS;
   if ((int32_t)(millis() - dueAt) < 0)
     return; // our slot hasn't opened yet
-  // Slot already passed (we were busy in the locator or a long RX drain) —
-  // skip this cycle rather than transmit late into the next device's slot.
-  if (millis() - dueAt > TALLY_TLM_BANK_MS)
+  // Slot already passed (we were busy in the locator or a long RX drain) — skip
+  // this cycle rather than transmit late into the next bank's slot.
+  if (millis() - dueAt > TALLY_TLM_LATE_MS)
     return;
-  // A frame arrived within the last frame-time: the hub is mid change-burst, so
-  // transmitting now would collide with a copy we actually care about. Telemetry
-  // is observability — yield. (Slots cannot avoid bursts entirely: burst offsets
-  // are measured from the CUT, not from a heartbeat. The hub's reachability
-  // window is 3 telemetry periods, so single skips are absorbed.)
-  if (link.msSinceLastRx() < 50)
+  // NEVER transmit into a change burst. More than one frame carrying this cycle
+  // number means the hub is repeating a cut, and the copies are spaced 60-210 ms
+  // apart — far beyond any "time since last frame" guard, which is why the
+  // previous 50 ms check failed: a slave that received copy 2 would fire its
+  // 51 ms uplink squarely on top of copy 3, miss that copy itself, AND radiate
+  // over it for every other camera in range. Telemetry is observability; the
+  // burst is the primary reliability mechanism. Yield unconditionally.
+  if (link.framesThisCycle() > 1)
     return;
 
   lastSentHb = hb;

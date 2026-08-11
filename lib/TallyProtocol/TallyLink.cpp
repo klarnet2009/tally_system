@@ -53,7 +53,12 @@ bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
         return true;
 
     // ---- STATE_ALL: tally state, source freshness, channel plan, time base --
-    _lastHbCount = TallyProtocol::hbCount(pkt);
+    uint8_t hb = TallyProtocol::hbCount(pkt);
+    if (!_hbSeen || hb != _lastHbCount)
+      _framesThisHb = 1; // first frame of a new cycle
+    else if (_framesThisHb < 255)
+      _framesThisHb++;   // another copy of the same cycle = a burst
+    _lastHbCount = hb;
     _lastHbAtMs = now;
     _hbSeen = true;
 

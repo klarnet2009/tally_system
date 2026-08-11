@@ -72,7 +72,17 @@ public:
 
 private:
   static const uint16_t *kOffsets() {
-    static const uint16_t offs[TALLY_BURST_COPIES_MAX] = TALLY_BURST_OFFSETS_MS;
+    static const uint16_t offs[] = TALLY_BURST_OFFSETS_MS;
+    // Sized from the initializer, then checked — declaring it
+    // [TALLY_BURST_COPIES_MAX] instead let C++ zero-fill any missing entries, so
+    // raising the copy count without extending the list gave the extra copies
+    // offset 0: they fired back-to-back, one interference burst erased both, and
+    // the time diversity the class exists for vanished with no compile error and
+    // no runtime symptom.
+    static_assert(sizeof(offs) / sizeof(offs[0]) == TALLY_BURST_COPIES_MAX,
+                  "TALLY_BURST_OFFSETS_MS must have TALLY_BURST_COPIES_MAX entries");
+    static_assert(TALLY_BURST_OFFSETS_FIRST_IS_ZERO,
+                  "the first burst copy must be due immediately");
     return offs;
   }
   uint8_t _idx = 0;
