@@ -2,6 +2,7 @@
 #define TALLY_RADIO_H
 
 #include "E28_SX1280.h"
+#include "TallyBurst.h"
 #include "TallyConfig.h"
 #include "TallyLink.h"
 #include "TallyProtocol.h"
@@ -40,6 +41,11 @@ static inline void tallyApplyRadioProfile(E28Radio &radio, int8_t txPowerDbm) {
 // correct: its telemetry would be stale, and the hub marking it unreachable IS
 // the signal we want.
 //
+// The frame reports the state this slave is actually DISPLAYING plus a
+// MAC-derived device tag, so the hub can verify the fleet rather than assume it
+// — and can notice two devices claiming the same camera ID (easy to do by
+// accident now that the ID lives in NVS, and previously invisible).
+//
 // `allowNow` lets a firmware defer around UI-critical sections (the locator
 // blink, where a blocking ~43ms send would stutter the pattern). battMv=0 +
 // noBattery until a VBAT divider is wired.
@@ -48,43 +54,37 @@ static inline void tallyTelemetryTick(E28Radio &radio, TallyLink &link,
   static uint8_t lastSentHb = 0;
   static bool haveSent = false;
 
-  if (!allowNow || !radio.isConnected() || !link.hbSeen())
-    return;
-  if (camId < 1 || camId > 16)
+  if (!allowNow || !radio.isConnected())
     return;
 
-  uint8_t slot = (uint8_t)((camId - 1) % TALLY_TLM_CYCLES);
-  uint8_t hb = link.lastHbCount();
-  if ((uint8_t)(hb % TALLY_TLM_CYCLES) != slot)
-    return; // not our cycle
-  if (haveSent && hb == lastSentHb)
-    return; // already transmitted in this cycle
-
-  uint32_t bank = (uint32_t)(camId - 1) / TALLY_TLM_CYCLES; // 0: ids 1-8, 1: 9-16
-  uint32_t dueAt =
-      link.lastHbAtMs() + TALLY_TLM_OFFSET_MS + bank * TALLY_TLM_BANK_MS;
-  if ((int32_t)(millis() - dueAt) < 0)
-    return; // our slot hasn't opened yet
-  // Slot already passed (we were busy in the locator or a long RX drain) —
-  // skip this cycle rather than transmit late into the next device's slot.
-  if (millis() - dueAt > TALLY_TLM_BANK_MS)
-    return;
-  // A frame arrived within the last frame-time: the hub is mid change-burst, so
-  // transmitting now would collide with a copy we actually care about. Telemetry
-  // is observability — yield. (Slots cannot avoid bursts entirely: burst offsets
-  // are measured from the CUT, not from a heartbeat. The hub's reachability
-  // window is 3 telemetry periods, so single skips are absorbed.)
-  if (link.msSinceLastRx() < 50)
+  TallySlotInputs in;
+  in.now = millis();
+  in.camId = camId;
+  in.hbSeen = link.hbSeen();
+  in.hbCount = link.lastHbCount();
+  in.hbAtMs = link.lastHbAtMs();
+  in.burstInFlight = link.burstInFlight();
+  in.sentThisCycle = haveSent && (link.lastHbCount() == lastSentHb);
+  if (!tallySlotDue(in)) // all the timing rules live in one testable function
     return;
 
-  lastSentHb = hb;
+  lastSentHb = link.lastHbCount();
   haveSent = true;
 
+  // Fold the eFuse MAC into one byte; 0 is reserved for "no tag".
+  static uint8_t tag = 0;
+  if (tag == 0) {
+    uint64_t mac = ESP.getEfuseMac();
+    for (int i = 0; i < 8; i++)
+      tag ^= (uint8_t)(mac >> (8 * i));
+    if (tag == 0)
+      tag = 1;
+  }
   TallyPacket t = TallyProtocol::createTelemetryPacket(
-      camId, radio.getRSSI(), link.missedBeats(), 0, true);
+      camId, radio.getRSSI(), link.missedBeats(), 0, true, link.state(), tag);
   uint8_t buf[TALLY_PACKET_SIZE];
   TallyProtocol::serialize(t, buf);
-  radio.send(buf, TALLY_PACKET_SIZE); // blocking, ~43ms of airtime
+  radio.send(buf, TALLY_PACKET_SIZE); // blocking, ~51ms of airtime
   radio.restartReceive();             // back to listening
 }
 

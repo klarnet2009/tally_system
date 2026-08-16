@@ -65,7 +65,7 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
   // (CPOL=0/CPHA=0); assert it explicitly instead of relying on the Arduino
   // default. The bus is dedicated to the radio, so configuring it once here
   // (the HW retains mode/bitorder/clock until changed) is sufficient.
-  // 4 MHz, deliberately far below the chip's 18 MHz max: our frames are 8
+  // 4 MHz, deliberately far below the chip's 18 MHz max: our frames are 9
   // bytes so SPI speed is irrelevant, while jumper-wire/module-socket wiring
   // plus GPIO-matrix routing erode setup/hold margin at 8 MHz+ — marginal
   // timing there shows up as exactly the "init sometimes fails" flakiness.
@@ -628,7 +628,16 @@ uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
   uint8_t bufferOffset = bufStatus[1];
 
   if (payloadLen > maxLen) {
-    payloadLen = maxLen;
+    // Do NOT truncate. Silently clamping handed callers a buffer that looked the
+    // right length, so the protocol's exact-length check could never fire and a
+    // foreign 24-byte frame arrived indistinguishable from one of ours. A frame
+    // that does not fit our fixed size is not ours: drop it and re-arm.
+    // COUNTED, though: dropping it silently would make a co-located foreign
+    // system — the exact thing this rejects — invisible in `rxerr` and in the
+    // slaves' RX_FAIL dump, the only two diagnostics that would reveal it.
+    _rxErrors++;
+    clearIrqStatus();
+    return 0;
   }
 
   // Read data from buffer

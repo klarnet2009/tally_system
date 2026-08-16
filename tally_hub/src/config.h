@@ -48,4 +48,8 @@ static uint8_t TALLY_INPUTS[8] = {1,2,3,4,5,6,7,8};
 #define WIFI_RETRY_MS  8000
 #define ATEM_RETRY_MS  5000          // Wait between connection attempts
 #define ATEM_CONNECT_TIMEOUT_MS 5000 // Give up a single attempt after this
-#define POLL_MS         100
+// ATEM poll period. This is IN SERIES with the radio latency: at 100ms it added
+// up to 100ms before the radio even started, putting worst-case end-to-end
+// tally at ~190ms against a 200ms budget. UDP polling is cheap, so 30ms buys
+// back the margin (worst case ~120ms).
+#define POLL_MS         30

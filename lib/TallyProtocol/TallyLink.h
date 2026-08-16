@@ -62,12 +62,18 @@ public:
     bool everHeard() const { return _everHeard; }
 
     // ---- Telemetry slotting time base ----
-    // The heartbeat carries a cycle counter, so the fleet shares a clock with
-    // no extra protocol. A camera transmits only in its own cycle, at a fixed
-    // offset after that heartbeat ARRIVED here.
+    // The heartbeat carries a cycle counter, so the fleet shares a clock with no
+    // extra protocol. A camera transmits only in its own cycle, at a fixed offset
+    // after that HEARTBEAT arrived — burst copies update the cycle number but
+    // deliberately NOT the anchor time, because they land at arbitrary offsets
+    // from a cut and would drag the slot onto the hub's next copy.
     uint8_t lastHbCount() const { return _lastHbCount; }
     uint32_t lastHbAtMs() const { return _lastHbAtMs; }
     bool hbSeen() const { return _hbSeen; }
+    // A change burst is in flight: the hub says so with a wire flag, and a slave
+    // must not transmit telemetry into it. Latched on a burst copy and cleared by
+    // the next lone heartbeat, so it covers the whole burst.
+    bool burstInFlight() const { return _burstInFlight; }
 
 private:
     uint8_t _cameraId = 1;
@@ -81,6 +87,8 @@ private:
     uint32_t _poorWindowStart = 0;
     uint8_t _lastHbCount = 0;
     uint32_t _lastHbAtMs = 0;
+    bool _burstInFlight = false;
+    uint32_t _burstSinceMs = 0;
     bool _hbSeen = false;
     StateCallback _onState = nullptr;
     LocatorCallback _onLocator = nullptr;

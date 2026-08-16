@@ -11,6 +11,7 @@ static TallyPacket makeFrame(uint8_t cmd, uint8_t flags, uint8_t d0, uint8_t d1,
   p.data[3] = d3;
   p.data[4] = d4;
   p.data[5] = d5;
+  p.crc = TallyProtocol::calculateCRC(p);
   return p;
 }
 
@@ -19,8 +20,11 @@ TallyPacket TallyProtocol::createStateAllPacket(uint16_t progMask,
                                                 bool sourceLive,
                                                 uint8_t hbCount,
                                                 uint8_t chanIdx,
-                                                uint8_t chanCountdown) {
+                                                uint8_t chanCountdown,
+                                                bool burstCopy) {
   uint8_t flags = sourceLive ? TALLY_FLAG_SOURCE_LIVE : 0;
+  if (burstCopy)
+    flags |= TALLY_FLAG_BURST;
   uint8_t chanByte = (uint8_t)(((chanIdx & 0x0F) << 4) | (chanCountdown & 0x0F));
   return makeFrame(CMD_STATE_ALL, flags, (uint8_t)(progMask & 0xFF),
                    (uint8_t)(progMask >> 8), (uint8_t)(prevMask & 0xFF),
@@ -33,13 +37,16 @@ TallyPacket TallyProtocol::createPingPacket(uint8_t cameraId) {
 
 TallyPacket TallyProtocol::createTelemetryPacket(uint8_t cameraId, int8_t rssi,
                                                  uint8_t missedBeats,
-                                                 uint16_t battMv,
-                                                 bool noBattery) {
+                                                 uint16_t battMv, bool noBattery,
+                                                 TallyState shown,
+                                                 uint8_t deviceTag) {
   uint8_t flags = noBattery ? TALLY_FLAG_NO_BATTERY : 0;
+  flags |= (uint8_t)(((uint8_t)shown << TALLY_TLM_STATE_SHIFT) &
+                     TALLY_TLM_STATE_MASK);
   if (missedBeats > 15)
     missedBeats = 15; // a hint for the hub, not a measurement — clamp it
   return makeFrame(CMD_TELEMETRY, flags, cameraId, (uint8_t)rssi, missedBeats,
-                   (uint8_t)(battMv & 0xFF), (uint8_t)(battMv >> 8), 0);
+                   (uint8_t)(battMv & 0xFF), (uint8_t)(battMv >> 8), deviceTag);
 }
 
 TallyState TallyProtocol::stateForCamera(const TallyPacket &p,
@@ -62,7 +69,10 @@ void TallyProtocol::serialize(const TallyPacket &p, uint8_t *buffer) {
 
 bool TallyProtocol::deserialize(const uint8_t *buffer, uint8_t len,
                                 TallyPacket &p) {
-  if (len < TALLY_PACKET_SIZE) {
+  // EXACT length, not a minimum: every frame we emit is this size, so a longer
+  // reception is by definition not ours. Free, and it rejects foreign traffic
+  // that would otherwise have to be caught by the checksum alone.
+  if (len != TALLY_PACKET_SIZE) {
     return false;
   }
   // Cheapest reject first: byte 0 pins version AND network, so a single
@@ -83,12 +93,29 @@ bool TallyProtocol::validate(const TallyPacket &p) {
   if (p.verNet != TALLY_VERNET_BYTE) {
     return false;
   }
-  // Integrity is the PHY's job: the SX1280 checks CRC-16 in hardware and the
-  // driver drops CrcError/HeaderError receptions, so a frame arriving here is
-  // already known intact. All that remains is rejecting an unknown command.
   uint8_t c = cmd(p);
   if (c != CMD_STATE_ALL && c != CMD_PING && c != CMD_TELEMETRY) {
     return false;
   }
+  // Not an integrity check — the PHY already did that in hardware. This is an
+  // AUTHENTICITY check: it is what stops a foreign SX1280 frame that happens to
+  // start with our version+netId byte from being decoded as a tally state.
+  if (p.crc != calculateCRC(p)) {
+    return false;
+  }
   return true;
+}
+
+uint8_t TallyProtocol::calculateCRC(const TallyPacket &p) {
+  static_assert(sizeof(TallyPacket) == TALLY_PACKET_SIZE,
+                "TallyPacket layout != wire size");
+  // CRC-8/CCITT (poly 0x07, init 0x00) over every byte but the CRC itself.
+  const uint8_t *data = (const uint8_t *)&p;
+  uint8_t crc = 0x00;
+  for (uint8_t i = 0; i < TALLY_PACKET_SIZE - 1; i++) {
+    crc ^= data[i];
+    for (uint8_t b = 0; b < 8; b++)
+      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+  }
+  return crc;
 }

@@ -6,17 +6,22 @@
 #include "TallyConfig.h"
 
 // ===== Protocol v4 =====
-// 8-byte frame. Deliberately NOT 9: the LoRa payload symbol count quantizes,
-// so 4..8 bytes all cost 43.2 ms at SF9/BW406/CR4-6 while 9 bytes costs
-// 50.7 ms — the 8th byte is free, and it buys the heartbeat counter that makes
-// collision-free telemetry slotting possible.
+// 9-byte frame: 8 bytes of content plus a CRC-8.
 //
-// What v3 carried and v4 drops:
-//  - start byte:   the LoRa PHY sync word already frames the packet.
-//  - app CRC-8:    the PHY CRC-16 is computed and checked in HARDWARE, and the
-//                  driver discards CrcError receptions before they reach this
-//                  layer. A second software CRC cost airtime, not safety.
-//                  (Deliberate decision to trust the PHY CRC.)
+// The CRC was briefly removed on the argument that the PHY already checks a
+// hardware CRC-16, which is true — and beside the point. A CRC proves INTEGRITY
+// ("no bits flipped"); it says nothing about AUTHENTICITY ("this frame is ours").
+// Without an app checksum the only filter left was byte 0 plus a 3-of-16 command
+// whitelist, so roughly 1 foreign LoRa frame in 1400 — from any co-located
+// SX1280 system on the same SF/BW/sync word, including a second tally rig — would
+// be accepted as a STATE_ALL and decoded into tally colours with nothing
+// anywhere able to notice. That is the exact failure the architecture promises
+// can never happen, so the byte is worth its airtime: the frame goes 43.2 ms ->
+// 50.7 ms (+17%, heartbeat duty 8.6% -> 10.1%) and the odds go to ~1 in 350,000.
+//
+// What v3 carried and v4 still drops:
+//  - start byte:   the LoRa PHY sync word already frames the packet, and the
+//                  version+netId byte is a stronger discriminator than 0xAA.
 //  - SET_POWER:    uplink ADR is gone — it bought ~1% duty cycle and
 //                  contaminated the channel decision (ARCHITECTURE_RF_V4 §9).
 //  - SET_CHANNEL:  channel switches now ride inside the STATE_ALL heartbeat, so
@@ -26,7 +31,7 @@
 // Byte 0 pins version AND network, so a mixed-firmware fleet fails CLOSED: a v3
 // node rejects the frame and shows signal-lost rather than decoding a different
 // layout as a tally colour.
-#define TALLY_PACKET_SIZE 8
+#define TALLY_PACKET_SIZE 9
 #define TALLY_PROTOCOL_VERSION 0x4
 
 // byte 0 = [version:4][netId:4]
@@ -46,8 +51,15 @@ enum TallyCmd : uint8_t {
 
 // STATE_ALL flag nibble
 #define TALLY_FLAG_SOURCE_LIVE 0x1 // hub's tally source (ATEM) is fresh
+// This frame is a copy of a CHANGE BURST, not a lone heartbeat. A receiver needs
+// to know, because it must not transmit telemetry into a burst — and it cannot
+// infer it from the cycle counter without coupling two unrelated jobs into one
+// field, which deadlocked the counter when bursts overlapped every heartbeat.
+#define TALLY_FLAG_BURST 0x2
 // TELEMETRY flag nibble
 #define TALLY_FLAG_NO_BATTERY 0x1 // slave has no battery-sense divider wired
+#define TALLY_TLM_STATE_SHIFT 1   // bits 1-2: the state the slave is displaying
+#define TALLY_TLM_STATE_MASK 0x6
 
 // Camera states
 enum TallyState : uint8_t {
@@ -61,15 +73,23 @@ enum TallyState : uint8_t {
 //
 //  STATE_ALL: [0]=prog_lo [1]=prog_hi [2]=prev_lo [3]=prev_hi
 //             [4]=[chanIdx:4][countdown:4]  (countdown 0 = no switch pending)
-//             [5]=heartbeat counter (mod 256)
+//             [5]=heartbeat counter (mod 256) — advances on the heartbeat TIMER,
+//                unconditionally, so it is a steady shared clock
+//             flags bit1 = this is a burst copy (see TALLY_FLAG_BURST)
 //  PING:      [0]=target camera id (0xFF = all)
 //  TELEMETRY: [0]=camId [1]=rssi(int8) [2]=missed heartbeats (0..15)
 //             [3]=batt_lo [4]=batt_hi
+//             [5]=device tag (MAC-derived, never 0) — lets the hub notice TWO
+//                devices claiming the same camera ID, which NVS provisioning
+//                makes easy to do by accident and was otherwise invisible.
+//             flags bits 1-2 = the tally state this slave is actually DISPLAYING,
+//                so the hub can verify what the fleet shows rather than assume.
 #pragma pack(push, 1)
 struct TallyPacket {
   uint8_t verNet;
   uint8_t cmdFlags;
   uint8_t data[6];
+  uint8_t crc; // CRC-8/CCITT over bytes 0..7 — authenticity, not integrity
 };
 #pragma pack(pop)
 
@@ -80,12 +100,14 @@ public:
   static TallyPacket createStateAllPacket(uint16_t progMask, uint16_t prevMask,
                                           bool sourceLive, uint8_t hbCount,
                                           uint8_t chanIdx = 0,
-                                          uint8_t chanCountdown = 0);
+                                          uint8_t chanCountdown = 0,
+                                          bool burstCopy = false);
   static TallyPacket createPingPacket(uint8_t cameraId);
   // ---- Build (slave -> hub) ----
   static TallyPacket createTelemetryPacket(uint8_t cameraId, int8_t rssi,
                                            uint8_t missedBeats, uint16_t battMv,
-                                           bool noBattery);
+                                           bool noBattery, TallyState shown,
+                                           uint8_t deviceTag);
 
   // ---- Read ----
   static uint8_t cmd(const TallyPacket &p) { return (uint8_t)(p.cmdFlags >> 4); }
@@ -96,6 +118,9 @@ public:
   static TallyState stateForCamera(const TallyPacket &p, uint8_t cameraId);
   static bool sourceLive(const TallyPacket &p) {
     return (p.cmdFlags & TALLY_FLAG_SOURCE_LIVE) != 0;
+  }
+  static bool isBurstCopy(const TallyPacket &p) {
+    return (p.cmdFlags & TALLY_FLAG_BURST) != 0;
   }
   static uint16_t progMask(const TallyPacket &p) {
     return (uint16_t)p.data[0] | ((uint16_t)p.data[1] << 8);
@@ -121,11 +146,18 @@ public:
   static bool telemetryNoBattery(const TallyPacket &p) {
     return (p.cmdFlags & TALLY_FLAG_NO_BATTERY) != 0;
   }
+  // What the slave says it is actually displaying (not what we told it to).
+  static TallyState telemetryShown(const TallyPacket &p) {
+    return (TallyState)((p.cmdFlags & TALLY_TLM_STATE_MASK) >>
+                        TALLY_TLM_STATE_SHIFT);
+  }
+  static uint8_t telemetryTag(const TallyPacket &p) { return p.data[5]; }
 
   // ---- Wire ----
   static void serialize(const TallyPacket &p, uint8_t *buffer);
   static bool deserialize(const uint8_t *buffer, uint8_t len, TallyPacket &p);
   static bool validate(const TallyPacket &p);
+  static uint8_t calculateCRC(const TallyPacket &p);
 };
 
 #endif // TALLY_PROTOCOL_H
