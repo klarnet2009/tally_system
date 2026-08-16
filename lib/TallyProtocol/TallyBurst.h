@@ -48,10 +48,17 @@ public:
   }
 
   bool idle() const { return _idx >= _copies; }
-  // A multi-copy group is a change burst; a single copy is a heartbeat. The hub
-  // puts this on the wire (TALLY_FLAG_BURST) so receivers can hold telemetry off
-  // without having to infer it from the cycle counter.
-  bool isBurst() const { return _copies > 1; }
+  // Does the copy about to be sent carry TALLY_FLAG_BURST?
+  //
+  // Every copy of a multi-copy group EXCEPT THE LAST. The exception is
+  // load-bearing: the flag tells a receiver to hold telemetry off and not to
+  // re-anchor its slot, and something has to release both. A lone heartbeat used
+  // to do that, but heartbeats are suppressed while a burst runs — so cuts
+  // arriving faster than the burst span starved them completely, latching the
+  // hold on and freezing the anchor until the hub declared the whole fleet
+  // offline. The final copy is the natural release point: nothing follows it, so
+  // anchoring on it cannot aim an uplink at a later copy.
+  bool flagAsBurst() const { return _copies > 1 && _idx + 1 < _copies; }
   uint8_t pending() const { return idle() ? 0 : (uint8_t)(_copies - _idx); }
 
   // A copy is due for transmission now.
@@ -111,5 +118,39 @@ public:
 private:
   uint32_t _deferSince = 0;
 };
+
+// ===== Telemetry slot decision =====
+// Pure, so the hub/slave coupling that produced every regression of the last
+// three review passes is finally testable: cycle number vs slot anchor, the
+// burst hold, the late-window, and the once-per-cycle rule all interact here and
+// nowhere else.
+struct TallySlotInputs {
+  uint32_t now = 0;
+  uint8_t camId = 0;
+  bool hbSeen = false;
+  uint8_t hbCount = 0;      // cycle number from the latest hub frame
+  uint32_t hbAtMs = 0;      // arrival of the frame that ANCHORS the slot
+  bool burstInFlight = false;
+  bool sentThisCycle = false; // already transmitted for hbCount
+};
+
+static inline bool tallySlotDue(const TallySlotInputs &in) {
+  if (!in.hbSeen || in.camId < 1 || in.camId > 16)
+    return false;
+  if (in.burstInFlight)
+    return false; // never transmit into a change burst
+  if (in.sentThisCycle)
+    return false;
+  uint8_t slot = (uint8_t)((in.camId - 1) % TALLY_TLM_CYCLES);
+  if ((uint8_t)(in.hbCount % TALLY_TLM_CYCLES) != slot)
+    return false; // not our cycle
+  uint32_t bank = (uint32_t)(in.camId - 1) / TALLY_TLM_CYCLES;
+  uint32_t dueAt = in.hbAtMs + TALLY_TLM_OFFSET_MS + bank * TALLY_TLM_BANK_MS;
+  if ((int32_t)(in.now - dueAt) < 0)
+    return false; // slot has not opened
+  if (in.now - dueAt > TALLY_TLM_LATE_MS)
+    return false; // too late: would run into the next bank's slot
+  return true;
+}
 
 #endif // TALLY_BURST_H

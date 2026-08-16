@@ -62,6 +62,24 @@ int main() {
     CHECK_EQ(TallyProtocol::stateForCamera(p, 15), STATE_OFF);
   }
 
+  CASE("the burst flag round-trips and does not collide with source-live");
+  {
+    TallyPacket a = TallyProtocol::createStateAllPacket(1, 2, true, 5, 0, 0, true);
+    CHECK(TallyProtocol::isBurstCopy(a));
+    CHECK(TallyProtocol::sourceLive(a));
+    TallyPacket b = TallyProtocol::createStateAllPacket(1, 2, false, 5, 0, 0, true);
+    CHECK(TallyProtocol::isBurstCopy(b));
+    CHECK(!TallyProtocol::sourceLive(b));
+    TallyPacket c = TallyProtocol::createStateAllPacket(1, 2, true, 5);
+    CHECK(!TallyProtocol::isBurstCopy(c)); // default: a lone heartbeat
+    // and it survives the wire
+    uint8_t buf[TALLY_PACKET_SIZE];
+    TallyProtocol::serialize(a, buf);
+    TallyPacket q;
+    CHECK(TallyProtocol::deserialize(buf, sizeof(buf), q));
+    CHECK(TallyProtocol::isBurstCopy(q));
+  }
+
   CASE("PING carries its target, broadcast included");
   {
     TallyPacket p = TallyProtocol::createPingPacket(7);

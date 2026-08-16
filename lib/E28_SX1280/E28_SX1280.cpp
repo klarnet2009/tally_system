@@ -632,6 +632,10 @@ uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
     // right length, so the protocol's exact-length check could never fire and a
     // foreign 24-byte frame arrived indistinguishable from one of ours. A frame
     // that does not fit our fixed size is not ours: drop it and re-arm.
+    // COUNTED, though: dropping it silently would make a co-located foreign
+    // system — the exact thing this rejects — invisible in `rxerr` and in the
+    // slaves' RX_FAIL dump, the only two diagnostics that would reveal it.
+    _rxErrors++;
     clearIrqStatus();
     return 0;
   }

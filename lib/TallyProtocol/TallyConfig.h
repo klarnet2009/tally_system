@@ -66,7 +66,11 @@
 // Checked, not asserted-by-hand: the previous guard static_asserted a #define
 // that a human had to remember to update, so editing the table to start at 20 ms
 // left the assert passing while every latency-critical first copy went out late.
-constexpr uint16_t kTallyBurstOffsets[] = TALLY_BURST_OFFSETS_MS;
+// `inline` matters: a plain namespace-scope constexpr array in a header has
+// INTERNAL linkage, so the inline function returning a pointer to it would bind
+// to a different object per translation unit — an ODR violation, plus a private
+// copy in every TU's .rodata.
+inline constexpr uint16_t kTallyBurstOffsets[] = TALLY_BURST_OFFSETS_MS;
 static_assert(sizeof(kTallyBurstOffsets) / sizeof(kTallyBurstOffsets[0]) ==
                   TALLY_BURST_COPIES_MAX,
               "TALLY_BURST_OFFSETS_MS must have TALLY_BURST_COPIES_MAX entries");
@@ -136,6 +140,12 @@ static_assert(kTallyBurstOffsets[0] == 0,
 
 // ===== Coordinated channel switch =====
 #define TALLY_CHAN_ANNOUNCE_BEATS 10 // heartbeats of countdown before switching
+// The countdown is a 4-bit wire field and the hub requests a switch against the
+// NEXT cycle (the current one's frame has already gone out), so the largest
+// announceable value is 14, not 15. At 15 the first countdown would be 16, which
+// reads as "expired" and retunes the hub with ZERO announcements.
+static_assert(TALLY_CHAN_ANNOUNCE_BEATS <= 14,
+              "announce beats must leave room for the +1 next-cycle offset");
 // Slaves retune this much AFTER their computed switch instant, so a small
 // clock skew makes them late (still covered by the beacon) rather than early
 // (missing the hub's last heartbeats on the old channel).
@@ -160,7 +170,9 @@ static_assert(TALLY_TLM_CYCLES >= 2, "telemetry needs at least two cycles");
 // one frame at the current profile.
 static_assert(TALLY_TLM_LATE_MS + 51 <= TALLY_TLM_BANK_MS,
               "late-slot tolerance would let bank 0 overlap bank 1");
-static_assert(TALLY_TLM_OFFSET_MS + TALLY_TLM_BANK_MS + 51 < TALLY_REFRESH_MS,
-              "telemetry slots must fit inside one heartbeat cycle");
+static_assert(TALLY_TLM_OFFSET_MS + TALLY_TLM_BANK_MS + TALLY_TLM_LATE_MS + 51 <
+                  TALLY_REFRESH_MS,
+              "telemetry slots must fit inside one heartbeat cycle even when a "
+              "bank-1 camera uses its full late tolerance");
 
 #endif // TALLY_CONFIG_H

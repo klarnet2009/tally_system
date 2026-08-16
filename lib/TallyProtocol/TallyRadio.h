@@ -2,6 +2,7 @@
 #define TALLY_RADIO_H
 
 #include "E28_SX1280.h"
+#include "TallyBurst.h"
 #include "TallyConfig.h"
 #include "TallyLink.h"
 #include "TallyProtocol.h"
@@ -53,37 +54,21 @@ static inline void tallyTelemetryTick(E28Radio &radio, TallyLink &link,
   static uint8_t lastSentHb = 0;
   static bool haveSent = false;
 
-  if (!allowNow || !radio.isConnected() || !link.hbSeen())
-    return;
-  if (camId < 1 || camId > 16)
+  if (!allowNow || !radio.isConnected())
     return;
 
-  uint8_t slot = (uint8_t)((camId - 1) % TALLY_TLM_CYCLES);
-  uint8_t hb = link.lastHbCount();
-  if ((uint8_t)(hb % TALLY_TLM_CYCLES) != slot)
-    return; // not our cycle
-  if (haveSent && hb == lastSentHb)
-    return; // already transmitted in this cycle
-
-  uint32_t bank = (uint32_t)(camId - 1) / TALLY_TLM_CYCLES; // 0: ids 1-8, 1: 9-16
-  uint32_t dueAt =
-      link.lastHbAtMs() + TALLY_TLM_OFFSET_MS + bank * TALLY_TLM_BANK_MS;
-  if ((int32_t)(millis() - dueAt) < 0)
-    return; // our slot hasn't opened yet
-  // Slot already passed (we were busy in the locator or a long RX drain) — skip
-  // this cycle rather than transmit late into the next bank's slot.
-  if (millis() - dueAt > TALLY_TLM_LATE_MS)
-    return;
-  // NEVER transmit into a change burst. The hub flags its copies, because a
-  // receiver cannot otherwise tell them from a heartbeat and no "time since last
-  // frame" guard can work: the copies are 60-210 ms apart, so a slave that
-  // received copy 2 would fire its 51 ms uplink squarely onto copy 3 — missing
-  // that copy itself AND radiating over it for every other camera in range.
-  // Telemetry is observability; the burst is the primary reliability mechanism.
-  if (link.burstInFlight())
+  TallySlotInputs in;
+  in.now = millis();
+  in.camId = camId;
+  in.hbSeen = link.hbSeen();
+  in.hbCount = link.lastHbCount();
+  in.hbAtMs = link.lastHbAtMs();
+  in.burstInFlight = link.burstInFlight();
+  in.sentThisCycle = haveSent && (link.lastHbCount() == lastSentHb);
+  if (!tallySlotDue(in)) // all the timing rules live in one testable function
     return;
 
-  lastSentHb = hb;
+  lastSentHb = link.lastHbCount();
   haveSent = true;
 
   // Fold the eFuse MAC into one byte; 0 is reserved for "no tag".

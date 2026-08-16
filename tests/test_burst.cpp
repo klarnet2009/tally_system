@@ -179,5 +179,104 @@ int main() {
     CHECK(!g.clear(1006 + TALLY_LBT_MAX_DEFER_MS - 1, false, true));
   }
 
+  testSetMillis(0);
+  CASE("burst flag: every copy EXCEPT the last, so something releases the hold");
+  {
+    // The last copy is deliberately unflagged. It is what clears the receiver's
+    // telemetry hold and re-anchors its slot — and nothing follows it, so
+    // anchoring there cannot aim an uplink at a later copy. Without this,
+    // sustained cutting starved the lone heartbeat and the hold latched on
+    // forever, stopping the entire fleet's telemetry.
+    TallyBurst b; b.reset(0);
+    b.onChange(0, false);
+    for (int i = 0; i < TALLY_BURST_COPIES_MIN - 1; i++) {
+      CHECK(b.flagAsBurst());
+      b.markSent(0);
+    }
+    CHECK(!b.flagAsBurst()); // final copy releases
+    b.markSent(0);
+    CHECK(b.idle());
+  }
+
+  testSetMillis(0);
+  CASE("a lone heartbeat is never flagged as a burst copy");
+  {
+    TallyBurst b; b.reset(0);
+    b.scheduleHeartbeat(0);
+    CHECK(!b.flagAsBurst());
+  }
+
+  printf("== telemetry slot ==\n");
+
+  auto slotIn = [](uint32_t now, uint8_t cam, uint8_t hb, uint32_t hbAt) {
+    TallySlotInputs i;
+    i.now = now; i.camId = cam; i.hbSeen = true; i.hbCount = hb; i.hbAtMs = hbAt;
+    return i;
+  };
+
+  CASE("a camera transmits only in its own cycle, at its own bank offset");
+  {
+    // cam 1 -> slot 0, bank 0; cam 9 -> slot 0, bank 1
+    CHECK(tallySlotDue(slotIn(1000 + TALLY_TLM_OFFSET_MS, 1, 8, 1000)));
+    CHECK(!tallySlotDue(slotIn(1000 + TALLY_TLM_OFFSET_MS, 1, 9, 1000)));
+    CHECK(tallySlotDue(
+        slotIn(1000 + TALLY_TLM_OFFSET_MS + TALLY_TLM_BANK_MS, 9, 8, 1000)));
+    // ...and cam 9 must NOT fire in cam 1's window
+    CHECK(!tallySlotDue(slotIn(1000 + TALLY_TLM_OFFSET_MS, 9, 8, 1000)));
+  }
+
+  CASE("the slot opens and closes; a late frame must not run into bank 1");
+  {
+    uint32_t open = 1000 + TALLY_TLM_OFFSET_MS;
+    CHECK(!tallySlotDue(slotIn(open - 1, 1, 8, 1000)));
+    CHECK(tallySlotDue(slotIn(open, 1, 8, 1000)));
+    CHECK(tallySlotDue(slotIn(open + TALLY_TLM_LATE_MS, 1, 8, 1000)));
+    CHECK(!tallySlotDue(slotIn(open + TALLY_TLM_LATE_MS + 1, 1, 8, 1000)));
+    // the closing bound must leave a whole frame before bank 1 opens
+    CHECK(TALLY_TLM_LATE_MS + 51 <= TALLY_TLM_BANK_MS);
+  }
+
+  CASE("a burst in flight silences telemetry regardless of the slot");
+  {
+    TallySlotInputs i = slotIn(1000 + TALLY_TLM_OFFSET_MS, 1, 8, 1000);
+    CHECK(tallySlotDue(i));
+    i.burstInFlight = true;
+    CHECK(!tallySlotDue(i));
+  }
+
+  CASE("one transmission per cycle, and nothing before the first heartbeat");
+  {
+    TallySlotInputs i = slotIn(1000 + TALLY_TLM_OFFSET_MS, 1, 8, 1000);
+    i.sentThisCycle = true;
+    CHECK(!tallySlotDue(i));
+    i.sentThisCycle = false;
+    i.hbSeen = false;
+    CHECK(!tallySlotDue(i));
+  }
+
+  CASE("an out-of-range camera id never transmits");
+  {
+    CHECK(!tallySlotDue(slotIn(1000 + TALLY_TLM_OFFSET_MS, 0, 8, 1000)));
+    CHECK(!tallySlotDue(slotIn(1000 + TALLY_TLM_OFFSET_MS, 17, 8, 1000)));
+  }
+
+  CASE("every camera 1..16 gets exactly one slot per 8 cycles, none colliding");
+  {
+    // Walk 8 cycles and check that at most two cameras are due at any instant,
+    // and never two in the same bank.
+    for (uint8_t hb = 0; hb < TALLY_TLM_CYCLES; hb++) {
+      uint8_t dueBank0 = 0, dueBank1 = 0;
+      for (uint8_t cam = 1; cam <= 16; cam++) {
+        uint32_t bank = (uint32_t)(cam - 1) / TALLY_TLM_CYCLES;
+        uint32_t at = 1000 + TALLY_TLM_OFFSET_MS + bank * TALLY_TLM_BANK_MS;
+        if (tallySlotDue(slotIn(at, cam, hb, 1000))) {
+          if (bank == 0) dueBank0++; else dueBank1++;
+        }
+      }
+      CHECK_EQ(dueBank0, 1);
+      CHECK_EQ(dueBank1, 1);
+    }
+  }
+
   return testSummary("TallyBurst/TallyLbt");
 }

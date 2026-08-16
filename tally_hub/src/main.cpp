@@ -295,7 +295,7 @@ static TallyPacket buildStateFrame() {
   return TallyProtocol::createStateAllPacket(
       g_progMask, g_prevMask, sourceLiveNow(), g_hbCount,
       g_chanSwitch.pending() ? g_chanSwitch.target() : 0,
-      g_chanSwitch.countdown(g_hbCount), g_burst.isBurst());
+      g_chanSwitch.countdown(g_hbCount), g_burst.flagAsBurst());
 }
 
 static void applyChannelSwitch() {
@@ -421,15 +421,14 @@ static void processTx() {
   // immediately — its latency is the whole point; later copies and heartbeats
   // yield briefly to an active interferer.
   if (g_burst.dueNow(millis())) {
-    // Short-circuit the MEASUREMENT (a blocking SPI read the first copy of a cut
-    // must never pay for), but still clear the deferral clock — skipping the call
-    // entirely left _deferSince set from an earlier deferral, so the NEXT copy saw
-    // its patience already spent and fired straight into the interferer.
-    if (g_burst.latencyCritical()) {
-      g_lbtState.reset();
-    } else if (!g_lbtState.clear(millis(), false, channelBusyNow())) {
+    // One call, one encoding. The && short-circuits the MEASUREMENT (a blocking
+    // SPI read the first copy of a cut must never pay for) while still letting
+    // clear() see latencyCritical — which is what resets the deferral clock.
+    // Hoisting that reset into a separate branch left the parameter dead in
+    // production, so the tested path and the live path were different code.
+    bool crit = g_burst.latencyCritical();
+    if (!g_lbtState.clear(millis(), crit, !crit && channelBusyNow()))
       return;
-    }
     TallyPacket pkt = buildStateFrame();
     uint8_t buf[TALLY_PACKET_SIZE];
     TallyProtocol::serialize(pkt, buf);
@@ -998,6 +997,24 @@ void setup() {
   delay(3000);
 }
 
+// Keep the fleet alive across a long blocking operation (the log dump streams
+// up to ~512KB at 115200 ≈ 45s; the band survey sweeps for ~9s). Without it the
+// loop freezes for longer than TALLY_SIGNAL_LOST_MS and every camera declares
+// signal-lost and starts channel-scanning, the TX watchdog fires, and the ATEM
+// session goes unserviced.
+//
+// It calls the REAL heartbeatTick(), deliberately: the cycle counter is the
+// fleet's shared clock and the channel-switch countdown is derived from it, so a
+// pump that invents its own beats runs the countdown off wall time.
+static void fleetPump() {
+  processTx();
+  serviceTelemetry();
+  heartbeatTick();
+#ifndef LORA_TEST_MODE
+  atemTick();
+#endif
+}
+
 // ===== Full-band survey =====
 // Sweep the entire 2.4 GHz ISM band and print where the energy actually is, so
 // the channel set can be chosen for THIS venue instead of assumed. It exists
@@ -1023,21 +1040,6 @@ void setup() {
 // sweep returns to the working channel periodically and sends one heartbeat.
 #define SURVEY_PUMP_MS 350
 
-// Return to the working channel, put one heartbeat on air, go back. Keeps the
-// fleet's link timers fed (and the TX watchdog satisfied) across a long sweep.
-static void surveyPump() {
-  radio.setFrequency(g_chanFreq);
-  radio.startReceive();
-  g_hbCount++;
-  g_burst.reset(millis());
-  g_burst.scheduleHeartbeat(millis());
-  uint32_t guard = millis();
-  while (!g_burst.idle() && millis() - guard < 300)
-    processTx();
-  while (radio.txActive() && millis() - guard < 300)
-    processTx();
-}
-
 static void bandSurvey(Stream *io) {
   if (!radio.isConnected()) {
     hublogf("[SURVEY] radio DEAD — fix the module first\n");
@@ -1045,6 +1047,12 @@ static void bandSurvey(Stream *io) {
   }
   if (radio.txActive() || !g_burst.idle()) {
     hublogf("[SURVEY] TX in flight — try again in a moment\n");
+    return;
+  }
+  // A survey while a switch is being announced would interleave off-channel
+  // sweeping with the countdown the whole fleet is timing against.
+  if (g_chanSwitch.pending() || g_oldChanFreq) {
+    hublogf("[SURVEY] a channel switch is in progress — try again after it\n");
     return;
   }
   (void)io; // the report goes to hublogf: both consoles AND the flash log
@@ -1071,7 +1079,12 @@ static void bandSurvey(Stream *io) {
   for (uint8_t pass = 0; pass < 2; pass++) {
     for (uint32_t i = 0; i < steps; i++) {
       if (millis() - lastPump > SURVEY_PUMP_MS) {
-        surveyPump();
+        radio.setFrequency(g_chanFreq); // pump must transmit on the REAL channel
+        radio.startReceive();
+        uint32_t guard = millis();
+        do {
+          fleetPump();
+        } while ((!g_burst.idle() || radio.txActive()) && millis() - guard < 300);
         lastPump = millis();
       }
       uint32_t f = SURVEY_LO_HZ + i * SURVEY_STEP_KHZ * 1000UL;
@@ -1118,6 +1131,10 @@ static void bandSurvey(Stream *io) {
         mark = (c == g_chanIdx) ? "<*" : "<c";
     hublogf("[SURVEY] %4lu.%lu %5d %4u%%  %s %s\n", f / 1000000UL,
             (f % 1000000UL) / 100000UL, (int)floorDbm[i], busyPct[i], bar, mark);
+    // ~90 lines to two consoles plus a LittleFS write is seconds of blocking on
+    // its own — the sweep is not the only part that can starve the heartbeat.
+    if ((i & 0x07) == 0)
+      fleetPump();
   }
 
   // Recommend a set: quietest steps first, spaced so two picks cannot sit inside
@@ -1218,18 +1235,7 @@ static void noiseSurvey() {
           "[NOISE] high floor with busy~0 is harmless, LoRa decodes below noise\n");
 }
 
-// The log dump streams up to ~512KB at 115200 ≈ 45s; without a pump the loop
-// would freeze that long — no heartbeats (fleet-wide signal-lost alarm at 3s
-// + AFA channel scans), a dropped ATEM connection, a stalled TX queue. The
-// dump calls this after every 256B chunk, keeping the fleet alive mid-dump.
-static void logDumpPump() {
-  processTx();
-  serviceTelemetry();
-  heartbeatTick();
-#ifndef LORA_TEST_MODE
-  atemTick();
-#endif
-}
+
 
 // ===== Serial console (both ports): status / ping / reinit / help =====
 // io = the port the command arrived on (log dumps go only there); nullptr
@@ -1369,8 +1375,8 @@ static void handleSerialCommand(const String &cmd, Stream *io = nullptr) {
     ESP.restart();
   } else if (cmd == "log") {
     // Field-log dump to the asking console only (up to ~512KB @115200 ≈ 45s;
-    // logDumpPump keeps heartbeats/ATEM/telemetry running between chunks)
-    TallyLog.dump(io ? *io : Serial, logDumpPump);
+    // fleetPump keeps heartbeats/ATEM/telemetry running between chunks)
+    TallyLog.dump(io ? *io : Serial, fleetPump);
   } else if (cmd == "logclear") {
     TallyLog.clear();
     hublogf("[LOG] cleared\n");

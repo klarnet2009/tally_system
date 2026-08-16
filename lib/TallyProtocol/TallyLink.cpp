@@ -56,10 +56,13 @@ bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
     _lastHbCount = TallyProtocol::hbCount(pkt);
     _hbSeen = true;
     if (TallyProtocol::isBurstCopy(pkt)) {
-      _burstInFlight = true; // hold telemetry off until a lone heartbeat returns
+      _burstInFlight = true; // held until the burst's final (unflagged) copy
+      _burstSinceMs = now;
     } else {
       _burstInFlight = false;
-      _lastHbAtMs = now; // only a real heartbeat anchors the telemetry slot
+      // Anchors the telemetry slot. Safe on the final copy of a burst as well as
+      // on a lone heartbeat, because in both cases nothing follows it.
+      _lastHbAtMs = now;
     }
 
     if (TallyProtocol::sourceLive(pkt))
@@ -94,6 +97,10 @@ void TallyLink::tick() {
     // source frozen for longer than the grace window. Riding out brief ATEM
     // reconnects, this avoids flicker while still catching a real freeze.
     _sourceStale = (millis() - _lastSourceLiveMs > TALLY_SOURCE_GRACE_MS);
+    // If the burst's releasing copy was itself lost, the hold must not stick:
+    // no burst spans anywhere near two heartbeats.
+    if (_burstInFlight && millis() - _burstSinceMs > 2 * TALLY_REFRESH_MS)
+      _burstInFlight = false;
     // Gradient window: fixed 30s buckets (a hint for the hub, not a
     // measurement — boundary resets are fine under its sustained trigger).
     if (millis() - _poorWindowStart > 30000) {

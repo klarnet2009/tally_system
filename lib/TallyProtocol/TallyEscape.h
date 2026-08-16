@@ -34,6 +34,7 @@
 // hostile.
 #define ESC_POOR_MISSED 3          // a talking camera missing this many beats
 #define ESC_DEGRADED_FRAC 0.30f    // share of talking cameras complaining
+#define ESC_DEGRADED_MIN_CAMS 2    // ...or this many, whatever the fleet size
 // 0.65 so 2-of-3 and 3-of-4 both count: at that point the fleet is effectively
 // down, and "severe" is also exactly the condition allowed to override the
 // on-air guard — one threshold, one meaning, no second constant to drift.
@@ -147,10 +148,13 @@ public:
     EscTier tier = ESC_NONE;
     if (v.complaining >= ESC_SEVERE_MIN_CAMS && frac >= ESC_SEVERE_FRAC) {
       tier = ESC_SEVERE;
-    } else if (v.talking >= 1 && frac >= ESC_DEGRADED_FRAC) {
-      // No minimum fleet size: the old `talking >= 3` gate meant a two-camera rig
-      // at 50% downlink failure got no tier at all — not even the extra burst
-      // copies — while the documentation promised a trigger at 30%.
+    } else if (v.complaining >= ESC_DEGRADED_MIN_CAMS ||
+               (v.talking >= 1 && frac >= ESC_DEGRADED_FRAC)) {
+      // Absolute count OR fraction. The fraction alone misses a large fleet: on
+      // 10 cameras, two losing frames is 20% and would raise nothing at all — no
+      // extra burst copies for the cameras that are actually suffering, and no
+      // gradient for the operator. Removing the old `talking >= 3` gate was
+      // right; dropping the absolute trigger with it was not.
       tier = ESC_DEGRADED;
     } else if (v.talking == 0 && v.silent >= 1 && in.busyValid &&
                in.busyFrac >= ESC_BLACKOUT_BUSY) {
@@ -294,8 +298,11 @@ public:
   void request(uint8_t targetChan, uint8_t hbNow, uint8_t beats) {
     if (beats < 2)
       beats = 2; // 1 would derive countdown 0 = "no switch pending"
-    if (beats > 15)
-      beats = 15; // the countdown is a 4-bit wire field
+    // 14, not 15: the hub requests against the NEXT cycle, so the first
+    // countdown on air is beats+1 and 16 would read as "already expired" —
+    // retuning with zero announcements, the exact failure this class prevents.
+    if (beats > 14)
+      beats = 14;
     _target = targetChan;
     _dueHb = (uint8_t)(hbNow + beats);
     _pending = true;

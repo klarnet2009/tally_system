@@ -88,6 +88,7 @@ private:
     uint8_t _lastHbCount = 0;
     uint32_t _lastHbAtMs = 0;
     bool _burstInFlight = false;
+    uint32_t _burstSinceMs = 0;
     bool _hbSeen = false;
     StateCallback _onState = nullptr;
     LocatorCallback _onLocator = nullptr;
