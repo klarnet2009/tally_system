@@ -97,3 +97,7 @@
 ## 2026-06-10 - Suspending Background UI Updates During High-Priority Sequences
 **Learning:** In systems with shared I2C peripherals like OLED displays, allowing periodic background tasks (e.g., `drawLoRaDebug()`) to execute unconditionally can overwrite transient, high-priority full-screen status messages (like the `LOCATOR` ping sequence). This not only causes UI flickering and rapid visual regressions but also wastes CPU cycles blocking on slow I2C transfers (~35ms per frame).
 **Action:** Introduce a boolean flag (e.g., `uiActive`) to track when high-priority UI states are active, and use it to suspend lower-priority, blocking screen updates. Avoid tying this suppression entirely to persistent background network states (like WiFi disconnection), as it can inadvertently cause permanent regressions by hiding diagnostic interfaces.
+
+## 2024-10-24 - Algorithmic Early Return for Network Packet Filtering
+**Learning:** In high-frequency radio packet processing loops, executing `deserialize()` functions that perform full memory copies and compute expensive mathematical checksums (like CRC) for every incoming packet wastes significant CPU time when the device is not the intended recipient.
+**Action:** Always implement a fast-path algorithmic early return before computationally expensive operations. Inspect the raw incoming buffer directly (e.g., extracting the command from `buf[1]` and target ID from `buf[2]`) to immediately bypass processing for packets not destined for the current device.
