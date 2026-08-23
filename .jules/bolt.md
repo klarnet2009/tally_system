@@ -97,3 +97,11 @@
 ## 2026-06-10 - Suspending Background UI Updates During High-Priority Sequences
 **Learning:** In systems with shared I2C peripherals like OLED displays, allowing periodic background tasks (e.g., `drawLoRaDebug()`) to execute unconditionally can overwrite transient, high-priority full-screen status messages (like the `LOCATOR` ping sequence). This not only causes UI flickering and rapid visual regressions but also wastes CPU cycles blocking on slow I2C transfers (~35ms per frame).
 **Action:** Introduce a boolean flag (e.g., `uiActive`) to track when high-priority UI states are active, and use it to suspend lower-priority, blocking screen updates. Avoid tying this suppression entirely to persistent background network states (like WiFi disconnection), as it can inadvertently cause permanent regressions by hiding diagnostic interfaces.
+
+## 2026-08-23 - [Algorithmic early-return to avoid deserialization overhead]
+**Learning:** In a hub-and-spoke polling broadcast setup, receiver nodes processing unaddressed PING commands waste CPU cycles on structure deserialization and CRC verification for packets not intended for them.
+**Action:** Add an algorithmic fast-path check directly examining the raw incoming buffer ( for camera ID and  for header) before running the full deserialization and verification steps. Skip the expensive procedures if the target ID doesn't match the receiver or broadcast ID.
+
+## 2026-08-23 - [Algorithmic early-return to avoid deserialization overhead]
+**Learning:** In a hub-and-spoke polling broadcast setup, receiver nodes processing unaddressed PING commands waste CPU cycles on structure deserialization and CRC verification for packets not intended for them.
+**Action:** Add an algorithmic fast-path check directly examining the raw incoming buffer (byte 2 for camera ID and byte 0 for header) before running the full deserialization and verification steps. Skip the expensive procedures if the target ID doesn't match the receiver or broadcast ID.
