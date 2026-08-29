@@ -97,3 +97,7 @@
 ## 2026-06-10 - Suspending Background UI Updates During High-Priority Sequences
 **Learning:** In systems with shared I2C peripherals like OLED displays, allowing periodic background tasks (e.g., `drawLoRaDebug()`) to execute unconditionally can overwrite transient, high-priority full-screen status messages (like the `LOCATOR` ping sequence). This not only causes UI flickering and rapid visual regressions but also wastes CPU cycles blocking on slow I2C transfers (~35ms per frame).
 **Action:** Introduce a boolean flag (e.g., `uiActive`) to track when high-priority UI states are active, and use it to suspend lower-priority, blocking screen updates. Avoid tying this suppression entirely to persistent background network states (like WiFi disconnection), as it can inadvertently cause permanent regressions by hiding diagnostic interfaces.
+
+## 2024-05-18 - Replacing procedural CRC with Lookup Table (LUT)
+**Learning:** Procedurally generating a CRC-8 using nested loops over bits is computationally intensive and introduces significant overhead on critical hot paths (like packet serialization/deserialization) on low-power devices. Replacing algorithmic operations with memory lookups provides drastic execution speedups on microcontrollers.
+**Action:** Replace procedural CRC computation with a precomputed Lookup Table (LUT). The table should be `static const` to ensure allocation into read-only memory, protecting SRAM and reducing latency to O(1) per byte.
