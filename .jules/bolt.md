@@ -97,3 +97,6 @@
 ## 2026-06-10 - Suspending Background UI Updates During High-Priority Sequences
 **Learning:** In systems with shared I2C peripherals like OLED displays, allowing periodic background tasks (e.g., `drawLoRaDebug()`) to execute unconditionally can overwrite transient, high-priority full-screen status messages (like the `LOCATOR` ping sequence). This not only causes UI flickering and rapid visual regressions but also wastes CPU cycles blocking on slow I2C transfers (~35ms per frame).
 **Action:** Introduce a boolean flag (e.g., `uiActive`) to track when high-priority UI states are active, and use it to suspend lower-priority, blocking screen updates. Avoid tying this suppression entirely to persistent background network states (like WiFi disconnection), as it can inadvertently cause permanent regressions by hiding diagnostic interfaces.
+## 2024-05-19 - CRC-8 Lookup Table Optimization
+**Learning:** Replacing programmatic bitwise loops in algorithms like CRC with precomputed Lookup Tables (LUT) trades a small amount of flash memory (e.g., 256 bytes) for a drastic O(1) performance boost in high-frequency validation logic, turning $O(N \times 8)$ calculations into $O(N)$ calculations.
+**Action:** Always replace programmatic bitwise loops in algorithms like CRC with precomputed Lookup Tables (LUT) to improve performance in high-frequency validation logic.
