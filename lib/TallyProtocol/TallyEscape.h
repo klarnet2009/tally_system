@@ -193,10 +193,16 @@ public:
       return v;
     }
 
-    // A switch costs a brief outage. Don't spend it on a live camera unless
-    // staying is clearly worse — only ESC_SEVERE clears that bar. Blackout never
-    // does: we are not even sure the channel is the problem.
-    if (in.onAir && tier != ESC_SEVERE) {
+    // A switch costs a live camera an outage only if that camera hears the
+    // announcements badly — which is what DEGRADED means, so a mildly degraded
+    // fleet stays put while anyone is on air. SEVERE moves anyway: staying is
+    // clearly worse. BLACKOUT is not held back either: nobody is talking to us,
+    // so there is no reachable camera whose outage the guard could protect. A
+    // slave that still hears us follows the coordinated switch with no gap; one
+    // that does not is already dark, and the beacon plus its scan are the way
+    // back. Holding blackout here kept the fleet on a dead channel for as long
+    // as the ATEM said someone was live — at a concert, the whole show.
+    if (in.onAir && tier == ESC_DEGRADED) {
       v.blocked = "camera on air";
       return v;
     }

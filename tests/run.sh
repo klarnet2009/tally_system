@@ -29,6 +29,9 @@ build_run t_protocol tests/test_protocol.cpp lib/TallyProtocol/TallyProtocol.cpp
 build_run t_link     tests/test_link.cpp     lib/TallyProtocol/TallyProtocol.cpp lib/TallyProtocol/TallyLink.cpp
 build_run t_burst    tests/test_burst.cpp
 build_run t_escape   tests/test_escape.cpp
+# The radio driver against a scripted SPI slave: checks the BYTES on the bus,
+# where a wrong register encoding is invisible to every other kind of test.
+build_run t_e28      tests/test_e28.cpp      lib/E28_SX1280/E28_SX1280.cpp lib/TallyProtocol/TallyProtocol.cpp lib/TallyProtocol/TallyLink.cpp
 
 if [ $fail -ne 0 ]; then
   echo "TESTS FAILED"

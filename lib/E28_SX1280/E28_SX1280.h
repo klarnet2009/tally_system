@@ -32,6 +32,28 @@
 // Packet types
 #define SX1280_PACKET_TYPE_LORA 0x01
 
+// LoRa SetPacketParams field encodings — these are the SX1280 values and they
+// are NOT the SX126x ones. The driver shipped for months with the SX126x
+// encoding (CRC 0x01, IQ 0x00): on this chip 0x01 leaves bit 5 clear, which is
+// CRC OFF, so every frame went out with no hardware integrity check while the
+// protocol layer argued it could drop its own CRC "because the PHY checks it".
+// Both ends were misconfigured identically, so the bench never noticed.
+#define SX1280_LORA_HEADER_EXPLICIT 0x00
+#define SX1280_LORA_HEADER_IMPLICIT 0x80
+#define SX1280_LORA_CRC_ON 0x20
+#define SX1280_LORA_CRC_OFF 0x00
+#define SX1280_LORA_IQ_STANDARD 0x40
+#define SX1280_LORA_IQ_INVERTED 0x00
+
+// Registers the datasheet requires the host to touch directly (§14.4.1): the
+// spreading-factor-dependent demodulator setting and the frequency-error
+// compensation enable. Without them SetModulationParams is only half applied.
+#define SX1280_REG_LORA_SF_CONFIG 0x0925
+#define SX1280_REG_FREQ_ERR_CORR 0x093C
+#define SX1280_LORA_SF_CONFIG_SF5_6 0x1E
+#define SX1280_LORA_SF_CONFIG_SF7_8 0x37
+#define SX1280_LORA_SF_CONFIG_SF9_12 0x32
+
 // Standby modes
 #define SX1280_STANDBY_RC 0x00
 #define SX1280_STANDBY_XOSC 0x01
@@ -68,8 +90,10 @@ enum E28InitError : uint8_t {
   E28_ERR_BUSY_STUCK, // BUSY never went low: no power / BUSY miswired / chip hung
   E28_ERR_MISO_LOW,   // status reads 0x00: MISO stuck low — module unpowered/shorted
   E28_ERR_MISO_HIGH,  // status reads 0xFF: MISO stuck high — module absent/miswired
-  E28_ERR_READBACK    // status reads fine but SetPacketType didn't land:
+  E28_ERR_READBACK,   // status reads fine but SetPacketType didn't land:
                       // commands don't reach the chip — MOSI/SCK wiring
+  E28_ERR_SF_REG      // the SF demodulator register did not take the value we
+                      // wrote: the modulation profile is not actually applied
 };
 
 class E28Radio {
@@ -125,6 +149,10 @@ public:
   // Corrupted receptions (PHY CRC / header errors) since boot: the on-site
   // interference meter. Rising fast while RX: stays quiet = channel is dirty.
   uint32_t getRxErrors() const { return _rxErrors; }
+  // Direct register access (datasheet §11.4). Public so the bring-up firmware
+  // can prove the SF register actually holds what the profile requires.
+  bool writeRegister(uint16_t addr, uint8_t value);
+  bool readRegister(uint16_t addr, uint8_t &value);
 
   // Power management
   void standby();

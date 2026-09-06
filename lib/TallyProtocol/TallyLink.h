@@ -48,8 +48,14 @@ public:
     TallyState state() const { return _state; }
     bool signalLost() const { return _signalLost; }
     bool sourceStale() const { return _sourceStale; }
-    // True whenever the displayed colour must not be trusted as current.
-    bool trustworthy() const { return !_signalLost && !_sourceStale; }
+    // True only while the displayed colour may be trusted as current. Requires
+    // the hub to have been heard at least once: before that _signalLost is still
+    // false (its timer has simply not run out yet) but there is nothing to
+    // trust — the slave has never been told a state. Both presentation gates
+    // (paint a solid colour, allow a tone) hang off this one predicate.
+    bool trustworthy() const {
+        return _everHeard && !_signalLost && !_sourceStale;
+    }
     // Missed-heartbeat gradient (0..15) over a 30s window, reported to the hub
     // so it can tell "this camera struggles" apart from "the channel is bad",
     // and surface degradation to the operator BEFORE it becomes an outage.

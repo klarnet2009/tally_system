@@ -36,16 +36,22 @@ public:
 
   // Periodic re-send. Never interrupts a burst in progress: the burst's copies
   // carry the same state, so they already serve as the heartbeat.
+  // `notBefore` holds the FRAME back until the fleet's uplink window after the
+  // previous anchoring frame has closed (TALLY_TLM_WINDOW_MS). Only the frame:
+  // the cycle counter belongs to the caller and advances on its own steady
+  // timer, so this delay can never freeze it — the failure mode that made an
+  // earlier "gate the counter on the frame" design deadlock channel switches.
   // Returns true when a heartbeat copy was actually scheduled.
-  bool scheduleHeartbeat(uint32_t now) {
+  bool scheduleHeartbeat(uint32_t now, uint32_t notBefore) {
     if (!idle())
       return false;
     _idx = 0;
     _copies = 1;
-    _startMs = now;
-    _nextAtMs = now;
+    _startMs = ((int32_t)(notBefore - now) > 0) ? notBefore : now;
+    _nextAtMs = _startMs;
     return true;
   }
+  bool scheduleHeartbeat(uint32_t now) { return scheduleHeartbeat(now, now); }
 
   bool idle() const { return _idx >= _copies; }
   // Does the copy about to be sent carry TALLY_FLAG_BURST?

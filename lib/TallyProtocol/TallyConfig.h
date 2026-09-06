@@ -125,6 +125,10 @@ static_assert(kTallyBurstOffsets[0] == 0,
 // 9-16), separated by TALLY_TLM_BANK_MS > one frame time, so collisions are
 // eliminated by construction rather than thinned by jitter.
 #define TALLY_TLM_CYCLES 8
+// One 9-byte frame at the production profile (50.7 ms), rounded up. Used by the
+// timing invariants below and by the hub to keep its own heartbeat out of the
+// fleet's uplink window.
+#define TALLY_FRAME_AIRTIME_MS 51
 #define TALLY_TLM_OFFSET_MS 60 // after heartbeat arrival (frame is ~51ms)
 #define TALLY_TLM_BANK_MS 130  // extra offset for cameras 9..16
 // How late a slot may still be used. It must stay BELOW bank separation minus
@@ -137,6 +141,17 @@ static_assert(kTallyBurstOffsets[0] == 0,
 // Resulting per-camera telemetry period; the hub's reachability window derives
 // from it.
 #define TALLY_TELEMETRY_MS (TALLY_TLM_CYCLES * TALLY_REFRESH_MS)
+// Counted from the START of an anchoring frame's transmission: the interval in
+// which some slave may legitimately be on air with telemetry — the frame's own
+// airtime (slaves anchor on its end), the slot offset, the bank-1 offset, the
+// full late tolerance, the uplink frame itself, and loop-jitter margin. The hub
+// must not transmit a lone heartbeat inside it. It used to: the heartbeat timer
+// ran independently of the burst, so a heartbeat could land 100 ms after a
+// burst's final copy — jamming exactly the camera whose slot that copy had just
+// opened, and (half-duplex) costing the hub that camera's report as well.
+#define TALLY_TLM_WINDOW_MS                                                    \
+  (TALLY_FRAME_AIRTIME_MS + TALLY_TLM_OFFSET_MS + TALLY_TLM_BANK_MS +           \
+   TALLY_TLM_LATE_MS + TALLY_FRAME_AIRTIME_MS + 20)
 
 // ===== Coordinated channel switch =====
 #define TALLY_CHAN_ANNOUNCE_BEATS 10 // heartbeats of countdown before switching
@@ -166,13 +181,18 @@ static_assert(TALLY_NET_ID <= 0x0F,
 static_assert(TALLY_BURST_COPIES_MIN <= TALLY_BURST_COPIES_MAX,
               "burst copy floor above the ceiling");
 static_assert(TALLY_TLM_CYCLES >= 2, "telemetry needs at least two cycles");
-// A late bank-0 frame must not be able to run through bank-1's slot. ~51 ms is
-// one frame at the current profile.
-static_assert(TALLY_TLM_LATE_MS + 51 <= TALLY_TLM_BANK_MS,
+// A late bank-0 frame must not be able to run through bank-1's slot.
+static_assert(TALLY_TLM_LATE_MS + TALLY_FRAME_AIRTIME_MS <= TALLY_TLM_BANK_MS,
               "late-slot tolerance would let bank 0 overlap bank 1");
-static_assert(TALLY_TLM_OFFSET_MS + TALLY_TLM_BANK_MS + TALLY_TLM_LATE_MS + 51 <
+static_assert(TALLY_TLM_OFFSET_MS + TALLY_TLM_BANK_MS + TALLY_TLM_LATE_MS +
+                      TALLY_FRAME_AIRTIME_MS <
                   TALLY_REFRESH_MS,
               "telemetry slots must fit inside one heartbeat cycle even when a "
               "bank-1 camera uses its full late tolerance");
+// The hub holds a lone heartbeat back until the uplink window after the previous
+// anchoring frame has closed. If that hold could exceed a heartbeat period, the
+// held frame would collide with the NEXT timer's heartbeat instead.
+static_assert(TALLY_TLM_WINDOW_MS < TALLY_REFRESH_MS,
+              "uplink window must close within one heartbeat period");
 
 #endif // TALLY_CONFIG_H

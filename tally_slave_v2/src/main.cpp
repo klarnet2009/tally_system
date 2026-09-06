@@ -40,8 +40,12 @@ static void slogf(const char *fmt, ...) {
 // ===== CONFIGURATION =====
 // Compile-time fallback only; the live camera ID is stored in NVS and set in
 // the field (BOOT button or serial "id N"), so ONE binary serves every camera.
+// 0 = not provisioned. A build may still bake in a first-boot default with
+// -DSLAVE_CAM_ID=n, but the universal binary must NOT: a fresh unit that fell
+// back to "camera 1" lit up with camera 1's tally on whichever camera it was
+// actually clipped to, and sat in camera 1's telemetry slot as a second device.
 #ifndef SLAVE_CAM_ID
-#define SLAVE_CAM_ID 1
+#define SLAVE_CAM_ID 0
 #endif
 
 static uint8_t g_camId = SLAVE_CAM_ID;
@@ -73,6 +77,7 @@ static uint32_t g_switchAtMs = 0;
 #define COLOR_PING 0x0000FF      // Blue (locator flash)
 #define COLOR_LOST 0xFF4500      // Orange (radio signal lost)
 #define COLOR_STALE 0xFFFFFF     // White (tally source frozen — don't trust)
+#define COLOR_UNSET 0xFF00FF     // Magenta (camera ID not provisioned)
 #define COLOR_INIT_OK 0x00FF00   // Green
 
 // ===== GLOBALS =====
@@ -137,9 +142,16 @@ void applyTallyColor() {
 // Arm the receiver. Continuous RX only (see the file header).
 void armReceive() { radio.startReceive(); }
 
-// Buzzer policy: never sound while the camera is ON AIR — a live mic would
-// capture the tone. Visual indications always fire.
+// Buzzer policy: never sound while the camera MAY be on air — a live mic would
+// capture the tone. "May be": while the light is not trustworthy (link lost,
+// source frozen, hub never heard) the last known state says nothing about the
+// current one, so the tone stays off and those indications are visual only.
+// The old gate looked at the last known state alone, which made the link-lost
+// beep sound every 5 s on a camera the director could have cut to meanwhile.
+// Visual indications always fire.
 static bool buzzerAllowed() {
+  if (!tallyLink.trustworthy())
+    return false;
   TallyState s = tallyLink.state();
   return s != STATE_PROGRAM && s != STATE_BOTH;
 }
@@ -250,15 +262,19 @@ static void channelPlanTick() {
 // One universal binary: the camera ID lives in NVS, not the firmware image.
 // Set it in the field by holding BOOT at power-up (tap to count) or via the
 // serial "id N" command. SLAVE_CAM_ID is only the first-boot default.
+// Returns 0 when the unit has never been provisioned (no NVS key and no build-
+// time default). 0 is a real state the firmware shows (magenta blink, no tally
+// colour, no telemetry), not an error to paper over with a guess.
 static uint8_t loadCamId() {
   Preferences p;
   p.begin("tally", true);
   uint8_t id = p.getUChar("camid", SLAVE_CAM_ID);
   p.end();
-  if (id < 1 || id > 16)
-    id = SLAVE_CAM_ID;
+  if (id > 16)
+    id = 0; // corrupt value: unprovisioned, never "camera 1"
   return id;
 }
+static inline bool provisioned() { return g_camId >= 1 && g_camId <= 16; }
 
 static void saveCamId(uint8_t id) {
   Preferences p;
@@ -328,8 +344,9 @@ static uint8_t runSetIdModeIfRequested(uint8_t current, bool requested) {
 
 void onLinkChange(bool lost) {
   if (lost) {
+    // Visual only (orange pulse in loop()): with the link gone the camera's
+    // real state is unknown, so buzzerAllowed() is false by construction.
     slogf("[WARN] Signal lost!\n");
-    buzzPulse(800, 300);
   } else {
     slogf("[LINK] Signal restored\n");
     if (!locatorActive)
@@ -406,13 +423,20 @@ void setup() {
 
   Serial.println("\n=============================");
   Serial.println("  SUFIDE Tally Slave v2");
-  Serial.printf("  Camera ID: %d  NetID: 0x%X  proto v%d\n", g_camId,
-                TALLY_NET_ID, TALLY_PROTOCOL_VERSION);
+  if (provisioned())
+    Serial.printf("  Camera ID: %d  NetID: 0x%X  proto v%d\n", g_camId,
+                  TALLY_NET_ID, TALLY_PROTOCOL_VERSION);
+  else
+    Serial.printf("  Camera ID: NOT SET  NetID: 0x%X  proto v%d\n",
+                  TALLY_NET_ID, TALLY_PROTOCOL_VERSION);
   Serial.println("  RX: continuous");
   Serial.println("=============================");
   slogf("[BOOT] camId=%d netId=0x%X proto=v%d rx=continuous log=%s\n", g_camId,
         TALLY_NET_ID, TALLY_PROTOCOL_VERSION,
         TallyLog.ok() ? "OK" : "UNAVAILABLE");
+  if (!provisioned())
+    slogf("[CFG] *** camera ID not set: magenta blink, no tally, no telemetry. "
+          "Use 'id N' or hold BOOT at power-up\n");
 
   Serial.print("[LoRa] Init... ");
   bool ok = radio.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI,
@@ -491,13 +515,26 @@ void loop() {
   tallyLink.tick();
 
   // === "DON'T TRUST THE LIGHT" indications (priority just below locator) ===
-  // signalLost  = radio link dead: orange pulse + periodic beep.
-  // sourceStale = link alive but the hub's ATEM source is frozen: hold the
-  //               last tally colour but blink WHITE over it, so the operator
-  //               sees the colour may be stale without losing the held state.
+  // unprovisioned = no camera ID: magenta double-blink, never a tally colour.
+  // signalLost    = radio link dead: orange pulse. Visual only — the camera's
+  //                 real state is unknown, so no tone (buzzerAllowed()).
+  // sourceStale   = link alive but the hub's ATEM source is frozen: hold the
+  //                 last tally colour but blink WHITE over it, so the operator
+  //                 sees the colour may be stale without losing the held state.
   static bool wasUntrusted = false;
   if (!locatorActive) {
-    if (tallyLink.signalLost()) {
+    if (!provisioned()) {
+      // This unit belongs to NO camera yet, so it must not show any tally
+      // colour, trusted or not — magenta is a colour no tally state uses.
+      wasUntrusted = true;
+      static uint32_t lastStep = 0;
+      static uint8_t step = 0;
+      if (millis() - lastStep > 150) {
+        lastStep = millis();
+        step = (uint8_t)((step + 1) % 8); // blink, blink, pause
+        setColor((step == 0 || step == 2) ? COLOR_UNSET : COLOR_OFF, 100);
+      }
+    } else if (tallyLink.signalLost()) {
       wasUntrusted = true;
       static uint32_t lastPulse = 0;
       static bool pulseOn = false;
@@ -505,11 +542,6 @@ void loop() {
         lastPulse = millis();
         pulseOn = !pulseOn;
         setColor(pulseOn ? COLOR_LOST : COLOR_OFF, 60);
-      }
-      static uint32_t lastLostBeep = 0;
-      if (millis() - lastLostBeep > 5000) {
-        lastLostBeep = millis();
-        buzzPulse(600, 100);
       }
     } else if (tallyLink.sourceStale()) {
       wasUntrusted = true;

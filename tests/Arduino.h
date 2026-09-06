@@ -21,7 +21,21 @@ inline void testSetMillis(uint32_t ms) { g_testMillis = ms; }
 inline void testAdvance(uint32_t ms) { g_testMillis += ms; }
 
 inline void delay(uint32_t) {}
+inline void delayMicroseconds(uint32_t) {}
 inline void yield() {}
+
+// ---- GPIO, just enough for the SX1280 driver ----
+// Levels are per-pin test state (BUSY is held LOW so waits return at once);
+// writes to the SPI shim's NSS pin delimit bus transactions (see SPI.h).
+#define HIGH 1
+#define LOW 0
+#define INPUT 0
+#define OUTPUT 1
+#define INPUT_PULLUP 2
+void pinMode(int8_t pin, uint8_t mode);
+void digitalWrite(int8_t pin, uint8_t level);
+int digitalRead(int8_t pin);
+void testSetPin(int8_t pin, uint8_t level);
 
 // ---- minimal Serial ----
 struct SerialShim {

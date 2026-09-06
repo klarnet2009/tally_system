@@ -50,6 +50,10 @@ static uint32_t g_beaconNextMs = 0;
 
 // Heartbeat cycle counter — the fleet's shared time base for telemetry slots.
 static uint8_t g_hbCount = 0;
+// When the last ANCHORING frame (unflagged STATE_ALL: lone heartbeat or a
+// burst's final copy) started transmitting. Slaves anchor their telemetry slots
+// on it, so the hub must stay off the air for TALLY_TLM_WINDOW_MS after it.
+static uint32_t g_lastAnchorTxMs = 0;
 
 // ===== Debug logging =====
 // The S3 has two consoles: Serial = native USB-Serial-JTAG (GPIO19/20),
@@ -115,6 +119,14 @@ static bool radioInit() {
                         E28_PIN_TXEN);
   if (ok) {
     tallyApplyRadioProfile(radio, g_txPower);
+    // One line of evidence per init that the SF-dependent register the datasheet
+    // requires (§14.4.1) holds the profile's value — begin() already fails on a
+    // mismatch, but the field log should show the number, not just "OK".
+    uint8_t sfReg = 0, fec = 0;
+    radio.readRegister(SX1280_REG_LORA_SF_CONFIG, sfReg);
+    radio.readRegister(SX1280_REG_FREQ_ERR_CORR, fec);
+    hublogf("[E28] SF reg 0x0925=0x%02X FEC bit0=%u (CRC-16 on)\n", sfReg,
+            fec & 1);
     radio.setFrequency(g_chanFreq); // keep the current AFA channel
     radio.startReceive(); // listen for slave telemetry between our frames
     g_txOffChannel = false;
@@ -429,11 +441,18 @@ static void processTx() {
     bool crit = g_burst.latencyCritical();
     if (!g_lbtState.clear(millis(), crit, !crit && channelBusyNow()))
       return;
+    // Read BEFORE markSent() advances the index: is this the copy the fleet
+    // anchors its uplink slots on (the unflagged one)?
+    bool anchor = !g_burst.flagAsBurst();
     TallyPacket pkt = buildStateFrame();
     uint8_t buf[TALLY_PACKET_SIZE];
     TallyProtocol::serialize(pkt, buf);
-    if (radio.startSend(buf, TALLY_PACKET_SIZE))
-      g_burst.markSent(millis());
+    if (radio.startSend(buf, TALLY_PACKET_SIZE)) {
+      uint32_t now = millis();
+      g_burst.markSent(now);
+      if (anchor)
+        g_lastAnchorTxMs = now; // opens the fleet's uplink window
+    }
   }
 }
 
@@ -551,7 +570,11 @@ static void heartbeatTick() {
   // Burst copies are identified by TALLY_FLAG_BURST instead, so nothing depends
   // on this counter standing still.
   g_hbCount++;
-  g_burst.scheduleHeartbeat(now); // no-op while a burst is in progress
+  // The FRAME, unlike the counter, waits until the uplink window opened by the
+  // last anchoring frame has closed: a burst's final copy tells one camera to
+  // transmit ~60 ms later, and a heartbeat from this timer used to land right on
+  // top of it. No-op while a burst is in progress (its copies are the heartbeat).
+  g_burst.scheduleHeartbeat(now, g_lastAnchorTxMs + TALLY_TLM_WINDOW_MS);
 }
 
 // Beacon the current channel on the OLD one after a switch, so a slave that
@@ -1559,7 +1582,13 @@ void loop() {
   // non-blocking UI sequences (like LOCATOR). Also skip the blit while a TX is
   // in flight: a ~23ms full-frame I2C blit would otherwise defer checkTxDone()
   // (PA-off) and the next packet by that much. The redraw runs next pass.
-  bool uiActive = (locatorPingsLeft > 0) || radio.txActive();
+  // And skip it while the FIRST copy of a cut is still waiting for processTx()
+  // below: this block sits between heartbeatTick() (which notices the cut and
+  // marks the grid dirty) and the transmit, so the very redraw the cut caused
+  // used to add its 23 ms to the one latency the whole design exists to
+  // minimise. The grid is painted one pass later, after the copy is on air.
+  bool uiActive = (locatorPingsLeft > 0) || radio.txActive() ||
+                  g_burst.latencyCritical();
   bool connected = (atemPhase == ATEM_RUNNING);
 
   if (!uiActive) {

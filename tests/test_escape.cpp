@@ -192,14 +192,19 @@ int main() {
     CHECK(v.wantSwitch);
   }
 
-  CASE("blackout NEVER overrides the on-air guard; severe does");
+  CASE("the on-air guard holds only DEGRADED: severe AND blackout both move");
   {
+    // Blackout while the ATEM says someone is live: nobody is talking to us, so
+    // there is no reachable camera whose outage staying could prevent. The old
+    // guard kept the fleet on a dead channel for as long as anyone was on air —
+    // at a concert, that is the whole show.
     TallyEscape e; e.begin(0);
     clearCams(); silent(1); silent(2);
     TallyEscape::Verdict v =
         hold(e, T0, ESC_BLACKOUT_SUSTAIN_MS + 5000, true, 0.9f);
-    CHECK(!v.wantSwitch);
-    CHECK(v.blocked != nullptr);
+    CHECK_EQ(v.tier, ESC_BLACKOUT);
+    CHECK(v.wantSwitch);
+    CHECK(v.blocked == nullptr);
 
     TallyEscape e2; e2.begin(0);
     clearCams(); complaining(1); complaining(2); complaining(3);

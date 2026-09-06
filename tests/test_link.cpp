@@ -136,6 +136,22 @@ int main() {
     CHECK_EQ(l.missedBeats(), 1);
   }
 
+  CASE("trustworthy() is false before the hub has EVER been heard");
+  {
+    // Fresh boot: the signal-lost timer has not run out, the source-stale grace
+    // has not run out — and there is still nothing to trust, because no state
+    // was ever received. Both LED and buzzer gates hang off this predicate.
+    TallyLink l;
+    testSetMillis(1000);
+    l.begin(1, onState, onLocator, onLink);
+    l.tick();
+    CHECK(!l.signalLost());
+    CHECK(!l.sourceStale());
+    CHECK(!l.trustworthy());
+    feed(l, TallyProtocol::createStateAllPacket(0, 0, true, 0));
+    CHECK(l.trustworthy());
+  }
+
   CASE("everHeard is false until the hub is actually heard (boot scan gate)");
   {
     TallyLink l;

@@ -43,6 +43,13 @@ void setup() {
   if (ok) {
     tallyApplyRadioProfile(radio, TALLY_SLAVE_TX_POWER); // production air interface
     Serial.printf("OK (SPI:0x%02X)\n", radio.getChipStatus());
+    // Same readback as the hub's bring-up build: the profile is only real if
+    // the SF register took it (datasheet §14.4.1).
+    uint8_t sfReg = 0, fec = 0;
+    radio.readRegister(SX1280_REG_LORA_SF_CONFIG, sfReg);
+    radio.readRegister(SX1280_REG_FREQ_ERR_CORR, fec);
+    Serial.printf("[E28] SF reg 0x0925=0x%02X (want 0x%02X)  FEC 0x093C bit0=%u\n",
+                  sfReg, SX1280_LORA_SF_CONFIG_SF9_12, fec & 1);
   } else {
     Serial.printf("FAILED (SPI:0x%02X)\n", radio.getChipStatus());
     // Blink red to indicate error

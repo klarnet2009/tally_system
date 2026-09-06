@@ -278,5 +278,52 @@ int main() {
     }
   }
 
+  CASE("a heartbeat scheduled inside the fleet's uplink window waits it out");
+  {
+    // A burst's final copy went out at t=1000: the fleet anchors on it and one
+    // camera transmits telemetry inside [1000, 1000 + TALLY_TLM_WINDOW_MS).
+    TallyBurst b; b.reset(0);
+    b.onChange(1000, false);
+    while (!b.idle()) b.markSent(1000);
+    const uint32_t anchorTx = 1000;
+    // The steady timer fires 100 ms later. The COUNTER advances (caller's job);
+    // the FRAME must not go out until the window has closed.
+    CHECK(b.scheduleHeartbeat(1100, anchorTx + TALLY_TLM_WINDOW_MS));
+    CHECK(!b.dueNow(1100));
+    CHECK(!b.dueNow(anchorTx + TALLY_TLM_WINDOW_MS - 1));
+    CHECK(b.dueNow(anchorTx + TALLY_TLM_WINDOW_MS));
+    CHECK(!b.latencyCritical()); // still an ordinary heartbeat: LBT may defer it
+    CHECK(!b.flagAsBurst());     // and it anchors the next slot
+    // A window that has already closed schedules immediately.
+    TallyBurst c; c.reset(0);
+    CHECK(c.scheduleHeartbeat(5000, 4000));
+    CHECK(c.dueNow(5000));
+    // The single-argument form is "now".
+    TallyBurst d; d.reset(0);
+    CHECK(d.scheduleHeartbeat(7000));
+    CHECK(d.dueNow(7000));
+    // Wrap-safe: notBefore may sit past the millis() rollover.
+    TallyBurst e; e.reset(0);
+    CHECK(e.scheduleHeartbeat(0xFFFFFF00u, 0xFFFFFF00u + 300));
+    CHECK(!e.dueNow(0xFFFFFF00u));
+    CHECK(e.dueNow(0xFFFFFF00u + 300));
+    // A burst still running is never interrupted by a held heartbeat either.
+    TallyBurst f; f.reset(0);
+    f.onChange(2000, false);
+    CHECK(!f.scheduleHeartbeat(2100, 2500));
+    CHECK_EQ(f.pending(), TALLY_BURST_COPIES_MIN);
+  }
+
+  CASE("the uplink window fits inside a heartbeat period with margin");
+  {
+    // If it did not, the held heartbeat would collide with the next one.
+    CHECK(TALLY_TLM_WINDOW_MS < TALLY_REFRESH_MS);
+    // ...and it really covers a bank-1 camera using its full late tolerance
+    // plus its own frame, measured from the anchoring frame's START.
+    CHECK(TALLY_TLM_WINDOW_MS >= TALLY_FRAME_AIRTIME_MS + TALLY_TLM_OFFSET_MS +
+                                     TALLY_TLM_BANK_MS + TALLY_TLM_LATE_MS +
+                                     TALLY_FRAME_AIRTIME_MS);
+  }
+
   return testSummary("TallyBurst/TallyLbt");
 }

@@ -26,6 +26,7 @@ const char *E28Radio::initErrorStr() const {
   case E28_ERR_MISO_LOW:   return "MISO low (no 3V3?)";
   case E28_ERR_MISO_HIGH:  return "MISO high (no module?)";
   case E28_ERR_READBACK:   return "cfg readback (MOSI/SCK?)";
+  case E28_ERR_SF_REG:     return "SF register readback";
   }
   return "?";
 }
@@ -182,6 +183,19 @@ bool E28Radio::begin(int8_t sck, int8_t miso, int8_t mosi, int8_t nss,
     _connected = false;
     return false;
   }
+  // Second readback, this time of a register PAYLOAD rather than a command
+  // echo: the SF demodulator setting must hold what setModulationParams() wrote.
+  // This is the only place in the driver where the chip can confirm that a
+  // written VALUE — not just a command — landed intact.
+  uint8_t sfReg = 0xEE;
+  uint8_t want = (_sf <= LORA_SF6)   ? SX1280_LORA_SF_CONFIG_SF5_6
+                 : (_sf <= LORA_SF8) ? SX1280_LORA_SF_CONFIG_SF7_8
+                                     : SX1280_LORA_SF_CONFIG_SF9_12;
+  if (!readRegister(SX1280_REG_LORA_SF_CONFIG, sfReg) || sfReg != want) {
+    _initError = E28_ERR_SF_REG;
+    _connected = false;
+    return false;
+  }
 
   _connected = true;
   _initError = E28_OK;
@@ -277,6 +291,23 @@ bool E28Radio::spiFrame(const uint8_t *header, uint8_t headerLen,
   return true;
 }
 
+bool E28Radio::writeRegister(uint16_t addr, uint8_t value) {
+  if (!_connected)
+    return false;
+  uint8_t hdr[3] = {SX1280_CMD_WRITE_REGISTER, (uint8_t)(addr >> 8),
+                    (uint8_t)(addr & 0xFF)};
+  return spiFrame(hdr, 3, &value, nullptr, 1);
+}
+
+bool E28Radio::readRegister(uint16_t addr, uint8_t &value) {
+  if (!_connected)
+    return false;
+  // ReadRegister clocks one NOP after the address before data appears.
+  uint8_t hdr[4] = {SX1280_CMD_READ_REGISTER, (uint8_t)(addr >> 8),
+                    (uint8_t)(addr & 0xFF), 0x00};
+  return spiFrame(hdr, 4, nullptr, &value, 1);
+}
+
 void E28Radio::writeCommand(uint8_t cmd, uint8_t *data, uint8_t len) {
   spiFrame(&cmd, 1, data, nullptr, len);
 }
@@ -333,6 +364,27 @@ void E28Radio::setCodingRate(uint8_t cr) {
 void E28Radio::setModulationParams() {
   uint8_t modParams[3] = {_sf, _bw, _cr};
   writeCommand(SX1280_CMD_SET_MODULATION_PARAMS, modParams, 3);
+
+  // Datasheet §14.4.1: SetModulationParams is only half of configuring the LoRa
+  // demodulator. The host must then write an SF-dependent value to 0x0925 and
+  // set bit 0 of 0x093C (frequency-error compensation) — "in all cases".
+  // This driver never did, so the ~-114 dBm SF9 sensitivity the whole link
+  // budget rests on was never something the silicon was configured to deliver.
+  // It went unnoticed because both ends were equally misconfigured and the only
+  // range ever tested was a bench. The 0x093C bit is what absorbs the crystal
+  // offset between a mains hub and battery slaves warming up (~48 kHz worst
+  // case at 2.4 GHz, ~12% of a 406 kHz channel).
+  uint8_t sfReg;
+  if (_sf <= LORA_SF6)
+    sfReg = SX1280_LORA_SF_CONFIG_SF5_6;
+  else if (_sf <= LORA_SF8)
+    sfReg = SX1280_LORA_SF_CONFIG_SF7_8;
+  else
+    sfReg = SX1280_LORA_SF_CONFIG_SF9_12;
+  writeRegister(SX1280_REG_LORA_SF_CONFIG, sfReg);
+  uint8_t fec = 0;
+  if (readRegister(SX1280_REG_FREQ_ERR_CORR, fec))
+    writeRegister(SX1280_REG_FREQ_ERR_CORR, (uint8_t)(fec | 0x01));
 }
 
 void E28Radio::setPreambleLength(uint16_t symbols) {
@@ -358,13 +410,16 @@ void E28Radio::setPacketParams(uint8_t payloadLen) {
     return;
   _lastPktLen = payloadLen;
 
+  // SX1280 encodings (see the note beside the constants): the previous literals
+  // 0x01 / 0x00 were SX126x values, which on this chip meant CRC OFF and
+  // inverted IQ — symmetric, so the link worked and nothing ever said so.
   uint8_t pktParams[7] = {
-      _preambleByte,   // Preamble length (default 0x0C = 12 symbols)
-      0x00,            // Header type: explicit
-      payloadLen,      // Payload length
-      0x01,            // CRC on
-      0x00,            // Standard IQ
-      0x00,       0x00 // Reserved
+      _preambleByte,               // Preamble length
+      SX1280_LORA_HEADER_EXPLICIT, // Header type: explicit
+      payloadLen,                  // Payload length
+      SX1280_LORA_CRC_ON,          // Hardware CRC-16 — genuinely on this time
+      SX1280_LORA_IQ_STANDARD,     // Standard IQ
+      0x00,       0x00             // Reserved
   };
   writeCommand(SX1280_CMD_SET_PACKET_PARAMS, pktParams, 7);
 }
@@ -599,25 +654,35 @@ bool E28Radio::available() {
 
   // Read IRQ register directly (no DIO1 pin check — unreliable on some boards)
   uint16_t irq = getIrqStatus();
-  // RxDone first: when a valid frame completes and a colliding/foreign frame
-  // latches CrcError alongside it, draining the FIFO must win — receive()
-  // clears every IRQ bit anyway. The old order wiped the pending RxDone
-  // together with the error, silently abandoning a good frame.
-  if (irq & 0x0002) // RxDone bit
-    return true;
-  // Corrupted reception: CRC fail on a full packet, or a header that didn't
-  // survive interference. Counted so the error rate is visible on the
-  // status lines.
+  // Errors FIRST, and they are authoritative. On the SX1280 a CRC failure
+  // raises CrcError AND RxDone for the same reception, so checking RxDone first
+  // handed every corrupted payload to the application. The earlier ordering
+  // was justified by "a colliding frame may latch CrcError next to a good
+  // RxDone" — and in that rare case dropping the good frame costs one heartbeat
+  // (500 ms), while accepting a bad one costs a confidently wrong colour. For a
+  // safety indicator only one of those is acceptable.
   if (irq & 0x0060) { // CrcError | HeaderError
     _rxErrors++;
     clearIrqStatus();
+    return false;
   }
-  return false;
+  return (irq & 0x0002) != 0; // RxDone
 }
 
 uint8_t E28Radio::receive(uint8_t *buffer, uint8_t maxLen) {
   if (!_connected)
     return 0;
+
+  // available() and receive() are separate SPI transactions, and the caller's
+  // drain loop can run several receptions between them; the buffer pointer
+  // tracks the LAST one. Re-check the error bits here so a reception that
+  // failed CRC in that gap is never read out as if it were good.
+  uint16_t irq = getIrqStatus();
+  if (irq & 0x0060) {
+    _rxErrors++;
+    clearIrqStatus();
+    return 0;
+  }
 
   uint8_t statusHdr[2] = {SX1280_CMD_GET_RX_BUFFER_STATUS, 0x00}; // NOP
   uint8_t bufStatus[2] = {0};

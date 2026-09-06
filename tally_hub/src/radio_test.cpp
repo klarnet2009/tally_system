@@ -58,8 +58,17 @@ void setup() {
   bool ok = radio.begin(E28_PIN_SCK, E28_PIN_MISO, E28_PIN_MOSI, E28_PIN_NSS,
                         E28_PIN_BUSY, E28_PIN_DIO1, E28_PIN_RESET, E28_PIN_RXEN,
                         E28_PIN_TXEN);
-  if (ok)
+  if (ok) {
     tallyApplyRadioProfile(radio, TALLY_HUB_TX_POWER); // production air interface
+    // Prove the SF-dependent demodulator register and the frequency-error
+    // compensation bit actually hold what the profile requires (datasheet
+    // §14.4.1). Both were missing for months; a readback is the only evidence.
+    uint8_t sfReg = 0, fec = 0;
+    radio.readRegister(SX1280_REG_LORA_SF_CONFIG, sfReg);
+    radio.readRegister(SX1280_REG_FREQ_ERR_CORR, fec);
+    Serial.printf("[E28] SF reg 0x0925=0x%02X (want 0x%02X)  FEC 0x093C bit0=%u\n",
+                  sfReg, SX1280_LORA_SF_CONFIG_SF9_12, fec & 1);
+  }
 
   display.clearDisplay();
   display.setTextSize(1);
