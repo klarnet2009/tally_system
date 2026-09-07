@@ -106,6 +106,12 @@ bool TallyProtocol::validate(const TallyPacket &p) {
   return true;
 }
 
+// Precomputed CRC-8/CCITT table (poly 0x07, init 0x00).
+// Replacing the original bitwise loop with this LUT array changes the calculation
+// from O(N * 8) shifts/XORs down to exactly O(N) simple array lookups.
+// This significantly reduces the CPU overhead of packet validation in the hot RX path.
+#include "crc8_lut.h"
+
 uint8_t TallyProtocol::calculateCRC(const TallyPacket &p) {
   static_assert(sizeof(TallyPacket) == TALLY_PACKET_SIZE,
                 "TallyPacket layout != wire size");
@@ -113,9 +119,7 @@ uint8_t TallyProtocol::calculateCRC(const TallyPacket &p) {
   const uint8_t *data = (const uint8_t *)&p;
   uint8_t crc = 0x00;
   for (uint8_t i = 0; i < TALLY_PACKET_SIZE - 1; i++) {
-    crc ^= data[i];
-    for (uint8_t b = 0; b < 8; b++)
-      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+    crc = CRC8_LUT[crc ^ data[i]];
   }
   return crc;
 }
