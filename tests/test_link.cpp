@@ -53,6 +53,50 @@ int main() {
     CHECK_EQ(g_lastState, STATE_PREVIEW);
   }
 
+  CASE("DEFECT: a PING-only diet must not keep a colour trusted (state-stale)");
+  {
+    // Under heavy loss every STATE frame of a cut can vanish while the odd
+    // hub frame still arrives. signalLost() is (correctly) about the LINK and
+    // any hub frame feeds it; the COLOUR's freshness must come from STATE frames.
+    TallyLink l; primed(l);
+    feed(l, TallyProtocol::createStateAllPacket(1u << 0, 0, true, 1));
+    CHECK(l.trustworthy());
+    // one lost heartbeat, even with the hub's uplink-window hold, is tolerated
+    testAdvance(2 * TALLY_REFRESH_MS + TALLY_TLM_WINDOW_MS);
+    l.tick();
+    CHECK(!l.stateStale());
+    CHECK(l.trustworthy());
+    // pings keep arriving: the link is alive...
+    testAdvance(TALLY_STATE_STALE_MS);
+    feed(l, TallyProtocol::createPingPacket(TALLY_BROADCAST_ID));
+    l.tick();
+    CHECK(!l.signalLost());
+    // ...but the colour is old, and says so
+    CHECK(l.stateStale());
+    CHECK(!l.trustworthy());
+    CHECK_EQ(l.state(), STATE_PROGRAM); // the held state is still reported
+    // a STATE frame restores trust at once
+    feed(l, TallyProtocol::createStateAllPacket(1u << 0, 0, true, 2));
+    l.tick();
+    CHECK(!l.stateStale());
+    CHECK(l.trustworthy());
+    // and state-stale always precedes signal-lost
+    CHECK(TALLY_STATE_STALE_MS < TALLY_SIGNAL_LOST_MS);
+  }
+
+  CASE("a hub heard only through a PING has no state to trust");
+  {
+    TallyLink l;
+    testSetMillis(1000);
+    l.begin(1, onState, onLocator, onLink);
+    testAdvance(TALLY_STATE_STALE_MS + 1);
+    feed(l, TallyProtocol::createPingPacket(1));
+    l.tick();
+    CHECK(l.everHeard());
+    CHECK(!l.signalLost());
+    CHECK(!l.trustworthy()); // never told a state -> nothing to paint
+  }
+
   CASE("signal-lost asserts only after the full timeout, and clears on a frame");
   {
     TallyLink l; primed(l);

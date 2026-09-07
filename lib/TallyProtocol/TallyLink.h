@@ -48,13 +48,16 @@ public:
     TallyState state() const { return _state; }
     bool signalLost() const { return _signalLost; }
     bool sourceStale() const { return _sourceStale; }
+    // No STATE frame for TALLY_STATE_STALE_MS although the link is alive (some
+    // hub frame — possibly only a PING — kept the signal-lost timer fed).
+    bool stateStale() const { return _stateStale; }
     // True only while the displayed colour may be trusted as current. Requires
     // the hub to have been heard at least once: before that _signalLost is still
     // false (its timer has simply not run out yet) but there is nothing to
     // trust — the slave has never been told a state. Both presentation gates
     // (paint a solid colour, allow a tone) hang off this one predicate.
     bool trustworthy() const {
-        return _everHeard && !_signalLost && !_sourceStale;
+        return _everHeard && !_signalLost && !_sourceStale && !_stateStale;
     }
     // Missed-heartbeat gradient (0..15) over a 30s window, reported to the hub
     // so it can tell "this camera struggles" apart from "the channel is bad",
@@ -86,8 +89,10 @@ private:
     TallyState _state = STATE_OFF;
     bool _signalLost = false;
     bool _sourceStale = false;
+    bool _stateStale = false;
     bool _everHeard = false;
     uint32_t _lastRxMs = 0;
+    uint32_t _lastStateMs = 0;    // last CMD_STATE_ALL, not just any hub frame
     uint32_t _lastSourceLiveMs = 0;
     uint8_t _rxGaps = 0;          // heartbeat gaps in the current 30s window
     uint32_t _poorWindowStart = 0;

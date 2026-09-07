@@ -85,15 +85,23 @@ static uint16_t g_prevMask = 0;
 // signal (no separate shadow flag to keep in sync).
 enum AtemPhase : uint8_t { ATEM_IDLE, ATEM_CONNECTING, ATEM_RUNNING };
 static AtemPhase atemPhase = ATEM_IDLE;
+// When the tally masks were last actually refreshed from the source (ATEM poll
+// or the test-mode generator). sourceLiveNow() is keyed off THIS, not off the
+// connection phase: a connected ATEM whose masks nobody has polled for half a
+// second is a frozen source, whatever the socket says.
+static uint32_t g_lastSourcePollMs = 0;
+#define SOURCE_FRESH_MS 500UL // >> POLL_MS; tolerates OLED blits and log flushes
 
-// sourceLive: in production true only while ATEM is actually connected, so a
-// frozen mask set is flagged stale and slaves show "don't trust" instead of a
-// confident wrong colour. In test mode the generated stream is always live.
+// sourceLive: true only while the masks are being refreshed. Any blocking path
+// that keeps heartbeats going but stops polling (that was fleetPump() during
+// `log` and `survey`) now drops SOURCE_LIVE within SOURCE_FRESH_MS, and the
+// fleet shows "don't trust" instead of holding a colour nobody is updating.
 static inline bool sourceLiveNow() {
+  bool fresh = millis() - g_lastSourcePollMs < SOURCE_FRESH_MS;
 #ifdef LORA_TEST_MODE
-  return true;
+  return fresh;
 #else
-  return atemPhase == ATEM_RUNNING;
+  return atemPhase == ATEM_RUNNING && fresh;
 #endif
 }
 
@@ -298,10 +306,6 @@ static void enqueueOneShot(const TallyPacket &pkt, uint32_t freqHz = 0) {
   g_osHead = next;
 }
 
-static inline bool txIdle() {
-  return !radio.txActive() && g_burst.idle() && g_osHead == g_osTail;
-}
-
 // Serialized fresh on every copy — this is what makes a stale state impossible.
 static TallyPacket buildStateFrame() {
   return TallyProtocol::createStateAllPacket(
@@ -372,8 +376,12 @@ static void processTx() {
         g_txOffChannel = false;
       }
       radio.startReceive(); // back to listening for telemetry
-      // The last announcing frame is now on air: it is safe to retune.
-      if (g_chanSwitch.expired(g_hbCount) && txIdle())
+      // The last announcing frame is now on air: it is safe to retune. NOT gated
+      // on the burst being idle: the slaves retune on their own clocks when the
+      // countdown runs out, so under sustained cutting (burst never idle) the
+      // hub used to stay behind on the old channel while the whole fleet had
+      // moved — and its remaining copies must go where the fleet now is.
+      if (g_chanSwitch.expired(g_hbCount))
         applyChannelSwitch();
     }
     return;
@@ -398,7 +406,7 @@ static void processTx() {
     return;
   }
 
-  if (g_chanSwitch.expired(g_hbCount) && txIdle()) {
+  if (g_chanSwitch.expired(g_hbCount)) { // txActive() is false here
     applyChannelSwitch();
     return;
   }
@@ -591,7 +599,16 @@ static void beaconTick() {
   }
   if ((int32_t)(now - g_beaconNextMs) < 0)
     return;
-  if (!txIdle()) // never take the air from a state burst
+  if (radio.txActive())
+    return;
+  // One-shots outrank burst copies in processTx(), so take the air only when no
+  // copy is due within one beacon's airtime — and never ahead of a cut's first
+  // copy. The old gate (txIdle(): burst idle AND queue empty) was never true
+  // under sustained cutting, so the beacon — the stranded slaves' only rescue —
+  // starved in exactly the situation that strands them.
+  if (!g_burst.idle() &&
+      (g_burst.latencyCritical() ||
+       g_burst.untilNext(now) < TALLY_FRAME_AIRTIME_MS + 15))
     return;
   g_beaconNextMs = now + TALLY_OLD_BEACON_EVERY_MS;
   TallyPacket pkt = TallyProtocol::createStateAllPacket(
@@ -1029,13 +1046,58 @@ void setup() {
 // It calls the REAL heartbeatTick(), deliberately: the cycle counter is the
 // fleet's shared clock and the channel-switch countdown is derived from it, so a
 // pump that invents its own beats runs the countdown off wall time.
+// Refresh the tally masks from the source. ONE function, called from loop() and
+// from fleetPump(): the pump used to run heartbeats WITHOUT this, so while `log`
+// streamed (~45 s) or `survey` swept (~10 s) every heartbeat carried frozen
+// masks flagged SOURCE_LIVE — the fleet trusted a colour nobody was updating,
+// and every cut in that window was invisible: the camera cut away from held
+// RED, the camera cut to stayed dark. Worse than having no pump at all (the
+// fleet would have gone to safe orange in 3 s). sourceLiveNow() additionally
+// keys off g_lastSourcePollMs so any FUTURE blocking path fails safe.
+static void tallySourcePoll() {
+#ifdef LORA_TEST_MODE
+  // === TEST STREAM: cam 1 RED <-> GREEN every 1s (radio bring-up without ATEM)
+  static uint32_t lastToggle = 0;
+  static bool testRed = true;
+  if (millis() - lastToggle > 1000) {
+    lastToggle = millis();
+    testRed = !testRed;
+    g_progMask = testRed ? 0x0001 : 0x0000;
+    g_prevMask = testRed ? 0x0000 : 0x0001;
+  }
+  g_lastSourcePollMs = millis();
+#else
+  atemTick();
+  if (atemPhase == ATEM_RUNNING && millis() - lastPoll > POLL_MS) {
+    lastPoll = millis();
+    g_lastSourcePollMs = lastPoll;
+    g_progMask = 0;
+    g_prevMask = 0;
+    for (int i = 0; i < 8; i++) {
+      uint8_t human = TALLY_INPUTS[i];
+      if (human < 1 || human > 16)
+        continue; // out-of-range entry would make the bit shift below UB
+      uint8_t idx0 = human - 1;
+      uint8_t tflags = atem.getTallyByIndexTallyFlags(idx0); // bit0 pgm, bit1 pvw
+      if (tflags & 0x01)
+        g_progMask |= (1U << idx0);
+      if (tflags & 0x02)
+        g_prevMask |= (1U << idx0);
+    }
+  }
+#endif
+}
+
+// Everything the fleet needs while some command blocks loop(): finish the frame
+// in flight, take telemetry, refresh the SOURCE, run the heartbeat scheduler,
+// and transmit — the trailing processTx() is what lets a cut noticed by this
+// call go out now rather than a whole pump interval later.
 static void fleetPump() {
   processTx();
   serviceTelemetry();
+  tallySourcePoll();
   heartbeatTick();
-#ifndef LORA_TEST_MODE
-  atemTick();
-#endif
+  processTx();
 }
 
 // ===== Full-band survey =====
@@ -1104,10 +1166,15 @@ static void bandSurvey(Stream *io) {
       if (millis() - lastPump > SURVEY_PUMP_MS) {
         radio.setFrequency(g_chanFreq); // pump must transmit on the REAL channel
         radio.startReceive();
+        // Drain the WHOLE burst before going off-channel again: a cut noticed by
+        // the pump schedules copies up to 740 ms out, and a 300 ms guard left
+        // the later ones waiting for the next pump slot.
         uint32_t guard = millis();
         do {
           fleetPump();
-        } while ((!g_burst.idle() || radio.txActive()) && millis() - guard < 300);
+        } while ((!g_burst.idle() || radio.txActive()) &&
+                 millis() - guard < kTallyBurstOffsets[TALLY_BURST_COPIES_MAX - 1] +
+                                        2 * TALLY_FRAME_AIRTIME_MS + 100);
         lastPump = millis();
       }
       uint32_t f = SURVEY_LO_HZ + i * SURVEY_STEP_KHZ * 1000UL;
@@ -1508,36 +1575,8 @@ void loop() {
   }
 #endif
 
-#ifdef LORA_TEST_MODE
-  // === TEST STREAM: cam 1 RED <-> GREEN every 1s (radio bring-up without ATEM)
-  static uint32_t lastToggle = 0;
-  static bool testRed = true;
-  if (millis() - lastToggle > 1000) {
-    lastToggle = millis();
-    testRed = !testRed;
-    g_progMask = testRed ? 0x0001 : 0x0000;
-    g_prevMask = testRed ? 0x0000 : 0x0001;
-  }
-#else
-  atemTick();
-
-  if (atemPhase == ATEM_RUNNING && millis() - lastPoll > POLL_MS) {
-    lastPoll = millis();
-    g_progMask = 0;
-    g_prevMask = 0;
-    for (int i = 0; i < 8; i++) {
-      uint8_t human = TALLY_INPUTS[i];
-      if (human < 1 || human > 16)
-        continue; // out-of-range entry would make the bit shift below UB
-      uint8_t idx0 = human - 1;
-      uint8_t tflags = atem.getTallyByIndexTallyFlags(idx0); // bit0 pgm, bit1 pvw
-      if (tflags & 0x01)
-        g_progMask |= (1U << idx0);
-      if (tflags & 0x02)
-        g_prevMask |= (1U << idx0);
-    }
-  }
-#endif
+  // === Tally source (ATEM poll / test stream) — shared with fleetPump()
+  tallySourcePoll();
 
   // === STATE_ALL broadcast: on change + heartbeat (see heartbeatTick())
   heartbeatTick();

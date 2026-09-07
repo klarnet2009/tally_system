@@ -8,6 +8,7 @@ void TallyLink::begin(uint8_t cameraId, StateCallback onState,
     _onLink = onLink;
     _lastRxMs = millis();
     _lastSourceLiveMs = millis();
+    _lastStateMs = millis();
     _poorWindowStart = millis();
 }
 
@@ -53,6 +54,7 @@ bool TallyLink::onPacket(const uint8_t* buf, uint8_t len) {
         return true;
 
     // ---- STATE_ALL: tally state, source freshness, channel plan, time base --
+    _lastStateMs = now; // only STATE frames refresh the colour's freshness
     _lastHbCount = TallyProtocol::hbCount(pkt);
     _hbSeen = true;
     if (TallyProtocol::isBurstCopy(pkt)) {
@@ -97,6 +99,11 @@ void TallyLink::tick() {
     // source frozen for longer than the grace window. Riding out brief ATEM
     // reconnects, this avoids flicker while still catching a real freeze.
     _sourceStale = (millis() - _lastSourceLiveMs > TALLY_SOURCE_GRACE_MS);
+    // State-stale: the link is alive but no STATE frame has arrived for a
+    // while. Gated on _everHeard only because before the first frame the
+    // everHeard term of trustworthy() already covers it; once heard, a PING-only
+    // diet must not keep a colour trusted.
+    _stateStale = _everHeard && (millis() - _lastStateMs > TALLY_STATE_STALE_MS);
     // If the burst's releasing copy was itself lost, the hold must not stick:
     // no burst spans anywhere near two heartbeats.
     if (_burstInFlight && millis() - _burstSinceMs > 2 * TALLY_REFRESH_MS)

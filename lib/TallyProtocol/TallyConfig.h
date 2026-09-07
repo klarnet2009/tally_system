@@ -44,6 +44,13 @@
 #define TALLY_REFRESH_MS 500 // Periodic STATE_ALL re-send = link heartbeat
 // Derived from the heartbeat so they track it automatically.
 #define TALLY_SIGNAL_LOST_MS (6 * TALLY_REFRESH_MS) // Alarm after 6 missed beats
+// How long a slave may keep painting a SOLID colour without having received a
+// STATE frame. Distinct from signal-lost, which any hub frame (a PING included)
+// refreshes: under 60-80% loss a whole change burst plus several heartbeats can
+// vanish while the odd frame still arrives, and the old single 3 s timer let the
+// camera hold confident RED after it had been cut away from. Above this the
+// slave shows "colour may be old" (white blink over the held colour).
+#define TALLY_STATE_STALE_MS (3 * TALLY_REFRESH_MS)
 #define TALLY_RX_REARM_MS (3 * TALLY_REFRESH_MS)   // RX safety-net re-arm
 // Grace before a slave shows the "source stale" (ATEM frozen) indication, so a
 // brief switcher reconnect doesn't flicker the light.
@@ -194,5 +201,14 @@ static_assert(TALLY_TLM_OFFSET_MS + TALLY_TLM_BANK_MS + TALLY_TLM_LATE_MS +
 // held frame would collide with the NEXT timer's heartbeat instead.
 static_assert(TALLY_TLM_WINDOW_MS < TALLY_REFRESH_MS,
               "uplink window must close within one heartbeat period");
+// The state-stale threshold must tolerate ONE lost heartbeat even when the hub
+// held the next one out of the uplink window (a legal ~882 ms gap), and must
+// fire before signal-lost does — otherwise it would never be the one to show.
+static_assert(TALLY_STATE_STALE_MS > 2 * TALLY_REFRESH_MS + TALLY_TLM_WINDOW_MS,
+              "state-stale would trip on a single lost heartbeat");
+static_assert(TALLY_STATE_STALE_MS < TALLY_SIGNAL_LOST_MS,
+              "state-stale must precede signal-lost or it never shows");
+static_assert(TALLY_SOURCE_GRACE_MS < TALLY_SIGNAL_LOST_MS,
+              "source-stale must precede signal-lost or it never shows");
 
 #endif // TALLY_CONFIG_H

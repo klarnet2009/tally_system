@@ -584,10 +584,11 @@ bool E28Radio::checkTxDone() {
 }
 
 bool E28Radio::isTxDone() {
-  // ⚡ Bolt: Fast-path hardware pin polling prevents SPI bus starvation during TxDone wait
-  if (_pinDIO1 != -1 && digitalRead(_pinDIO1) == LOW) {
-    return false;
-  }
+  // The IRQ register is authoritative. A DIO1 fast path used to veto it (low
+  // pin = "not done, skip the SPI read") — the same pin this driver elsewhere
+  // calls "unreliable on some boards", so a dead DIO1 line turned EVERY transmit
+  // into a full txTimeoutMs() burn and a counted drop. One 4-byte read per
+  // poll is cheap; the callers already pace themselves (yield / loop pass).
   return (getIrqStatus() & 0x0001) != 0;
 }
 

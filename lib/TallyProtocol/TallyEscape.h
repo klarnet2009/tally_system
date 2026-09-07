@@ -217,7 +217,12 @@ public:
       v.blocked = "settling after boot";
       return v;
     }
-    uint32_t dwell = (tier == ESC_SEVERE) ? ESC_DWELL_SEVERE_MS : ESC_DWELL_MS;
+    // The long dwell exists to stop a mildly degraded fleet from wandering; it
+    // is for DEGRADED only. SEVERE and BLACKOUT both mean cameras are dark NOW,
+    // and holding either for ten minutes per hop put the fleet ~20 minutes from
+    // the one channel outside every EU WiFi allocation (index 3). Ordered
+    // comparison so a future tier above DEGRADED cannot silently inherit 10 min.
+    uint32_t dwell = (tier >= ESC_SEVERE) ? ESC_DWELL_SEVERE_MS : ESC_DWELL_MS;
     if (in.now - _lastSwitch < dwell) {
       v.blocked = "min-dwell";
       return v;
@@ -312,6 +317,7 @@ public:
     _target = targetChan;
     _dueHb = (uint8_t)(hbNow + beats);
     _pending = true;
+    _expired = false;
   }
   bool pending() const { return _pending; }
   uint8_t target() const { return _target; }
@@ -319,18 +325,31 @@ public:
   // What this frame should announce. 0 = nothing pending (also what a receiver
   // reads as "no switch"), so a live announcement is always >= 1.
   uint8_t countdown(uint8_t hbNow) const {
-    if (!_pending)
+    if (!_pending || _expired)
       return 0;
     uint8_t left = (uint8_t)(_dueHb - hbNow); // modular: survives the wrap
     if (left > 15)
       return 0; // the deadline has passed
     return left;
   }
-  bool expired(uint8_t hbNow) const { return _pending && countdown(hbNow) == 0; }
-  void clear() { _pending = false; }
+  // LATCHED: once the deadline has passed it stays passed until clear(). The
+  // modular countdown alone has a blind spot — 241 beats (~2 min) after the
+  // deadline the difference wraps back under 16 and a switch that was never
+  // applied would quietly re-announce itself. A switch the hub could not apply
+  // in time must be applied or cleared, never resurrected.
+  bool expired(uint8_t hbNow) {
+    if (_pending && !_expired && countdown(hbNow) == 0)
+      _expired = true;
+    return _pending && _expired;
+  }
+  void clear() {
+    _pending = false;
+    _expired = false;
+  }
 
 private:
   bool _pending = false;
+  bool _expired = false;
   uint8_t _target = 0;
   uint8_t _dueHb = 0;
 };

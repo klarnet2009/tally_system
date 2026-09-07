@@ -95,14 +95,13 @@ int main() {
       CHECK_EQ((*pp)[5], 0x40); // standard IQ — NOT 0x00, which is inverted
       CHECK((*pp)[4] != 0x01);  // the SX126x value that shipped for months
     }
-    // The driver polls DIO1 before spending an SPI read on the IRQ register, so
-    // a completed TX needs both the pin and the bit, like on the real chip.
-    CHECK(!r.checkTxDone()); // still in flight: not timed out, DIO1 low
+    // The IRQ register is authoritative: TxDone must complete with DIO1 LOW
+    // (a dead pin used to turn every transmit into a full timeout + a drop).
+    CHECK(!r.checkTxDone()); // still in flight: not timed out, no TxDone yet
     g_irq = 0x0001;
-    testSetPin(6, HIGH);
     CHECK(r.checkTxDone());
     CHECK(r.txSucceeded());
-    testSetPin(6, LOW);
+    CHECK_EQ(g_irq, 0); // teardown cleared the IRQ
   }
 
   CASE("DEFECT: after SetModulationParams the SF register and FEC bit are written");

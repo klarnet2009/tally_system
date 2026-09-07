@@ -88,6 +88,7 @@ TallyLink tallyLink;
 uint32_t lastHeartbeat = 0;
 uint32_t rxCount = 0;  // Valid packets since last heartbeat
 uint32_t rxFails = 0;  // Rejected packets (noise/CRC/foreign) since heartbeat
+uint32_t rxNoDio1 = 0; // Frames drained while DIO1 said nothing (dead pin?)
 
 // DIO1 fires on RxDone/CrcError; the loop drains the event and re-arms RX
 static volatile bool g_dio1Flag = false;
@@ -180,13 +181,16 @@ void updateLocator() {
   if (elapsed >= 600) { // 5 cycles x 120ms
     locatorActive = false;
     noTone(PIN_BUZZER);
-    // Don't paint the (possibly stale) tally colour over a dead link — that
-    // could show solid RED ("you're live") on data minutes old. Hand straight
-    // back to the orange signal-lost indication.
-    if (tallyLink.signalLost())
+    // Only a TRUSTWORTHY colour goes back on the pixel — the old test checked
+    // signalLost alone, so a source-stale or state-stale camera got solid RED
+    // painted over its white "may be old" blink. Otherwise hand the pixel to
+    // the indication ladder, which repaints within one blink period.
+    if (tallyLink.trustworthy())
+      applyTallyColor();
+    else if (tallyLink.signalLost())
       setColor(COLOR_LOST, 60);
     else
-      applyTallyColor();
+      setColor(COLOR_OFF);
     return;
   }
 
@@ -349,7 +353,9 @@ void onLinkChange(bool lost) {
     slogf("[WARN] Signal lost!\n");
   } else {
     slogf("[LINK] Signal restored\n");
-    if (!locatorActive)
+    // "Restored" means a hub frame arrived — not that it carried a state. Paint
+    // only if the colour is actually trustworthy; the ladder handles the rest.
+    if (!locatorActive && tallyLink.trustworthy())
       applyTallyColor();
   }
 }
@@ -374,6 +380,15 @@ void tryRadioRecover() {
 
 // ===== SETUP =====
 void setup() {
+  // FIRST: blank the pixel. A warm reset (`id N` -> ESP.restart(), EN, brownout)
+  // does not power-cycle the WS2812B — it sits on the same 3V3 rail as the MCU
+  // and keeps its last frame — and NeoPixel::begin() only configures the pin.
+  // This used to run after the 2 s BOOT window below, so a camera showing
+  // solid RED kept showing solid RED for ~2.2 s of reboot that neither the
+  // operator nor the hub could see. (The bootloader's own ~0.3 s is hardware.)
+  led.begin();
+  setColor(COLOR_OFF);
+
   Serial.begin(115200);
   // Field units run on battery with NO USB host: HWCDC's default 100ms TX
   // timeout would otherwise stall every log line once the FIFO fills — and
@@ -409,8 +424,6 @@ void setup() {
     delay(10);
   }
 
-  led.begin();
-  setColor(COLOR_OFF);
   pinMode(PIN_BUZZER, OUTPUT);
   noTone(PIN_BUZZER);
 
@@ -476,9 +489,16 @@ void loop() {
   updateLocator();
   TallyLog.tick(); // periodic flash-log flush
 
-  // === RX: interrupt-driven. Continuous RX, so a stray SPI read between
-  // events is harmless (that constraint died with duty-cycle RX).
-  if (g_dio1Flag || digitalRead(PIN_LORA_DIO1) == HIGH) {
+  // === RX: POLLED every pass; DIO1 is only the fast path. The driver's own
+  // note calls DIO1 "unreliable on some boards" and the hub already polls
+  // unconditionally — here the FIFO used to be read ONLY when the pin said so,
+  // and the timed safety net below cleared the pending RxDone instead of
+  // draining it. One dead signal line (cold joint on GPIO1, a POR glitch that
+  // lost the DIO1 routing) made a camera deaf for a whole show while the chip
+  // received every heartbeat, with nothing in any log to say why. One 4-byte
+  // GetIrqStatus per ~5 ms pass is nothing; a dead pin now names itself.
+  {
+    bool dio1 = g_dio1Flag || digitalRead(PIN_LORA_DIO1) == HIGH;
     // Clear the flag FIRST: an ISR firing during the drain/re-arm below sets
     // it again, so we re-enter next loop (a harmless duplicate pass gated by
     // available()) instead of losing that packet. Clearing it AFTER the
@@ -489,9 +509,11 @@ void loop() {
     // re-arm closes the window where its RxDone would be wiped by the IRQ
     // clear below and the payload silently abandoned in the FIFO. The cap
     // keeps a flooding neighbour from starving the rest of loop().
+    uint8_t drained = 0;
     for (int drain = 0; drain < 4 && radio.available(); drain++) {
       uint8_t buf[TALLY_PACKET_SIZE];
       uint8_t len = radio.receive(buf, TALLY_PACKET_SIZE);
+      drained++;
 
       if (len > 0) {
         if (tallyLink.onPacket(buf, len)) {
@@ -507,8 +529,12 @@ void loop() {
         }
       }
     }
-    // Unconditional re-arm: RxDone (even a CRC error) ends the duty cycle
-    radio.rearmAfterIrq();
+    if (drained && !dio1)
+      rxNoDio1++; // received, but the pin never said so
+    // Re-arm after any event: a payload, or an IRQ without one (a CRC/header
+    // error that available() already counted and cleared).
+    if (drained || dio1)
+      radio.rearmAfterIrq();
   }
 
   // === LINK SUPERVISION (hub broadcasts every TALLY_REFRESH_MS) ===
@@ -518,9 +544,14 @@ void loop() {
   // unprovisioned = no camera ID: magenta double-blink, never a tally colour.
   // signalLost    = radio link dead: orange pulse. Visual only — the camera's
   //                 real state is unknown, so no tone (buzzerAllowed()).
-  // sourceStale   = link alive but the hub's ATEM source is frozen: hold the
-  //                 last tally colour but blink WHITE over it, so the operator
-  //                 sees the colour may be stale without losing the held state.
+  // sourceStale / = "colour may be old": link alive but either the hub's ATEM
+  // stateStale      source is frozen, or no STATE frame has reached us for
+  //                 TALLY_STATE_STALE_MS (a PING alone keeps the link "alive").
+  //                 Hold the last tally colour but blink WHITE over it.
+  // trusted       = paint on change AND repaint idempotently every 500 ms — the
+  //                 pixel has no readback, and a corrupted data frame or an LED
+  //                 rail dip used to leave a random/dark colour until the next
+  //                 cut, because only the untrusted indications self-refreshed.
   static bool wasUntrusted = false;
   if (!locatorActive) {
     if (!provisioned()) {
@@ -543,7 +574,7 @@ void loop() {
         pulseOn = !pulseOn;
         setColor(pulseOn ? COLOR_LOST : COLOR_OFF, 60);
       }
-    } else if (tallyLink.sourceStale()) {
+    } else if (tallyLink.sourceStale() || tallyLink.stateStale()) {
       wasUntrusted = true;
       static uint32_t lastBlink = 0;
       static bool whiteOn = false;
@@ -555,10 +586,13 @@ void loop() {
         else
           applyTallyColor();
       }
-    } else if (wasUntrusted) {
-      // Just regained trust — repaint the true colour once.
-      wasUntrusted = false;
-      applyTallyColor();
+    } else if (tallyLink.trustworthy()) { // explicit: never on the not-yet-heard path
+      static uint32_t lastRepaint = 0;
+      if (wasUntrusted || millis() - lastRepaint >= 500) {
+        wasUntrusted = false; // regained trust: repaint now, then keep repainting
+        lastRepaint = millis();
+        applyTallyColor();
+      }
     }
   }
 
@@ -617,11 +651,11 @@ void loop() {
   if (millis() - lastHeartbeat > 10000) {
     lastHeartbeat = millis();
     slogf("[STATUS] Up:%lus State:%d Ch:%u LastRX:%lus ago RX:%lu "
-          "Fail:%lu RxErr:%lu Pwr:%d%%\n",
+          "Fail:%lu RxErr:%lu NoDIO1:%lu Pwr:%d%%\n",
           (unsigned long)(millis() / 1000), (int)tallyLink.state(), g_chanIdx,
           (unsigned long)(tallyLink.msSinceLastRx() / 1000),
           (unsigned long)rxCount, (unsigned long)rxFails,
-          (unsigned long)radio.getRxErrors(),
+          (unsigned long)radio.getRxErrors(), (unsigned long)rxNoDio1,
           (int)((g_txPower + 18) * 100 / 30));
     if (tallyLink.missedBeats())
       slogf("[STATUS] missed heartbeats this window: %u\n",

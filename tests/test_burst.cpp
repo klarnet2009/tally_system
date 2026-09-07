@@ -314,6 +314,27 @@ int main() {
     CHECK_EQ(f.pending(), TALLY_BURST_COPIES_MIN);
   }
 
+  CASE("untilNext() reports the gap to the next copy, 0 when due or idle");
+  {
+    // The old-channel beacon uses this to slip between copies without ever
+    // pushing one back — and never ahead of a cut's first copy.
+    TallyBurst b; b.reset(0);
+    CHECK_EQ(b.untilNext(0), 0u); // idle
+    b.onChange(1000, false);
+    CHECK_EQ(b.untilNext(1000), 0u); // first copy due now
+    CHECK(b.latencyCritical());
+    b.markSent(1000);
+    CHECK_EQ(b.untilNext(1000), (unsigned)offs[1]);
+    CHECK_EQ(b.untilNext(1000 + offs[1] - 10), 10u);
+    CHECK_EQ(b.untilNext(1000 + offs[1] + 5), 0u); // overdue counts as due
+    // wrap-safe
+    TallyBurst c; c.reset(0);
+    c.onChange(0xFFFFFFF0u, false);
+    c.markSent(0xFFFFFFF0u);
+    CHECK_EQ(c.untilNext(0xFFFFFFF0u), (unsigned)offs[1]);
+    CHECK_EQ(c.untilNext(0xFFFFFFF0u + offs[1]), 0u); // past the rollover
+  }
+
   CASE("the uplink window fits inside a heartbeat period with margin");
   {
     // If it did not, the held heartbeat would collide with the next one.

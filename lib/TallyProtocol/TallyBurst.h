@@ -71,6 +71,15 @@ public:
   bool dueNow(uint32_t now) const {
     return !idle() && (int32_t)(now - _nextAtMs) >= 0;
   }
+  // Milliseconds until the next copy is due (0 when due or idle). Lets a lower-
+  // priority transmit (the old-channel beacon) take the air between copies
+  // without ever pushing one back.
+  uint32_t untilNext(uint32_t now) const {
+    if (idle())
+      return 0;
+    int32_t d = (int32_t)(_nextAtMs - now);
+    return d > 0 ? (uint32_t)d : 0;
+  }
 
   // The first copy of a multi-copy burst is the one whose latency IS the point;
   // it must never be delayed for collision avoidance.

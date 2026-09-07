@@ -258,6 +258,37 @@ int main() {
     CHECK(v.blocked != nullptr);
   }
 
+  CASE("DEFECT: blackout uses the short dwell too — a dark fleet must not wait 10 min per hop");
+  {
+    TallyEscape e; e.begin(0);
+    clearCams(); silent(1); silent(2); silent(3);
+    TallyEscape::Verdict v =
+        hold(e, T0, ESC_BLACKOUT_SUSTAIN_MS + 5000, false, 0.9f);
+    CHECK_EQ(v.tier, ESC_BLACKOUT);
+    CHECK(v.wantSwitch);
+    uint32_t t = T0 + ESC_BLACKOUT_SUSTAIN_MS + 5000;
+    e.noteSwitching(t, 0);
+    // Still dark and still busy on the new channel. After the blackout sustain
+    // has been re-earned but BEFORE the severe dwell: blocked by min-dwell.
+    TallyEscape::Inputs i = in(t + 80000);
+    i.curChan = 1; i.busyFrac = 0.9f;
+    for (uint32_t k = 0; k <= ESC_BLACKOUT_SUSTAIN_MS + 2000; k += 1000) {
+      i.now = t + 80000 - ESC_BLACKOUT_SUSTAIN_MS - 2000 + k;
+      v = e.evaluate(i, cams);
+    }
+    CHECK_EQ(v.tier, ESC_BLACKOUT);
+    CHECK(!v.wantSwitch);
+    CHECK(v.blocked != nullptr);
+    // Past the SEVERE dwell (90 s), well short of the 10-min one: must move.
+    for (uint32_t k = 0; k <= 20000; k += 1000) {
+      i.now = t + ESC_DWELL_SEVERE_MS + k;
+      v = e.evaluate(i, cams);
+    }
+    CHECK_EQ(v.tier, ESC_BLACKOUT);
+    CHECK(v.wantSwitch);
+    CHECK(ESC_DWELL_SEVERE_MS < ESC_DWELL_MS / 4);
+  }
+
   CASE("severe uses the short dwell so it is not stuck behind a 10-min wait");
   {
     TallyEscape e; e.begin(0);
@@ -340,6 +371,30 @@ int main() {
     CHECK_EQ(s.countdown(0), 4);
     CHECK_EQ(s.countdown(3), 1);
     CHECK(s.expired(4));
+  }
+
+  CASE("DEFECT: an expired switch stays expired through the 241-beat blind spot");
+  {
+    // countdown() is modular: 241 beats after the deadline the difference wraps
+    // back under 16, and an un-applied switch quietly re-announced itself.
+    TallyChanSwitch s;
+    s.request(2, 100, 10); // due at 110
+    CHECK(s.expired(110));
+    CHECK(s.expired(200));
+    CHECK_EQ(s.countdown(200), 0);
+    // 110 + 241 = 351 = 95 mod 256: (110 - 95) mod 256 = 15 -> the old code
+    // announced "15 beats to go" here
+    CHECK(s.expired(95));
+    CHECK_EQ(s.countdown(95), 0);
+    CHECK(s.expired(100)); // and "10 to go" a moment later
+    CHECK_EQ(s.countdown(100), 0);
+    CHECK(s.pending());    // still needs applying or clearing — never resurrecting
+    s.clear();
+    CHECK(!s.expired(100));
+    // a fresh request after clear() starts a fresh countdown
+    s.request(1, 100, 5);
+    CHECK_EQ(s.countdown(100), 5);
+    CHECK(!s.expired(100));
   }
 
   CASE("cleared switch announces nothing");
