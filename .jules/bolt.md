@@ -97,3 +97,11 @@
 ## 2026-06-10 - Suspending Background UI Updates During High-Priority Sequences
 **Learning:** In systems with shared I2C peripherals like OLED displays, allowing periodic background tasks (e.g., `drawLoRaDebug()`) to execute unconditionally can overwrite transient, high-priority full-screen status messages (like the `LOCATOR` ping sequence). This not only causes UI flickering and rapid visual regressions but also wastes CPU cycles blocking on slow I2C transfers (~35ms per frame).
 **Action:** Introduce a boolean flag (e.g., `uiActive`) to track when high-priority UI states are active, and use it to suspend lower-priority, blocking screen updates. Avoid tying this suppression entirely to persistent background network states (like WiFi disconnection), as it can inadvertently cause permanent regressions by hiding diagnostic interfaces.
+
+## 2026-09-10 - Precomputed LUTs for CRC overhead reduction
+**Learning:** In hot paths parsing network packets, mathematical loops calculating CRC (like 's nested bitwise XOR/shifts over a fixed polynomial) consume significant CPU cycles. Using nested loops to process bits is a common but expensive C++ embedded anti-pattern.
+**Action:** Replace nested bitwise CRC loops with a precomputed 256-byte Lookup Table (LUT). This replaces 8 iteration loops per byte with a single O(1) array access, vastly improving validation speed at a negligible memory cost.
+
+## 2026-09-10 - Precomputed LUTs for CRC overhead reduction
+**Learning:** In hot paths parsing network packets, mathematical loops calculating CRC (like TallyProtocol::calculateCRC nested bitwise XOR/shifts over a fixed polynomial) consume significant CPU cycles. Using nested loops to process bits is a common but expensive C++ embedded anti-pattern.
+**Action:** Replace nested bitwise CRC loops with a precomputed 256-byte Lookup Table (LUT). This replaces 8 iteration loops per byte with a single O(1) array access, vastly improving validation speed at a negligible memory cost.
