@@ -97,3 +97,11 @@
 ## 2026-06-10 - Suspending Background UI Updates During High-Priority Sequences
 **Learning:** In systems with shared I2C peripherals like OLED displays, allowing periodic background tasks (e.g., `drawLoRaDebug()`) to execute unconditionally can overwrite transient, high-priority full-screen status messages (like the `LOCATOR` ping sequence). This not only causes UI flickering and rapid visual regressions but also wastes CPU cycles blocking on slow I2C transfers (~35ms per frame).
 **Action:** Introduce a boolean flag (e.g., `uiActive`) to track when high-priority UI states are active, and use it to suspend lower-priority, blocking screen updates. Avoid tying this suppression entirely to persistent background network states (like WiFi disconnection), as it can inadvertently cause permanent regressions by hiding diagnostic interfaces.
+
+## 2024-09-14 - Replace inner-loop bitwise math with Lookup Tables
+**Learning:** In high-frequency parsing paths like , a nested software bitwise operation adds unnecessary O(N) overhead per byte.
+**Action:** Replace bitwise mathematical loops in serialization and parsing with static precomputed Lookup Tables (LUTs). This trades a small amount of flash memory (256 bytes) for an O(1) array access per byte.
+
+## 2024-09-14 - Replace inner-loop bitwise math with Lookup Tables
+**Learning:** In high-frequency parsing paths like TallyProtocol::calculateCRC, a nested software bitwise operation adds unnecessary O(N) overhead per byte.
+**Action:** Replace bitwise mathematical loops in serialization and parsing with static precomputed Lookup Tables (LUTs). This trades a small amount of flash memory (256 bytes) for an O(1) array access per byte.
