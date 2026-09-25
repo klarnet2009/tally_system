@@ -97,3 +97,7 @@
 ## 2026-06-10 - Suspending Background UI Updates During High-Priority Sequences
 **Learning:** In systems with shared I2C peripherals like OLED displays, allowing periodic background tasks (e.g., `drawLoRaDebug()`) to execute unconditionally can overwrite transient, high-priority full-screen status messages (like the `LOCATOR` ping sequence). This not only causes UI flickering and rapid visual regressions but also wastes CPU cycles blocking on slow I2C transfers (~35ms per frame).
 **Action:** Introduce a boolean flag (e.g., `uiActive`) to track when high-priority UI states are active, and use it to suspend lower-priority, blocking screen updates. Avoid tying this suppression entirely to persistent background network states (like WiFi disconnection), as it can inadvertently cause permanent regressions by hiding diagnostic interfaces.
+
+## 2024-05-18 - LUT optimization for CRC calculations
+**Learning:** In hot paths like packet validation loops (e.g., `calculateCRC`), nested bitwise shifting algorithms impose significant O(M*N) computational overhead. On microcontrollers, trading a small amount of flash memory (256 bytes) for an O(N) array lookup provides a drastic performance boost without risking out-of-bounds memory accesses if input types are properly bounded (e.g., uint8_t).
+**Action:** Always replace programmatic bitwise loops in algorithms like CRC with precomputed Lookup Tables (LUT) to drastically improve execution speed on validation fast-paths. Keep the script used to generate the LUT in the repo for maintainability.
