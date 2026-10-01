@@ -451,14 +451,20 @@ static void serviceTelemetry() {
   radio.rearmAfterIrq();
   if (len == 0)
     return;
+
+  // ⚡ Bolt: Fast-path early return to avoid deserialization overhead for non-telemetry packets or invalid IDs
+  // Packets smaller than 3 bytes are dropped early to prevent out-of-bounds reads.
+  if (len < 3) return;
+  uint8_t cmd = buf[1] >> 4;
+  if (cmd != CMD_TELEMETRY) return;
+  uint8_t id = buf[2];
+  if (id < 1 || id > 16) return;
+
   TallyPacket pkt;
   if (!TallyProtocol::deserialize(buf, len, pkt))
     return;
-  if (TallyProtocol::cmd(pkt) != CMD_TELEMETRY)
-    return;
-  uint8_t id = TallyProtocol::telemetryCamId(pkt);
-  if (id < 1 || id > 16)
-    return;
+  // CMD and ID already verified by fast-path, extract directly
+  id = TallyProtocol::telemetryCamId(pkt);
   g_camLastSeen[id] = millis();
   g_camRssi[id] = TallyProtocol::telemetryRssi(pkt); // downlink (slave-heard)
   g_camRxRssi[id] = radio.getRSSI();                 // uplink (hub-heard)

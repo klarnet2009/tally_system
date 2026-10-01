@@ -1,4 +1,5 @@
 #include "TallyProtocol.h"
+#include "crc8_lut.h"
 
 static TallyPacket makeFrame(uint8_t cmd, uint8_t flags, uint8_t d0, uint8_t d1,
                              uint8_t d2, uint8_t d3, uint8_t d4, uint8_t d5) {
@@ -110,12 +111,11 @@ uint8_t TallyProtocol::calculateCRC(const TallyPacket &p) {
   static_assert(sizeof(TallyPacket) == TALLY_PACKET_SIZE,
                 "TallyPacket layout != wire size");
   // CRC-8/CCITT (poly 0x07, init 0x00) over every byte but the CRC itself.
+  // ⚡ Bolt: Using a 256-byte precomputed Lookup Table (LUT) for O(1) performance boost
   const uint8_t *data = (const uint8_t *)&p;
   uint8_t crc = 0x00;
   for (uint8_t i = 0; i < TALLY_PACKET_SIZE - 1; i++) {
-    crc ^= data[i];
-    for (uint8_t b = 0; b < 8; b++)
-      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+    crc = crc8_lut[crc ^ data[i]];
   }
   return crc;
 }
