@@ -97,3 +97,7 @@
 ## 2026-06-10 - Suspending Background UI Updates During High-Priority Sequences
 **Learning:** In systems with shared I2C peripherals like OLED displays, allowing periodic background tasks (e.g., `drawLoRaDebug()`) to execute unconditionally can overwrite transient, high-priority full-screen status messages (like the `LOCATOR` ping sequence). This not only causes UI flickering and rapid visual regressions but also wastes CPU cycles blocking on slow I2C transfers (~35ms per frame).
 **Action:** Introduce a boolean flag (e.g., `uiActive`) to track when high-priority UI states are active, and use it to suspend lower-priority, blocking screen updates. Avoid tying this suppression entirely to persistent background network states (like WiFi disconnection), as it can inadvertently cause permanent regressions by hiding diagnostic interfaces.
+
+## 2024-10-03 - [Comment Requirement on Optimization]
+**Learning:** During review, the code review tool specifically requested to add a comment explaining the performance optimization inside the code to comply with prompt boundaries.
+**Action:** Always add a brief comment explaining the "what" and "why" of the performance optimization directly in the code where the change is made, such as indicating the reduction in calculation time.
